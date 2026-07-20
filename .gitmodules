@@ -10,3 +10,12 @@
 [submodule "dependencies/submodules/UESDK"]
 	path = dependencies/submodules/UESDK
 	url = https://github.com/joeyhodge/UESDK.git
+[submodule "dependencies/submodules/SR-lib"]
+	path = dependencies/submodules/SR-lib
+	url = https://github.com/bo3b/SR-lib.git
+[submodule "dependencies/submodules/nvapi"]
+	path = dependencies/submodules/nvapi
+	url = https://github.com/NVIDIA/nvapi
+[submodule "dependencies/submodules/adl_sdk"]
+	path = dependencies/submodules/adl_sdk
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/display-library

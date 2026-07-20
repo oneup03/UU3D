@@ -3,6 +3,7 @@
 #include <future>
 #include <optional>
 #include <unordered_set>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 #include <wrl/client.h>
@@ -10,6 +11,9 @@
 #include <utility/Module.hpp>
 #include <utility/RTTI.hpp>
 #include <utility/String.hpp>
+
+#include <d3d12sdklayers.h>
+#include <wrl.h>
 
 #include "WindowFilter.hpp"
 #include "Framework.hpp"
@@ -21,6 +25,10 @@
 #include "D3D12Hook.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
+
+// True while a depth-stencil observer's on_resource_barriers is running, so the
+// self-contained depth copy's own ResourceBarrier calls aren't re-observed.
+thread_local bool g_inside_depth_stencil_observer = false;
 
 namespace {
 constexpr size_t CREATE_GRAPHICS_PIPELINE_STATE_VTABLE_INDEX = 10;
@@ -143,14 +151,143 @@ void add_unique_pointer_hook(
 }
 }
 
+namespace {
+const char* d3d12_severity_name(D3D12_MESSAGE_SEVERITY sev) {
+    switch (sev) {
+    case D3D12_MESSAGE_SEVERITY_CORRUPTION: return "CORRUPTION";
+    case D3D12_MESSAGE_SEVERITY_ERROR:      return "ERROR";
+    case D3D12_MESSAGE_SEVERITY_WARNING:    return "WARNING";
+    case D3D12_MESSAGE_SEVERITY_INFO:       return "INFO";
+    default:                                return "MESSAGE";
+    }
+}
+
+void log_d3d12_message(D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, const char* description) {
+    const char* sev = d3d12_severity_name(severity);
+    const char* desc = description != nullptr ? description : "";
+
+    if (severity == D3D12_MESSAGE_SEVERITY_CORRUPTION || severity == D3D12_MESSAGE_SEVERITY_ERROR) {
+        spdlog::error("[D3D12 Debug] {} id={} : {}", sev, (uint32_t)id, desc);
+        // Flush now: the very next thing may be the corruption/crash this message
+        // is warning about, so the log must already be on disk.
+        if (auto logger = spdlog::default_logger(); logger != nullptr) {
+            logger->flush();
+        }
+    } else {
+        spdlog::warn("[D3D12 Debug] {} id={} : {}", sev, (uint32_t)id, desc);
+    }
+}
+
+// Synchronous ID3D12InfoQueue1 callback: fires at the D3D12 call site (e.g. the
+// exact ResourceBarrier with a mismatched StateBefore) BEFORE control returns to
+// the caller, so we capture the offending message even when the frame goes on to
+// corrupt state and crash.
+void CALLBACK d3d12_message_callback(D3D12_MESSAGE_CATEGORY /*category*/, D3D12_MESSAGE_SEVERITY severity,
+                                     D3D12_MESSAGE_ID id, LPCSTR description, void* /*context*/) {
+    log_d3d12_message(severity, id, description);
+}
+} // namespace
+
 D3D12Hook::~D3D12Hook() {
     unhook();
+}
+
+void D3D12Hook::setup_debug_info_queue() {
+    if (m_device == nullptr) {
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info_queue{};
+    if (FAILED(m_device->QueryInterface(IID_PPV_ARGS(&info_queue))) || info_queue == nullptr) {
+        spdlog::warn("[D3D12 Debug] Requested, but the game's D3D12 device has NO debug layer, so validation "
+                     "messages can't be captured. To enable it: install the Windows 'Graphics Tools' optional "
+                     "feature, run dxcpl.exe, Add the game's .exe, set 'Direct3D / Debug Layer' to 'Force On' "
+                     "(Scope: this application only), Apply, then relaunch with this option enabled. "
+                     "(Or set the environment variable UEVR_D3D12_DEBUG=1 if UEVR injects at game startup.)");
+        return;
+    }
+
+    // Never break into a debugger: one may not be attached, and an unhandled
+    // breakpoint would crash the game. We only want the messages recorded.
+    info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+    info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+    info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
+
+    // Drop the INFO/MESSAGE firehose; keep WARNING and above.
+    D3D12_MESSAGE_SEVERITY hide[] = { D3D12_MESSAGE_SEVERITY_INFO, D3D12_MESSAGE_SEVERITY_MESSAGE };
+    D3D12_INFO_QUEUE_FILTER filter{};
+    filter.DenyList.NumSeverities = (UINT)_countof(hide);
+    filter.DenyList.pSeverityList = hide;
+    info_queue->PushStorageFilter(&filter);
+
+    // Prefer the synchronous callback (ID3D12InfoQueue1, Win10 2004+): it fires at
+    // the call site, so a message from the frame that crashes is still captured —
+    // a Present-time poll would miss it.
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue1> info_queue1{};
+    if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&info_queue1))) && info_queue1 != nullptr) {
+        DWORD cookie = 0;
+        if (SUCCEEDED(info_queue1->RegisterMessageCallback(&d3d12_message_callback,
+                                                           D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie))) {
+            spdlog::info("[D3D12 Debug] Debug layer attached (synchronous callback). D3D12 validation messages "
+                         "(incl. resource-barrier state mismatches) will be logged as they occur.");
+            return;
+        }
+    }
+
+    // Fallback: poll stored messages at each Present (may miss the crashing frame).
+    m_debug_poll = true;
+    spdlog::info("[D3D12 Debug] Debug layer attached (polled at Present — may miss a message from the exact "
+                 "frame that crashes).");
+}
+
+void D3D12Hook::drain_debug_messages() {
+    if (m_device == nullptr) {
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info_queue{};
+    if (FAILED(m_device->QueryInterface(IID_PPV_ARGS(&info_queue))) || info_queue == nullptr) {
+        return;
+    }
+
+    const UINT64 count = info_queue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(info_queue->GetMessage(i, nullptr, &len)) || len == 0) {
+            continue;
+        }
+
+        std::vector<uint8_t> bytes(len);
+        auto* msg = reinterpret_cast<D3D12_MESSAGE*>(bytes.data());
+        if (SUCCEEDED(info_queue->GetMessage(i, msg, &len))) {
+            log_d3d12_message(msg->Severity, msg->ID, msg->pDescription);
+        }
+    }
+
+    info_queue->ClearStoredMessages();
 }
 
 bool D3D12Hook::hook() {
     spdlog::info("Hooking D3D12");
 
     g_d3d12_hook = this;
+
+    // Diagnostic: enable the D3D12 debug layer as early as we can. This only
+    // takes effect for devices created AFTER this call, so it helps only when
+    // UEVR is injected before the game creates its device — hence the env-var
+    // opt-in (the cvar isn't loaded this early). When the game's device already
+    // exists, use dxcpl.exe "Force On" instead; setup_debug_info_queue() detects
+    // that and logs instructions. Harmless if Graphics Tools isn't installed.
+    if (GetEnvironmentVariableW(L"UEVR_D3D12_DEBUG", nullptr, 0) != 0) {
+        Microsoft::WRL::ComPtr<ID3D12Debug> debug_iface{};
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug_iface))) && debug_iface != nullptr) {
+            debug_iface->EnableDebugLayer();
+            spdlog::info("[D3D12 Debug] EnableDebugLayer() called early (UEVR_D3D12_DEBUG set)");
+        } else {
+            spdlog::warn("[D3D12 Debug] UEVR_D3D12_DEBUG set but D3D12GetDebugInterface failed "
+                         "(install the Windows 'Graphics Tools' optional feature)");
+        }
+    }
 
     IDXGISwapChain1* swap_chain1{ nullptr };
     IDXGISwapChain3* swap_chain{ nullptr };
@@ -497,11 +634,13 @@ bool D3D12Hook::hook() {
         m_create_render_target_view_hooks.clear();
         m_create_depth_stencil_view_hooks.clear();
         m_set_pipeline_state_hooks.clear();
+        m_resource_barrier_hooks.clear();
         m_create_graphics_pipeline_state_hook_lookup.clear();
         m_create_pipeline_state_hook_lookup.clear();
         m_create_render_target_view_hook_lookup.clear();
         m_create_depth_stencil_view_hook_lookup.clear();
         m_set_pipeline_state_hook_lookup.clear();
+        m_resource_barrier_hook_lookup.clear();
         m_swapchain_hook.reset();
 
         m_is_phase_1 = true;
@@ -516,6 +655,7 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> render_target_view_slots{};
         std::unordered_set<uintptr_t> depth_stencil_view_slots{};
         std::unordered_set<uintptr_t> set_pipeline_state_slots{};
+        std::unordered_set<uintptr_t> resource_barrier_slots{};
 
         add_unique_pointer_hook(
             device,
@@ -622,6 +762,15 @@ bool D3D12Hook::hook() {
             set_pipeline_state_slots
         );
 
+        add_unique_pointer_hook(
+            command_list,
+            RESOURCE_BARRIER_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::resource_barrier),
+            m_resource_barrier_hooks,
+            m_resource_barrier_hook_lookup,
+            resource_barrier_slots
+        );
+
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> command_list1{};
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> command_list2{};
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList3> command_list3{};
@@ -656,6 +805,15 @@ bool D3D12Hook::hook() {
                 m_set_pipeline_state_hooks,
                 m_set_pipeline_state_hook_lookup,
                 set_pipeline_state_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                RESOURCE_BARRIER_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::resource_barrier),
+                m_resource_barrier_hooks,
+                m_resource_barrier_hook_lookup,
+                resource_barrier_slots
             );
         }
 
@@ -704,11 +862,14 @@ bool D3D12Hook::unhook() {
     m_create_render_target_view_hooks.clear();
     m_create_depth_stencil_view_hooks.clear();
     m_set_pipeline_state_hooks.clear();
+    m_resource_barrier_hooks.clear();
     m_create_graphics_pipeline_state_hook_lookup.clear();
     m_create_pipeline_state_hook_lookup.clear();
     m_create_render_target_view_hook_lookup.clear();
     m_create_depth_stencil_view_hook_lookup.clear();
     m_set_pipeline_state_hook_lookup.clear();
+    m_resource_barrier_hook_lookup.clear();
+    m_depth_stencil_observer.store(nullptr, std::memory_order_release);
     m_swapchain_hook.reset();
 
     m_hooked = false;
@@ -755,6 +916,14 @@ PointerHook* D3D12Hook::find_set_pipeline_state_hook(void* slot) const {
     }
 
     return m_set_pipeline_state_hooks.empty() ? nullptr : m_set_pipeline_state_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_resource_barrier_hook(void* slot) const {
+    if (const auto it = m_resource_barrier_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_resource_barrier_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_resource_barrier_hooks.empty() ? nullptr : m_resource_barrier_hooks.front().get();
 }
 
 thread_local int32_t g_present_depth = 0;
@@ -806,6 +975,7 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
         //d3d12->m_swapchain_hook->hook_method(8, (uintptr_t)&D3D12Hook::present);
         d3d12->m_swapchain_hook->hook_method(13, (uintptr_t)&D3D12Hook::resize_buffers);
         d3d12->m_swapchain_hook->hook_method(14, (uintptr_t)&D3D12Hook::resize_target);
+        d3d12->m_swapchain_hook->hook_method(38, (uintptr_t)&D3D12Hook::set_color_space1); // IDXGISwapChain3::SetColorSpace1
         d3d12->m_is_phase_1 = false;
     }
 
@@ -835,6 +1005,16 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
         );
 
         log_dune_present_path_once(swap_chain, d3d12->m_command_queue);
+    }
+
+    // Diagnostic D3D12 debug-layer capture (see set_debug_layer_wanted). Attach
+    // once, the first present after the option is enabled and the device exists.
+    if (d3d12->m_device != nullptr && d3d12->m_debug_layer_wanted.load() && !d3d12->m_debug_layer_setup_done) {
+        d3d12->m_debug_layer_setup_done = true;
+        d3d12->setup_debug_info_queue();
+    }
+    if (d3d12->m_debug_poll) {
+        d3d12->drain_debug_messages();
     }
 
     if (d3d12->m_swapchain_0 == nullptr) {
@@ -913,6 +1093,11 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
                     if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
                         flags |= DXGI_PRESENT_ALLOW_TEARING;
                     }
+                } else {
+                    // Forcing vsync ON while the game presents with tearing
+                    // enabled: ALLOW_TEARING is only valid with interval 0 —
+                    // leaving it set fails DXGI_ERROR_INVALID_CALL (fatal in UE).
+                    flags &= ~DXGI_PRESENT_ALLOW_TEARING;
                 }
             }
         }
@@ -1122,6 +1307,37 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
     }
 
     render::D3D12Diagnostics::get().register_dsv_descriptor("D3D12Hook::CreateDepthStencilView", resource, descriptor);
+
+    if (const auto observer = d3d12 != nullptr ? d3d12->m_depth_stencil_observer.load(std::memory_order_acquire) : nullptr;
+        observer != nullptr) {
+        observer->on_depth_stencil_view_created(resource, desc, descriptor);
+    }
+}
+
+void WINAPI D3D12Hook::resource_barrier(
+    ID3D12GraphicsCommandList* command_list,
+    UINT count,
+    const D3D12_RESOURCE_BARRIER* barriers)
+{
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[RESOURCE_BARRIER_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_resource_barrier_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::resource_barrier)*>() : nullptr;
+
+    // The DSV-observer depth capture must run before the engine restores a depth
+    // resource to DEPTH_WRITE. Nested ResourceBarrier calls made by that copy
+    // bypass observation and continue through the real vtable entry normally.
+    if (original != nullptr && !g_inside_depth_stencil_observer && d3d12 != nullptr) {
+        if (const auto observer = d3d12->m_depth_stencil_observer.load(std::memory_order_acquire); observer != nullptr) {
+            g_inside_depth_stencil_observer = true;
+            observer->on_resource_barriers(command_list, count, barriers);
+            g_inside_depth_stencil_observer = false;
+        }
+    }
+
+    if (original != nullptr) {
+        original(command_list, count, barriers);
+    }
 }
 
 void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_list, ID3D12PipelineState* pipeline_state) {
@@ -1164,6 +1380,34 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
 
     if (WindowFilter::get().is_filtered(swapchain_wnd)) {
         return resize_buffers_fn(swap_chain, buffer_count, width, height, new_format, swap_chain_flags);
+    }
+
+    // 3D Display mode: force sub-native swapchain sizes up to the display's
+    // native size (pixel-exact output modes die under post-composite scaling).
+    if (const auto fw = d3d12->m_forced_resize_w.load(), fh = d3d12->m_forced_resize_h.load();
+        fw != 0 && fh != 0) {
+        // The engine's belief — Slate sizes its UI draw from this.
+        d3d12->m_engine_believed_w = width;
+        d3d12->m_engine_believed_h = height;
+
+        // Preserve the request as the 3D render resolution — except within
+        // the suppress window after our own nudge/kick (games can re-apply
+        // OUR requested resolution multiple times, seconds apart; capturing
+        // those would silently jump the render resolution to native).
+        if (!d3d12->is_render_res_capture_suppressed()) {
+            d3d12->m_game_requested_w = width;
+            d3d12->m_game_requested_h = height;
+        }
+
+        // Pin in BOTH directions: UE's high-DPI viewport path multiplies the
+        // requested resolution by the monitor scale (e.g. SMT5V echoes our
+        // r.SetRes 3840x2160 back as 5760x3240 at 150%), and an oversized
+        // swapchain breaks the pixel-exact output modes just like a small one.
+        if (width != fw || height != fh) {
+            spdlog::info("D3D12 resize buffers: forcing {}x{} -> {}x{} (native output)", width, height, fw, fh);
+            width = fw;
+            height = fh;
+        }
     }
 
     d3d12->m_display_width = width;
@@ -1235,6 +1479,26 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
         return resize_target_fn(swap_chain, new_target_parameters);
     }
 
+    // 3D Display mode: block sub-native display-mode switches — substitute the
+    // native size and let DXGI pick the refresh (pixel-exact output modes need
+    // the panel's native mode).
+    DXGI_MODE_DESC forced_mode{};
+    if (const auto fw = d3d12->m_forced_resize_w.load(), fh = d3d12->m_forced_resize_h.load();
+        fw != 0 && fh != 0 && new_target_parameters != nullptr &&
+        (new_target_parameters->Width != fw || new_target_parameters->Height != fh)) {
+        spdlog::info("D3D12 resize target: forcing {}x{} -> {}x{} (native output)",
+                     new_target_parameters->Width, new_target_parameters->Height, fw, fh);
+        d3d12->m_game_requested_w = new_target_parameters->Width;  // preserved as the 3D render resolution
+        d3d12->m_game_requested_h = new_target_parameters->Height;
+        forced_mode = *new_target_parameters;
+        forced_mode.Width = fw;
+        forced_mode.Height = fh;
+        forced_mode.RefreshRate = {};                                // let DXGI choose
+        forced_mode.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+        forced_mode.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+        new_target_parameters = &forced_mode;
+    }
+
     d3d12->m_render_width = new_target_parameters->Width;
     d3d12->m_render_height = new_target_parameters->Height;
 
@@ -1275,7 +1539,7 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     ++g_resize_target_depth;
 
     const auto result = resize_target_fn(swap_chain, new_target_parameters);
-    
+
     if (result != S_OK) {
         spdlog::error("Resize target failed: {:x}", result);
     }
@@ -1283,6 +1547,21 @@ HRESULT WINAPI D3D12Hook::resize_target(IDXGISwapChain3* swap_chain, const DXGI_
     --g_resize_target_depth;
 
     return result;
+}
+
+HRESULT WINAPI D3D12Hook::set_color_space1(IDXGISwapChain3* swap_chain, DXGI_COLOR_SPACE_TYPE color_space) {
+    std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
+
+    auto d3d12 = g_d3d12_hook;
+
+    spdlog::info("D3D12 SetColorSpace1 called: {}", (uint32_t)color_space);
+    // A 10-bit swapchain is only HDR if the game explicitly sets a PQ/scRGB
+    // color space — record it so the flat3d compositor picks the right
+    // encoding (SDR games commonly use R10G10B10A2 with plain G22).
+    d3d12->m_swapchain_colorspace = (uint32_t)color_space;
+
+    auto set_color_space1_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::set_color_space1)*>(38);
+    return set_color_space1_fn(swap_chain, color_space);
 }
 
 /*HRESULT WINAPI D3D12Hook::create_swap_chain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain** swap_chain)

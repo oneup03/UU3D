@@ -1390,6 +1390,10 @@ d3d12::TextureContext* D3D12Component::render_dune_hmd_mono_scene_texture(
 }
 
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
+    if (vr->get_runtime()->is_flat3d()) {
+        return on_frame_flat3d(vr); // flat 3D monitor mode: composite to the real backbuffer, no VR submit
+    }
+
     const auto on_frame_start = std::chrono::steady_clock::now();
     utility::ScopeGuard frame_timing_guard{[&]() {
         m_perf_on_frame.add(std::chrono::steady_clock::now() - on_frame_start);
@@ -3988,7 +3992,8 @@ void D3D12Component::on_post_present(VR* vr) {
     }
 
     // Clear the (real) backbuffer if VR is enabled. Otherwise it will flicker and all sorts of nasty things.
-    if (vr->is_hmd_active()) {
+    // Flat 3D monitor mode: the backbuffer IS the output — never clear it.
+    if (vr->is_hmd_active() && !vr->get_runtime()->is_flat3d()) {
         clear_backbuffer();
     }
 }
@@ -4047,6 +4052,8 @@ void D3D12Component::on_reset(VR* vr) {
     m_dune_hmd_mono_scene_format = DXGI_FORMAT_UNKNOWN;
     m_skip_spectator_view_for_volatile_external_rt = false;
     m_shf_scene_mode = ShfSceneMode::Unknown;
+    m_flat3d_compositor.reset();
+    m_flat3d_katanga12.shutdown();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
     m_ui_batch_alpha_invert.reset();

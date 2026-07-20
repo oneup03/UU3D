@@ -5,11 +5,14 @@ FOR /F "tokens=*" %%g IN ('git rev-parse HEAD') DO (SET UEVR_COMMIT_HASH=%%g)
 FOR /F "tokens=*" %%t IN ('git describe --tags --always --abbrev^=0') DO (SET UEVR_TAG=%%t)
 IF "%UEVR_TAG%"=="" (SET UEVR_TAG=no_tag)
 
-FOR /F "tokens=*" %%c IN ('git describe --tags --always --long') DO (
-FOR /F "tokens=1,2 delims=-" %%a IN ("%%c") DO (
-SET UEVR_TAG_LONG=%%a
-SET UEVR_COMMITS_PAST_TAG=%%b
-)
+FOR /F "tokens=*" %%c IN ('git describe --tags --always --long') DO (SET UEVR_TAG_LONG=%%c)
+
+REM Count commits since the tag directly; the old dash-split broke on tags that
+REM themselves contain dashes (e.g. nightly-00008-<sha>), which yielded a
+REM zero-padded value that C++ then parsed as an invalid octal literal.
+SET UEVR_COMMITS_PAST_TAG=0
+IF NOT "%UEVR_TAG%"=="no_tag" (
+FOR /F "tokens=*" %%b IN ('git rev-list --count "%UEVR_TAG%..HEAD"') DO (SET UEVR_COMMITS_PAST_TAG=%%b)
 )
 
 IF "%UEVR_COMMITS_PAST_TAG%"=="" (SET UEVR_COMMITS_PAST_TAG=0)

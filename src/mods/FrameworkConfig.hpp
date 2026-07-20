@@ -126,5 +126,5 @@ private:
     ModCombo::Ptr m_log_level{ ModCombo::create(generate_name("LogLevel"), s_get_log_levels(), spdlog::level::info) };
     
     ModKey::Ptr m_show_cursor_key{ ModKey::create(generate_name("ShowCursorKey")) };
-    ModInt32::Ptr m_font_size{ModInt32::create(generate_name("FontSize"), 16)};
+    ModInt32::Ptr m_font_size{ModInt32::create(generate_name("FontSize"), 24)};
 };

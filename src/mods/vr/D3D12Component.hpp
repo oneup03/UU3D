@@ -22,6 +22,10 @@
 
 #include "d3d12/CommandContext.hpp"
 #include "d3d12/TextureContext.hpp"
+#include "d3d12/DepthStencilObserver.hpp"
+
+#include "flat3d/Flat3DCompositorD3D12.hpp"
+#include "flat3d/Flat3DKatangaD3D12.hpp"
 
 #include "PDAFWPlugin.h"
 
@@ -36,13 +40,14 @@ public:
     EyeFrameBuffers m_eyeFrameBuffers;
 
 public:
-    D3D12Component() 
+    D3D12Component()
         : m_openvr{this}
     {
 
     }
 
     vr::EVRCompositorError on_frame(VR* vr);
+    vr::EVRCompositorError on_frame_flat3d(VR* vr);
     void on_post_present(VR* vr);
     void on_reset(VR* vr);
 
@@ -405,6 +410,21 @@ private:
     } m_openxr;
 
     uint32_t m_backbuffer_size[2]{};
+
+    flat3d::Flat3DCompositorD3D12 m_flat3d_compositor{};
+    flat3d::Flat3DKatangaD3D12 m_flat3d_katanga12{};
+
+    // Flat3D "DSV Observer" depth source: API-level scene-depth capture via the
+    // D3D12Hook depth-stencil observer (no engine hook). See DepthStencilObserver.
+    d3d12::DepthStencilCaptureObserver m_flat3d_depth_observer{};
+
+public:
+    // Diagnostic string for the 3D Display page's DSV Observer status line.
+    std::string get_flat3d_depth_trace_summary() const {
+        return m_flat3d_depth_observer.depth_trace_summary();
+    }
+
+private:
 
     uint32_t m_last_rendered_frame{0};
     bool m_force_reset{true};

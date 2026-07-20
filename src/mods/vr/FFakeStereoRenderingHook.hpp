@@ -1109,8 +1109,14 @@ private:
     const ModToggle::Ptr m_recreate_textures_on_reset{ ModToggle::create("VR_RecreateTexturesOnReset", true) };
     const ModInt32::Ptr m_frame_delay_compensation{ ModInt32::create("VR_FrameDelayCompensation", 0) };
     const ModToggle::Ptr m_asynchronous_scan{ ModToggle::create("VR_AsynchronousScan", true) };
-    // Off by default because it can cause issues with some games
-    const ModToggle::Ptr m_use_fmalloc_scene_view_extensions{ ModToggle::create("VR_UseFMallocSceneViewExtensions", false) };
+    // ON by default: the view-extensions array we splice into
+    // GEngine->ViewExtensions must come from the game's own allocator. Games
+    // that add/remove transient scene-view extensions at runtime (SMT5V does
+    // it around loads/cutscenes) Realloc/Shrink that TArray — with a CRT-
+    // allocated block that dies as "FMallocBinned2 Attempt to realloc an
+    // unrecognized block" (LowLevelFatalError, exception 0x4000). Turn OFF
+    // only for titles whose GMalloc discovery misfires.
+    const ModToggle::Ptr m_use_fmalloc_scene_view_extensions{ ModToggle::create("VR_UseFMallocSceneViewExtensions", true) };
     // Off by default: restores safetyhook's trampoline lock path for games that dislike the faster original-call path.
     const ModToggle::Ptr m_safe_tick_hook{ ModToggle::create("VR_SafeTickHook", false) };
     const ModInt32::Ptr m_daysgone_bend_ui_mode{ ModInt32::create("VR_DaysGoneBendUI_Mode", 2, true) };

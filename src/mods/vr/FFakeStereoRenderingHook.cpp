@@ -3731,6 +3731,48 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack() {
         nullptr);
 
     const auto game_module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+
+    // Before UE5.7, ISceneViewExtension::BeginRenderViewFamily is invoked
+    // directly from FRendererModule::BeginRenderingViewFamily — reached
+    // through the IRendererModule virtual, so there is no small direct-call
+    // wrapper on the stack for the pair heuristic below to validate. It then
+    // latches an unrelated frame pair high up the stack (seen on UE4.27:
+    // stack_index=12, score=3) and the render-pass hook lands on the wrong
+    // function: the second engine view never gets suppressed (doubled
+    // geometry in the left eye), the scene-capture pass never runs (black
+    // right eye), and calling that function twice corrupts engine state.
+    // Resolve the direct caller instead, exactly like the pre-rework code.
+    if (!is_ue_5_7_or_newer()) {
+        for (uint32_t i = 1; i < depth; ++i) {
+            if (utility::get_module_within(stack[i]).value_or(nullptr) != (HMODULE)game_module) {
+                continue;
+            }
+
+            // Unwind first to find the actual function start;
+            // find_virtual_function_start alone can land on a false positive.
+            const auto unwind = utility::find_function_start_unwind(stack[i]);
+            const auto candidate = utility::find_virtual_function_start(unwind ? *unwind : stack[i]);
+
+            if (candidate) {
+                SPDLOG_INFO(
+                    "[NativeStereoFix] BeginRenderingViewFamily resolved from the direct caller at {:x} (stack_index={}, pre-UE5.7 path)",
+                    *candidate,
+                    i);
+            } else {
+                SPDLOG_WARN(
+                    "[NativeStereoFix] Failed to resolve BeginRenderingViewFamily from the direct caller (stack_index={}, return={:x})",
+                    i,
+                    stack[i]);
+            }
+
+            // Only the first game-module frame is the direct caller; a scored
+            // guess further up the stack must never be hooked on this path.
+            return candidate;
+        }
+
+        return std::nullopt;
+    }
+
     std::optional<uintptr_t> best_candidate{};
     int best_score = std::numeric_limits<int>::min();
 
@@ -8799,14 +8841,18 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     "[NativeStereoFix] Preserving UE5.5+ SECONDARY pass identity for modern per-eye renderer paths");
             }
 
-            if (is_ue5) {
+            {
                 auto view_family = init_options->get_view_family();
                 auto views = view_family != nullptr ? view_family->get_views() : nullptr;
 
                 if (views != nullptr && use_primary_constructor_pass) {
+                    // A relabeled PRIMARY constructed with the multi-view family
+                    // visible runs the constructor's special stereo logic
+                    // (instanced-stereo/family lookups) — on UE4 this doubles
+                    // the pass geometry and breaks the scene-capture render.
                     // UE5.5+ indexes the primary view while constructing a
-                    // secondary pass. Never hide this list unless the temporary
-                    // constructor pass has also been relabeled as PRIMARY.
+                    // secondary pass, so the list is still only hidden when the
+                    // temporary constructor pass has been relabeled as PRIMARY.
                     views_original_count = views->count;
                     views->count = 0;
                     SPDLOG_INFO_ONCE(
@@ -10053,7 +10099,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
                 const auto now_frame = (frame_count + 1) % runtimes::OpenXR::QUEUE_SIZE;
                 openxr->pipeline_states[now_frame] = openxr->pipeline_states[last_frame];
                 openxr->pipeline_states[now_frame].frame_count = now_frame;
-            } else {
+            } else if (runtime->is_openvr()) {
                 auto openvr = (runtimes::OpenVR*)runtime;
                 std::unique_lock __{ openvr->pose_mtx };
 
@@ -10062,6 +10108,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
                 openvr->pose_queue[now_frame] = openvr->pose_queue[last_frame];
             }
         }
+        // Flat3D: no compositor pose queue to clone — nothing to do.
 
         /*auto init_options = (sdk::FSceneViewInitOptions*)((uintptr_t)view_family.views.data[0] + INIT_OPTIONS_OFFSET);
         init_options->stereo_pass = 0;
@@ -12525,7 +12572,9 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         *view_location += camera_up;
     }
 
-    const auto is_2d_screen = vr->is_using_2d_screen();
+    // Flat 3D monitor mode reuses the 2D-screen neutralization: skip head
+    // translation and rotation overwrite (no HMD), keep eye separation.
+    const auto is_2d_screen = vr->is_using_2d_screen() || vr->is_using_flat3d();
 
     const auto rotation_offset = vr->get_rotation_offset();
     const auto current_hmd_rotation = glm::normalize(rotation_offset * glm::quat{vr->get_rotation(0)});
@@ -12552,7 +12601,6 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // if we have stereo emulation mode enabled
     // it is only for debugging purposes
     if (!vr->is_stereo_emulation_enabled()) {
-
         if (!has_double_precision) {
             if (!is_2d_screen) {
                 *view_location -= head_offset;
@@ -12578,6 +12626,59 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 rot_d->pitch = euler.x;
                 rot_d->yaw = euler.y;
                 rot_d->roll = euler.z;
+            }
+        }
+
+        // Flat 3D + OpenTrack head tracking (v2): additive TrackIR-style look
+        // (head rotation added on top of the game's own camera) and
+        // head-coupled parallax (camera-local translation). Pure no-op when
+        // OpenTrack is off — the game keeps its rotation and only the fixed
+        // eye separation applies (as above).
+        if (vr->is_using_flat3d()) {
+            auto* f = vr->get_flat3d_runtime();
+
+            if (f != nullptr && f->opentrack_active.load()) {
+                const float rs = vr->get_flat3d_opentrack_rot_scale();
+                const float ps = vr->get_flat3d_opentrack_pos_scale();
+
+                // Read the current (game) view yaw to build a camera-local
+                // basis for the positional shift.
+                const float base_yaw_deg = has_double_precision ? (float)rot_d->yaw : view_rotation->yaw;
+                const float add_pitch = glm::degrees(f->head_pitch.load()) * rs;
+                const float add_yaw   = glm::degrees(f->head_yaw.load())   * rs;
+                const float add_roll  = glm::degrees(f->head_roll.load())  * rs;
+
+                if (!has_double_precision) {
+                    view_rotation->pitch += add_pitch;
+                    view_rotation->yaw   += add_yaw;
+                    view_rotation->roll  += add_roll;
+                } else {
+                    rot_d->pitch += add_pitch;
+                    rot_d->yaw   += add_yaw;
+                    rot_d->roll  += add_roll;
+                }
+
+                // Positional parallax: translate the eye origin by head x/y/z
+                // in the game camera's local frame (yaw-only basis, UE X=fwd,
+                // Y=right, Z=up), scaled to world units.
+                const float yaw_rad = glm::radians(base_yaw_deg);
+                const float cy = std::cos(yaw_rad);
+                const float sy = std::sin(yaw_rad);
+                const float hx = f->head_x.load() * ps * world_scale; // right
+                const float hy = f->head_y.load() * ps * world_scale; // up
+                const float hz = f->head_z.load() * ps * world_scale; // forward
+
+                // forward = (cy, sy, 0), right = (sy, -cy, 0), up = (0,0,1)
+                const glm::vec3 head_shift{
+                    hz * cy + hx * sy,
+                    hz * sy - hx * cy,
+                    hy};
+
+                if (!has_double_precision) {
+                    *view_location -= head_shift;
+                } else {
+                    *view_d -= head_shift;
+                }
             }
         }
 
@@ -12908,6 +13009,103 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         } else {
             (*out)[3][2] = sdk::globals::get_near_clipping_plane();
         }
+    }
+
+    // Flat 3D monitor mode: game-FoV perspective + off-axis shear at [2][0].
+    // Shear delta = dir * (sep/2 / convergence) * P00 — the classic
+    // parallel-cameras + asymmetric-frustum method (VRto3D / perfect_dark_3D):
+    // geometry at z == convergence lands at zero disparity, nearer pops out.
+    //
+    // The matrix produced by the "original" call above is NOT the game
+    // camera's projection — the hooked function is UE's built-in
+    // FFakeStereoRenderingDevice (hardcoded ~126° FoV, 640x480 aspect), and
+    // when no direct hook exists `out` is untouched garbage. So the game's
+    // real FoV is sampled from APlayerCameraManager (game thread) and the
+    // projection is rebuilt with the engine's own reversed-Z infinite-far
+    // construction (same shape as the 2d-screen path below).
+    if (vr->is_using_flat3d() && out != nullptr) {
+        auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
+
+        if (vr->is_using_afr()) {
+            true_index = g_frame_count % 2;
+        }
+
+        auto* flat3d = vr->get_flat3d_runtime();
+
+        // Once per frame (this is called once per eye).
+        static uint32_t fov_sample_frame = 0xFFFFFFFF;
+        if (fov_sample_frame != (uint32_t)g_frame_count) {
+            fov_sample_frame = (uint32_t)g_frame_count;
+            flat3d->game_fov_deg.store(vr->sample_flat3d_game_fov(flat3d->game_fov_deg.load()));
+            flat3d->game_wants_cursor.store(vr->sample_flat3d_show_cursor(flat3d->game_wants_cursor.load()));
+            flat3d->game_paused.store(vr->sample_flat3d_game_paused(flat3d->game_paused.load()));
+            vr->sample_flat3d_camera_and_publish_anchors();
+        }
+
+        const float half_fov = glm::radians(flat3d->game_fov_deg.load()) * 0.5f;
+        const float tan_half_h = glm::tan(half_fov);
+        const float rt_w = (float)flat3d->get_width();
+        const float rt_h = (float)flat3d->get_height();
+        const float aspect = rt_h > 0.0f && rt_w > 0.0f ? (rt_w / rt_h) : (16.0f / 9.0f);
+        // Our-side near-plane resolver (SDK dummy -> r.SetNearClipPlane / UE
+        // default) so the UESDK submodule stays pristine. See VR::flat3d_effective_nearz.
+        const float near_z = vr->flat3d_effective_nearz();
+
+        // Effective separation must match the eye translation the view path
+        // applies (eyes[] x world_to_meters x world_scale); convergence stays
+        // in game meters, so only world_scale enters the ratio.
+        const float sep = flat3d->separation_m.load() * vr->get_world_scale(); // meters
+        const float conv = std::max(flat3d->convergence_m.load(), 0.001f);     // meters
+        const float o = sep * 0.5f / conv; // frustum shear offset (tangent units)
+
+        // Symmetric-projection compat — driven by the same Compatibility page
+        // setting the HMD paths use (Horizontal Projection = Symmetrical in
+        // OpenVR/OpenXR.cpp: widen the tangents to a symmetric superset,
+        // compensate by cropping — here the compositor crops via the scene
+        // shift+scale instead of submit view_bounds). The flat3d frustum is
+        // already vertically symmetric and horizontally mirrored between the
+        // eyes, so the Vertical override and Mirrored are inherently no-ops.
+        const bool symmetric = vr->get_horizontal_projection_override() == VR::HORIZONTAL_PROJECTION_OVERRIDE::HORIZONTAL_SYMMETRIC;
+
+        // Horizontal scale: original tangent, widened by |o| when symmetric.
+        const float xs_tan = symmetric ? (tan_half_h + o) : tan_half_h;
+        const float xs = xs_tan > 0.0f ? (1.0f / xs_tan) : 1.0f;
+        // Vertical FoV is unchanged in either mode.
+        const float ys = (tan_half_h > 0.0f ? (1.0f / tan_half_h) : 1.0f) * aspect;
+
+        // Sign: in UE's projection convention (z forward, w = z) the LEFT eye
+        // shear is NEGATIVE. Proof via the HMD chain this mode mirrors:
+        // VRto3D returns left-eye tangents {l = -t+o, r = t+o} with
+        // o = +sep/2/conv, and OpenVR.cpp's get_mat maps raw tangents into
+        // [2][0] = (l'+r')/(l'-r') with l' = -l, r' = -r, giving -o*P00.
+        const float dir = (true_index == 0) ? -1.0f : 1.0f;                    // left -, right +
+        const float shear = symmetric ? 0.0f : dir * o * xs;
+
+        vr->m_nearz = near_z;
+        flat3d->update_matrices(near_z, 10000.0f);
+
+        if (!g_hook->m_has_double_precision) {
+            *out = Matrix4x4f {
+                xs, 0.0f, 0.0f, 0.0f,
+                0.0f, ys, 0.0f, 0.0f,
+                shear, 0.0f, 0.0f, 1.0f,
+                0.0f, 0.0f, near_z, 0.0f
+            };
+
+            flat3d->set_game_projection((uint32_t)true_index, *out, tan_half_h, 1.0f / ys, near_z);
+        } else {
+            auto& dm = *(Matrix4x4d*)out;
+            dm = Matrix4x4d {
+                (double)xs, 0.0, 0.0, 0.0,
+                0.0, (double)ys, 0.0, 0.0,
+                (double)shear, 0.0, 0.0, 1.0,
+                0.0, 0.0, (double)near_z, 0.0
+            };
+
+            flat3d->set_game_projection((uint32_t)true_index, Matrix4x4f{dm}, tan_half_h, 1.0f / ys, near_z);
+        }
+
+        return out;
     }
 
     if (VR::get()->is_using_2d_screen()) {
@@ -17740,6 +17938,39 @@ bool VRRenderTargetManager_Base::need_reallocate_depth_texture(const void* Depth
     return false;
 }
 
+// Size for the redirected UI (Slate) render target. Normally the backbuffer
+// size — but under the 3D Display native-output override the swapchain is
+// held at the display's native size while the ENGINE believes (and draws
+// Slate at) its own requested resolution; the UI target must match that
+// belief or the UI renders cropped into a corner of the larger texture.
+static auto get_ui_texture_size() {
+    auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+
+    if (VR::get()->is_using_flat3d()) {
+        uint32_t believed_w = 0;
+        uint32_t believed_h = 0;
+
+        if (g_framework->is_dx11()) {
+            if (const auto& hook = g_framework->get_d3d11_hook(); hook != nullptr) {
+                believed_w = hook->get_engine_believed_width();
+                believed_h = hook->get_engine_believed_height();
+            }
+        } else {
+            if (const auto& hook = g_framework->get_d3d12_hook(); hook != nullptr) {
+                believed_w = hook->get_engine_believed_width();
+                believed_h = hook->get_engine_believed_height();
+            }
+        }
+
+        if (believed_w != 0 && believed_h != 0) {
+            size.x = (float)believed_w;
+            size.y = (float)believed_h;
+        }
+    }
+
+    return size;
+}
+
 void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& ctx, bool from_second) {
     if (g_framework->is_dx12() && shf_is_current_game()) {
         SPDLOG_INFO_EVERY_N_SEC(2, "[SHf] PreTextureHook summary last_desc={:x}", ctx.r8);
@@ -18070,7 +18301,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
     //a.movabs(rdx, ctx.rdx);
     a.movabs(r8, ctx.r8);
     //a.movabs(r9, ctx.r9);
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    const auto size = get_ui_texture_size();
     a.mov(r9, (uint32_t)size.x);
     // move w into first stack argument
     a.mov(dword_ptr(rsp, 0x20), (uint32_t)size.y);
@@ -18170,7 +18401,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
         a.mov(r8, ctx.r8);
 
-        const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+        const auto size = get_ui_texture_size();
         a.mov(r9, (uint32_t)size.x);
 
         a.sub(rsp, 0x100);
@@ -18207,7 +18438,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
     static FTexture2DRHIRef out{};
     static FTexture2DRHIRef shader_out{};
 
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    const auto size = get_ui_texture_size();
     const auto stack_args = (uintptr_t*)(ctx.rsp + 0x20);
 
     SPDLOG_INFO("About to call the original!");
@@ -20558,7 +20789,7 @@ bool VRRenderTargetManager::AllocateRenderTargetTexture(uint32_t Index, uint32_t
     *(uint64_t*)&TargetableTextureFlags |= (uint64_t)ETextureCreateFlags::ShaderResource | (uint64_t)Flags;
     RHICreateTexture2D_RenderThread(dynamic_rhi, &OutTargetableTexture, command_list, SizeX, SizeY, 2, NumMips, NumSamples, TargetableTextureFlags, &create_info);
 
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    const auto size = get_ui_texture_size();
     RHICreateTexture2D_RenderThread(dynamic_rhi, &OutShaderResourceTexture, command_list, (uint32_t)size.x, (uint32_t)size.y, 2, NumMips, NumSamples, TargetableTextureFlags, &create_info);
 
     this->render_target = OutTargetableTexture.texture;

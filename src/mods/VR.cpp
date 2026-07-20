@@ -2521,6 +2521,27 @@ bool VR::is_controller_camera_conflict_guard_active() const {
 std::optional<std::string> VR::clean_initialize() try {
     ZoneScopedN(__FUNCTION__);
 
+    // Flat 3D display mode takes priority over the HMD runtimes when the
+    // frontend requests it. No VR API/DLL is required for it.
+    if (m_requested_runtime_name->value() == "flat3d") {
+        auto flat3d_error = initialize_flat3d();
+
+        if (!flat3d_error && m_flat3d->loaded) {
+            m_openvr->is_hmd_active = false;
+            m_openvr->was_hmd_active = false;
+            m_openvr->needs_pose_update = false;
+            m_openxr->needs_pose_update = false;
+
+            m_init_finished = true;
+            return Mod::on_initialize();
+        }
+
+        if (flat3d_error) {
+            spdlog::error("Flat3D failed to initialize: {}", *flat3d_error);
+        }
+        // fall through to the HMD runtimes
+    }
+
     auto openvr_error = initialize_openvr();
 
     if (openvr_error || !m_openvr->loaded) {
@@ -3235,6 +3256,14 @@ bool VR::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == WM_DEVICECHANGE && !m_spoofed_gamepad_connection) {
         spdlog::info("[VR] Received WM_DEVICECHANGE");
         m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
+    }
+
+    // 3D Display stereo cursor: keep the game from arming a hardware cursor —
+    // the OS composites it flat on top of the stereo output (one copy at
+    // screen depth). The compositor draws the per-eye cursor instead.
+    if (message == WM_SETCURSOR && is_using_flat3d() && m_flat3d_cursor_mode->value() != 0) {
+        SetCursor(nullptr);
+        return false;
     }
 
     return true;
@@ -7068,6 +7097,37 @@ void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void
     }
 }
 
+float VR::flat3d_effective_nearz() {
+    // Custom Z Near is an explicit user override written into the SDK's cell by
+    // on_pre_viewport_client_draw — honor it exactly, whatever value they pick.
+    if (m_custom_z_near_enabled->value()) {
+        return sdk::globals::get_near_clipping_plane();
+    }
+
+    const float nz = sdk::globals::get_near_clipping_plane();
+    // A successful scan yields the game's real plane (UE default ~10 uu). The
+    // SDK returns a 1.0 dummy when the scan fails; treat <=1.0 as "no value".
+    if (std::isfinite(nz) && nz > 1.0f) {
+        return nz;
+    }
+
+    // Failed-scan fallback (kept out of the pristine UESDK submodule): use the
+    // game's r.SetNearClipPlane cvar if it set one, else UE's own default of 10
+    // (a far closer approximation than the SDK's 1.0 dummy). r.SetNearClipPlane
+    // is 0 until set, so only adopt a positive value.
+    try {
+        if (auto data = sdk::find_cvar_data_cached(L"Engine", L"r.SetNearClipPlane"); data) {
+            if (auto* cv = data->get<float>(); cv != nullptr && cv->get() > 0.0f) {
+                SPDLOG_INFO_ONCE("[Flat3D] near plane fallback via r.SetNearClipPlane cvar");
+                return cv->get();
+            }
+        }
+    } catch (...) {
+    }
+
+    return 10.0f;
+}
+
 void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     ZoneScopedN(__FUNCTION__);
 
@@ -7075,7 +7135,10 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
     auto runtime = get_runtime();
     if (m_uncap_framerate->value()) {
-        sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
+        // The 3D Display 2x-refresh cap owns t.MaxFPS while active.
+        if (!(is_using_flat3d() && m_flat3d_vsync->value() == 3)) {
+            sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
+        }
     }
 
     // Allows games running in HDR mode to not have a black UI overlay
@@ -7120,11 +7183,12 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
             const auto now_frame = frame_count % runtimes::OpenXR::QUEUE_SIZE;
             m_openxr->pipeline_states[now_frame] = m_openxr->pipeline_states[last_frame];
             m_openxr->pipeline_states[now_frame].frame_count = now_frame;
-        } else {
+        } else if (runtime->is_openvr()) {
             const auto last_frame = (frame_count - 1) % m_openvr->pose_queue.size();
             const auto now_frame = frame_count % m_openvr->pose_queue.size();
             m_openvr->pose_queue[now_frame] = m_openvr->pose_queue[last_frame];
         }
+        // Flat3D: no compositor pose queue to clone.
 
         // Forcefully disable motion blur because it freaks out with AFR
         sdk::set_cvar_data_int(L"Engine", L"r.DefaultFeature.MotionBlur", 0);
@@ -7870,6 +7934,10 @@ void VR::handle_keybinds() {
     if (m_keybind_toggle_gui->is_key_down_once()) {
         m_enable_gui->toggle();
     }
+
+    if (is_using_flat3d()) {
+        handle_flat3d_keybinds();
+    }
 }
 
 void VR::on_frame() {
@@ -7878,6 +7946,10 @@ void VR::on_frame() {
     m_last_mod_frame = std::chrono::steady_clock::now();
     m_cvar_manager->on_frame();
     handle_keybinds();
+
+    if (is_using_flat3d()) {
+        update_flat3d_params();
+    }
 
     if (!get_runtime()->ready()) {
         return;
@@ -8410,6 +8482,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         PAGE_INPUT,
         PAGE_CAMERA,
         PAGE_KEYBINDS,
+        PAGE_MONITOR3D,
         PAGE_CONSOLE,
         PAGE_COMPATIBILITY,
         PAGE_DEBUG,
@@ -8470,6 +8543,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
     case "Keybinds"_fnv:
         selected_page = PAGE_KEYBINDS;
         break;
+    case "3D Display"_fnv:
+        selected_page = PAGE_MONITOR3D;
+        break;
     case "Console/CVars"_fnv:
         selected_page = PAGE_CONSOLE;
         break;
@@ -8501,13 +8577,17 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         ImGui::Text((std::string{"Runtime Information ("} + get_runtime()->name().data() + ")").c_str());
 
-        m_desktop_fix->draw("Desktop Spectator View");
+        // No-ops under 3D Display mode: the flat3d compositor owns the real
+        // backbuffer (no desktop mirror) and 2D-screen is mutually exclusive.
+        if (!is_using_flat3d()) {
+            m_desktop_fix->draw("Desktop Spectator View");
 
-        if (m_desktop_fix->value()) {
-            m_desktop_mirror_mode->draw("Desktop Spectator View Mode");
+            if (m_desktop_fix->value()) {
+                m_desktop_mirror_mode->draw("Desktop Spectator View Mode");
+            }
+
+            m_2d_screen_mode->draw("2D Screen Mode");
         }
-
-        m_2d_screen_mode->draw("2D Screen Mode");
 
         ImGui::TextWrapped("Render Resolution (per-eye): %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
         ImGui::TextWrapped("Total Render Resolution: %d x %d", get_runtime()->get_width() * 2, get_runtime()->get_height());
@@ -8518,7 +8598,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         get_runtime()->on_draw_ui();
 
-        m_overlay_component.on_draw_ui();
+        if (!is_using_flat3d()) {
+            // VR-compositor overlay options — inert without a VR compositor.
+            m_overlay_component.on_draw_ui();
+        }
 
         ImGui::TreePop();
     }
@@ -8583,7 +8666,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_disable_blur_widgets->draw("Disable Blur Widgets");
         m_uncap_framerate->draw("Uncap Framerate");
         m_enable_gui->draw("Enable GUI");
-        m_enable_depth->draw("Enable Depth-based Latency Reduction");
+
+        if (!is_using_flat3d()) {
+            // Depth submission to the VR compositor — no compositor here.
+            m_enable_depth->draw("Enable Depth-based Latency Reduction");
+        }
         m_load_blueprint_code->draw("Load Blueprint Code");
 
         const auto draw_status_badge = [](const char* label, const char* status, const ImVec4& color) {
@@ -8719,7 +8806,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
     }
 
-    if (selected_page == PAGE_INPUT) {
+    if (selected_page == PAGE_INPUT && is_using_flat3d()) {
+        ImGui::TextWrapped("Motion-controller input options are not applicable in 3D Display mode\n"
+                           "(no VR controllers). Keyboard/mouse hotkeys are on the Keybinds and\n"
+                           "3D Display pages.");
+    } else if (selected_page == PAGE_INPUT) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Controller")) {
             m_joystick_deadzone->draw("VR Joystick Deadzone");
@@ -9209,6 +9300,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
     }
 
+    if (selected_page == PAGE_MONITOR3D) {
+        on_draw_sidebar_flat3d();
+    }
+
     if (selected_page == PAGE_CONSOLE) {
         m_cvar_manager->on_draw_ui();
     }
@@ -9403,30 +9498,34 @@ void VR::on_draw_ui() {
         return;
     }
 
-    if (ImGui::Button("Set Standing Height")) {
-        m_standing_origin.y = get_position(0).y;
-    }
+    // These are HMD-runtime controls (tracked standing origin / recenter /
+    // reinitialize) — meaningless in Flat3D (3D Display) mode, so hide the row.
+    if (!is_using_flat3d()) {
+        if (ImGui::Button("Set Standing Height")) {
+            m_standing_origin.y = get_position(0).y;
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Set Standing Origin")) {
-        m_standing_origin = get_position(0);
-    }
+        if (ImGui::Button("Set Standing Origin")) {
+            m_standing_origin = get_position(0);
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Recenter View")) {
-        recenter_view();
-    }
+        if (ImGui::Button("Recenter View")) {
+            recenter_view();
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-     if (ImGui::Button("Recenter Horizon")) {
-        recenter_horizon();
-    }
-	
-    if (ImGui::Button("Reinitialize Runtime")) {
-        get_runtime()->wants_reinitialize = true;
+        if (ImGui::Button("Recenter Horizon")) {
+            recenter_horizon();
+        }
+
+        if (ImGui::Button("Reinitialize Runtime")) {
+            get_runtime()->wants_reinitialize = true;
+        }
     }
 }
 
