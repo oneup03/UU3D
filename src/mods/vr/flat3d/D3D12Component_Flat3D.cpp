@@ -17,6 +17,156 @@
 #include "../D3D12Component.hpp"
 
 namespace vrmod {
+// AFW (Asynchronous Frame Warp) for Flat3D. Mirrors the OpenXR warp block in
+// D3D12Component::on_frame, but sized to the Flat3D display eye extent and feeding
+// the Flat3D compositor instead of the VR compositor. Depth + motion vectors are
+// harvested globally (DLSS NGX hook / NeverDLSS raw barriers) into
+// vr->depthDesc/motionVectorsDesc regardless of runtime. The PDAFWPlugin and the
+// Flat3D compositor both run on the game's main command queue, so the warp (below)
+// is serialized before the compositor's read of the warped eye — no extra fence.
+ID3D12Resource* D3D12Component::run_flat3d_framewarp(
+    VR* vr,
+    ID3D12Resource* double_wide,
+    uint32_t eye_w, uint32_t eye_h,
+    DXGI_FORMAT eye_format,
+    DXGI_FORMAT backbuffer_format,
+    bool extreme,
+    uint32_t backbuffer_index)
+{
+    // Only once AFW has engaged (post-warmup, DX12) and the real plugin device is
+    // live. The dummy PDAFWPlugin returns a null renderer from InitDevice, so this
+    // stays a no-op and the caller falls back to plain AFR (stale-eye reuse).
+    if (!vr->is_using_afw() || vr->d3d12Renderer == nullptr || double_wide == nullptr) {
+        return nullptr;
+    }
+
+    const EyeIndex nEye = (vr->m_render_frame_count % 2 == vr->m_left_eye_interval) ? EyeLeft : EyeRight;
+    const EyeIndex nEyeOther = (nEye == EyeLeft) ? EyeRight : EyeLeft;
+
+    // (Re)allocate the plugin-owned per-eye framebuffers at the Flat3D eye extent
+    // (NOT hmd dims — see the OpenXR setup()'s InitFrameWarp block, which uses
+    // get_hmd_width/height). Only re-init on a size/format change.
+    static uint32_t s_last_w = 0, s_last_h = 0;
+    static DXGI_FORMAT s_last_fmt = DXGI_FORMAT_UNKNOWN;
+    if (s_last_w != eye_w || s_last_h != eye_h || s_last_fmt != backbuffer_format) {
+        FrameWarpInitParams ip{ (int)eye_w, (int)eye_h, eye_format, backbuffer_format };
+        m_eyeFrameBuffers = InitFrameWarp(ip);
+        s_last_w = eye_w; s_last_h = eye_h; s_last_fmt = backbuffer_format;
+        SPDLOG_INFO("[Flat3D][AFW] InitFrameWarp {}x{} eyeFmt={} bbFmt={}",
+            eye_w, eye_h, (uint32_t)eye_format, (uint32_t)backbuffer_format);
+    }
+
+    auto& eyeFB = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
+    auto& otherFB = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
+    if (eyeFB.color.pTexture == nullptr || otherFB.color.pTexture == nullptr) {
+        return nullptr; // plugin didn't allocate (dummy / init failed)
+    }
+
+    // Seed the depth SIZE from the engine pool if the harvest hasn't set rawDepthTex
+    // yet (mirrors on_frame). The harvest hooks fill the CONTENT; this only sizes the
+    // depthDesc/motionVectorsDesc copies the plugin samples.
+    if (!vr->rawDepthTex) {
+        if (auto& rt_pool = vr->get_render_target_pool_hook(); rt_pool != nullptr) {
+            if (auto seed = rt_pool->get_texture<ID3D12Resource>(L"SceneDepthZ"); seed) {
+                vr->rawDepthTex = seed.Get();
+            }
+        }
+    }
+
+    // Allocate depthDesc / motionVectorsDesc (mirror on_frame). depth sized to
+    // rawDepthTex; MV to rawMotionVectorsTex, else an R16G16_FLOAT placeholder.
+    if (vr->rawDepthTex) {
+        const auto d = vr->rawDepthTex->GetDesc();
+        for (int i = 0; i < 2; ++i) {
+            if (vr->depthDesc[i].pTexture == nullptr ||
+                vr->depthDesc[i].pTexture->GetDesc().Width != d.Width ||
+                vr->depthDesc[i].pTexture->GetDesc().Height != d.Height) {
+                vr->d3d12Renderer->CreateTexture((int)d.Width, (int)d.Height, d.Format,
+                    D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->depthDesc[i], true);
+            }
+        }
+        if (!vr->rawMotionVectorsTex) {
+            for (int i = 0; i < 2; ++i) {
+                if (vr->motionVectorsDesc[i].pTexture == nullptr ||
+                    vr->motionVectorsDesc[i].pTexture->GetDesc().Width != d.Width ||
+                    vr->motionVectorsDesc[i].pTexture->GetDesc().Height != d.Height) {
+                    vr->d3d12Renderer->CreateTexture((int)d.Width, (int)d.Height, DXGI_FORMAT_R16G16_FLOAT,
+                        D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->motionVectorsDesc[i], true);
+                }
+            }
+        }
+    }
+    if (vr->rawMotionVectorsTex) {
+        const auto d = vr->rawMotionVectorsTex->GetDesc();
+        for (int i = 0; i < 2; ++i) {
+            if (vr->motionVectorsDesc[i].pTexture == nullptr ||
+                vr->motionVectorsDesc[i].pTexture->GetDesc().Width != d.Width ||
+                vr->motionVectorsDesc[i].pTexture->GetDesc().Height != d.Height) {
+                vr->d3d12Renderer->CreateTexture((int)d.Width, (int)d.Height, DXGI_FORMAT_R16G16_FLOAT,
+                    D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->motionVectorsDesc[i], true);
+            }
+        }
+    }
+
+    // Don't warp against garbage: require harvested depth for this eye. Until DLSS
+    // (or the NeverDLSS raw path) produces depth, fall back to plain AFR.
+    if (vr->depthDesc[nEye].pTexture == nullptr) {
+        return nullptr;
+    }
+
+    // Camera matrices src(current eye)->dest(other eye). Rate-limited internally.
+    vr->update_camera_data(vr->m_render_frame_count);
+
+    // Wrap the engine double-wide as a plugin TextureDesc. The compositor keeps it
+    // in RENDER_TARGET (kEngineSrcColor), or PRESENT under extreme-compat; Crop
+    // transitions to COPY_SOURCE and restores it before the compositor reads it.
+    static TextureDesc s_dwDesc[8];
+    const uint32_t di = backbuffer_index % 8;
+    if (s_dwDesc[di].pTexture != double_wide) {
+        s_dwDesc[di] = TextureDesc{};
+        s_dwDesc[di].pTexture = double_wide;
+        s_dwDesc[di].initialState = extreme ? D3D12_RESOURCE_STATE_PRESENT : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        vr->d3d12Renderer->SetupTextureDesc(s_dwDesc[di]);
+    }
+
+    auto* cmdList = vr->d3d12Renderer->BeginCommandList((int)backbuffer_index);
+
+    // Crop the freshly-rendered eye (left half of the double-wide) into the plugin's
+    // current-eye color buffer.
+    D3D12_BOX src_box{ 0, 0, 0, eye_w, eye_h, 1 };
+    vr->d3d12Renderer->Crop(cmdList, eyeFB.color, s_dwDesc[di], src_box);
+
+    static FrameBufferDesc s_in{};
+    s_in.color = eyeFB.color;
+    s_in.depth = vr->depthDesc[nEye];
+    s_in.motionVectors = vr->motionVectorsDesc[nEye];
+
+    FrameWarpEvaluateParams p{};
+    p.InCmdList = cmdList;
+    p.InEyeFrameBuffer = &s_in;
+    p.InUIColorAlpha = nullptr;
+    p.IsHudlessColor = true;
+    p.MotionVectorsType = vr->is_ghosting_fix_enabled() ? Normal : FromOtherEye;
+    p.InMotionScale[0] = vr->mvScale[0];
+    p.InMotionScale[1] = vr->mvScale[1];
+    p.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
+    p.EyeIndex = nEye;
+    p.ClearBeforeWarping = vr->m_clear_before_framewarp->value();
+    p.CameraData = &vr->cameraData[nEye];
+    p.IgnoreMotionThreshold = vr->m_ignore_motion_threshold->value();
+    p.Debug = vr->m_framewarp_debug->value();
+    if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() && vr->is_fix_moving_object_brightness_flickering()) {
+        p.InUEVelocityBuffer = &vr->rawVelocityDesc[nEye];
+    }
+    p.UseUINT64 = vr->is_use_uint64();
+    EvaluateFrameWarp(p);
+
+    vr->d3d12Renderer->EndCommandList((int)backbuffer_index);
+
+    // The plugin reprojected into the OTHER eye's buffer, left in ALL_SHADER_RESOURCE.
+    return otherFB.color.pTexture;
+}
+
 vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     auto& hook = g_framework->get_d3d12_hook();
 
@@ -169,6 +319,20 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
 
     if (params.want_depth || params.hud_depth_mode == 1) {
         switch (vr->flat3d_depth_source()) {
+        case VR::FLAT3D_DEPTH_DLSS: {
+            // The AFW pipeline harvests the DLSS (or NeverDLSS raw) scene depth into
+            // vr->depthDesc[] each frame — the exact per-eye depth the warp uses, so
+            // convergence/crosshair track the warp. Only populated while AFW is
+            // engaged; otherwise stays null and the depth features hold their last
+            // values (same graceful behavior as the other sources).
+            const int n_eye = (vr->m_render_frame_count % 2 == vr->m_left_eye_interval) ? 0 : 1;
+            if (vr->depthDesc[n_eye].pTexture != nullptr) {
+                scene_depth = vr->depthDesc[n_eye].pTexture; // owned copy, reverse-Z device depth
+                scene_depth_state = kShaderReadState;        // == ALL_SHADER_RESOURCE bits
+            }
+            break;
+        }
+
         case VR::FLAT3D_DEPTH_DSV_OBSERVER:
             if (wants_dsv_depth) {
                 // Owned snapshot from the D3D12Hook DSV/barrier observer. No
@@ -232,11 +396,32 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     float nearest_uu = -1.0f;
     float ui_coverage = 0.0f;
 
+    // AFW: reproject the freshly-rendered eye into the other eye (DLSS / raw depth +
+    // motion vectors). When it runs, the warped eye is handed to the compositor as
+    // the discrete second per-eye source (via the right_eye_src argument — free here
+    // because AFW and native-stereo-fix are mutually exclusive). On any miss (plugin
+    // absent, depth not live yet), warp_frame is cleared and the compositor falls
+    // back to plain AFR (stale-eye reuse).
+    ID3D12Resource* warped_eye = nullptr; // plugin-owned; borrowed for this frame
+    if (params.warp_frame) {
+        warped_eye = run_flat3d_framewarp(vr, double_wide.Get(), eye_w, eye_h,
+            dw_desc.Format, bb_desc.Format, extreme, swapchain->GetCurrentBackBufferIndex());
+        if (warped_eye == nullptr) {
+            // Warp unavailable this frame (plugin absent / depth not live yet). The
+            // engine still rendered only ONE eye (AFW rides AFR), so fall back to
+            // plain AFR: fresh eye from the left half, other eye from the stale
+            // cache — NOT both double-wide halves (the right half is garbage here).
+            params.warp_frame = false;
+            params.afr_frame = true;
+        }
+    }
+    ID3D12Resource* second_eye_src = params.warp_frame ? warped_eye : right_eye_src.Get();
+
     // UEVR's own ImGui menu: composite it into the eyes at menu depth
     // (Framework skips its flat backbuffer draw when we consumed it).
     ID3D12Resource* menu_tex = g_framework->get_rendertarget_d3d12().Get();
 
-    if (!m_flat3d_compositor.composite(double_wide.Get(), right_eye_src.Get(), ui_tex, menu_tex, real_backbuffer.Get(),
+    if (!m_flat3d_compositor.composite(double_wide.Get(), second_eye_src, ui_tex, menu_tex, real_backbuffer.Get(),
                                        (uint32_t)bb_desc.Width, bb_desc.Height, params,
                                        scene_depth.Get(), vr->get_flat3d_runtime()->game_nearz.load(),
                                        &center_uu, &nearest_uu, &ui_coverage, g_framework->get_window(),

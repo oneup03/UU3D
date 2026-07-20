@@ -1569,8 +1569,13 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     p.mode = m_flat3d_output_mode->value();
     p.vsync_override = m_flat3d_vsync->value();
     p.eye_swap = m_flat3d_eye_swap->value();
-    p.afr_frame = is_using_afr();
-    p.afr_left_eye = p.afr_frame && (m_render_frame_count % 2 == m_left_eye_interval);
+    // AFW: the engine renders one eye/frame (rides is_using_afr()); the other eye
+    // is reprojected. warp_frame drives the compositor to take both eyes fresh (the
+    // rendered half + the warped discrete texture) instead of reusing the stale eye.
+    p.warp_frame = is_using_afw();
+    p.afr_frame = is_using_afr() && !p.warp_frame;
+    // afr_left_eye stays meaningful under warp_frame: which eye the engine rendered.
+    p.afr_left_eye = (is_using_afr() || p.warp_frame) && (m_render_frame_count % 2 == m_left_eye_interval);
     p.native_stereo_layout = is_native_stereo_fix_enabled();
     p.paper_white_nits = m_flat3d_hdr_paper_white->value();
 
@@ -2042,6 +2047,50 @@ void VR::on_draw_sidebar_flat3d() {
         } else {
             ImGui::TextDisabled("DSV: %s", m_d3d12.get_flat3d_depth_trace_summary().c_str());
         }
+    }
+    if (flat3d_depth_source() == FLAT3D_DEPTH_DLSS && !is_using_afw_without_api_check()) {
+        ImGui::TextDisabled("DLSS Depth is only captured while Alternate Frame Warp is active.");
+    }
+
+    if (ImGui::TreeNode("Async Frame Warp (AFW)")) {
+        m_rendering_method->draw("Rendering Method");
+        text_disabled_wrapped("AFW renders one eye and reprojects the other from depth + motion "
+                              "vectors (~2x scene performance). Requires DX12 + DLSS in the game "
+                              "and PDAFWPlugin.dll beside UEVRBackend.dll (the shipped build only "
+                              "carries a no-op stub - copy the real DLL from PureDark's release).");
+
+        if (m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP) {
+            if (!m_is_d3d12) {
+                ImGui::TextDisabled("AFW requires D3D12.");
+            } else {
+                // d3d12Renderer is non-null only when the REAL plugin's InitDevice
+                // succeeded; the dummy stub returns null and we fall back to AFR.
+                const bool plugin_active = d3d12Renderer != nullptr;
+                if (!plugin_active) {
+                    ImGui::TextDisabled("Plugin: not loaded (PDAFWPlugin.dll) - plain AFR fallback.");
+                } else if (afw_since_inject_frame_count < 90) {
+                    ImGui::TextDisabled("Warming up... (%d/90)", (int)afw_since_inject_frame_count);
+                } else {
+                    const char* mv_src = (last_dlss_frame_count != 0) ? "DLSS"
+                        : (is_never_dlss() ? "raw buffers (no DLSS)" : "waiting for depth/MV");
+                    ImGui::TextDisabled("Active | motion-vector source: %s", mv_src);
+                }
+
+                m_framewarp_mode->draw("Warp Mode");
+                m_ghosting_fix->draw("Ghosting Fix");
+                m_fix_object_motion_vector->draw("Fix Object Motion Vectors");
+                if (m_fix_object_motion_vector->value()) {
+                    m_fix_object_motion_range->draw("Object Motion Range");
+                    m_fix_moving_object_brightness_flickering->draw("Fix Moving-Object Brightness Flicker");
+                }
+                m_ultra_responsive->draw("Ultra Responsive");
+                m_ignore_motion_threshold->draw("Ignore Motion Threshold");
+                m_clear_before_framewarp->draw("Clear Before Warping");
+                m_framewarp_debug->draw("Debug Overlay");
+                m_use_uint64->draw("Use UINT64 Shaders");
+            }
+        }
+        ImGui::TreePop();
     }
 
     if (ImGui::TreeNode("Auto-Convergence")) {

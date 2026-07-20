@@ -61,8 +61,12 @@ struct Flat3DFrameParams {
     int32_t vsync_override{0};
     bool eye_swap{false};
     bool afr_frame{false};      // only one eye is fresh this frame
-    bool afr_left_eye{false};   // which eye is fresh (when afr_frame)
+    bool afr_left_eye{false};   // which eye is fresh (when afr_frame OR warp_frame)
     bool native_stereo_layout{false}; // native-stereo-fix: sample left half
+    // AFW: the engine rendered one eye (the afr_left_eye half of the double-wide)
+    // and the OTHER eye is supplied as a discrete warped texture (via right_eye_src,
+    // arriving in ALL_SHADER_RESOURCE state). Both eyes are refreshed this frame.
+    bool warp_frame{false};
 
     // GUI layer (per-eye parallax; dir = +1 left eye, -1 right eye).
     bool ui_enabled{false};

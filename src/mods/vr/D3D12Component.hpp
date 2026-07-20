@@ -154,6 +154,21 @@ private:
         ID3D12Device* device,
         D3D12_RESOURCE_STATES source_state);
 
+    // Flat3D AFW: reproject the freshly-rendered eye (left half of double_wide)
+    // into the other eye via the PDAFWPlugin, consuming the globally-harvested
+    // DLSS / raw-buffer depth + motion vectors. Returns the warped other-eye
+    // texture (left in ALL_SHADER_RESOURCE), or nullptr when AFW is inactive /
+    // the plugin is the dummy / depth isn't live yet (caller falls back to plain
+    // AFR). Defined in D3D12Component_Flat3D.cpp. See on_frame_flat3d.
+    ID3D12Resource* run_flat3d_framewarp(
+        VR* vr,
+        ID3D12Resource* double_wide,
+        uint32_t eye_w, uint32_t eye_h,
+        DXGI_FORMAT eye_format,
+        DXGI_FORMAT backbuffer_format,
+        bool extreme,
+        uint32_t backbuffer_index);
+
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     struct FrameTimingStats {

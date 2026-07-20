@@ -568,11 +568,17 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
     // Under extreme compat the "double-wide" IS the real backbuffer (PRESENT
     // state at this point); otherwise the engine RT sits in RENDER_TARGET.
     const auto src_state = params.extreme_backbuffer_src ? D3D12_RESOURCE_STATE_PRESENT : kEngineSrcColor;
+    // The AFW-warped second eye arrives in ALL_SHADER_RESOURCE (the plugin leaves it
+    // there after EvaluateFrameWarp); the native-stereo-fix scene-capture is in
+    // RENDER_TARGET (kEngineSrcColor).
+    const auto second_src_state = params.warp_frame
+        ? D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE
+        : kEngineSrcColor;
 
     barrier(cmd, double_wide, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     if (right_eye_src != nullptr) {
-        barrier(cmd, right_eye_src, kEngineSrcColor, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(cmd, right_eye_src, second_src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     }
 
     const auto copy_half = [&](int eye) {
@@ -581,12 +587,18 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         // Native-stereo-fix titles: only the LEFT half of the double-wide is
         // written by the engine; the RIGHT eye is rendered into the dedicated
         // scene-capture target (same consumption as the HMD submit path).
-        const bool use_capture = eye == 1 && params.native_stereo_layout && right_eye_src != nullptr;
+        // AFW: the engine renders ONE eye into the LEFT half; the OTHER eye is the
+        // discrete warped texture (right_eye_src), a full-frame copy.
+        const int fresh_eye = params.afr_left_eye ? 0 : 1;
+        const bool use_capture =
+            right_eye_src != nullptr &&
+            ((eye == 1 && params.native_stereo_layout) ||
+             (params.warp_frame && eye != fresh_eye));
 
-        // AFR / synced sequential: the engine renders ONE view per frame and
+        // AFR / synced sequential / AFW: the engine renders ONE view per frame and
         // it always lands in the LEFT half of the double-wide (same source
         // box the HMD AFR submit paths use) — regardless of which eye it is.
-        const bool left_half_src = params.native_stereo_layout || params.afr_frame;
+        const bool left_half_src = params.native_stereo_layout || params.afr_frame || params.warp_frame;
 
         D3D12_BOX box{};
         box.left = (eye == 0 || left_half_src) ? 0 : m_eye_w;
@@ -631,7 +643,7 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
     barrier(cmd, double_wide, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
 
     if (right_eye_src != nullptr) {
-        barrier(cmd, right_eye_src, D3D12_RESOURCE_STATE_COPY_SOURCE, kEngineSrcColor);
+        barrier(cmd, right_eye_src, D3D12_RESOURCE_STATE_COPY_SOURCE, second_src_state);
     }
 
     // NOTE on overlays under AFR: the stale eye keeps last frame's UI baked

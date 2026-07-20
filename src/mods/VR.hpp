@@ -638,6 +638,7 @@ public:
         FLAT3D_DEPTH_PER_DRAW = 0,     // API-level per-draw capture (safe default)
         FLAT3D_DEPTH_ENGINE_POOL = 1,  // UE render-target pool SceneDepthZ (engine hook)
         FLAT3D_DEPTH_DSV_OBSERVER = 2, // D3D12Hook DSV/barrier observer snapshot (no engine hook)
+        FLAT3D_DEPTH_DLSS = 3,         // the AFW-harvested DLSS depth (only in AFW mode)
     };
 
     int32_t flat3d_depth_source() const {
@@ -669,6 +670,14 @@ public:
     // per-draw path).
     bool flat3d_wants_dsv_depth() const {
         return flat3d_depth_source() == FLAT3D_DEPTH_DSV_OBSERVER && m_is_d3d12;
+    }
+
+    // The "DLSS Depth (AFW)" source reuses the per-eye depth the AFW pipeline
+    // harvests from DLSS (or the NeverDLSS raw path) into vr->depthDesc[]. It is
+    // only populated while AFW is engaged, so it's the natural convergence source
+    // under AFW (coherent with the warp). D3D12-only.
+    bool flat3d_wants_dlss_depth() const {
+        return flat3d_depth_source() == FLAT3D_DEPTH_DLSS && m_is_d3d12;
     }
 
     bool is_decoupled_pitch_enabled() const {
@@ -1850,6 +1859,7 @@ private:
         "Per-Draw Capture (Default)",
         "Engine Pool (SceneDepthZ)",
         "DSV Observer (D3D12)",
+        "DLSS Depth (AFW)",
     };
     // Successor to Flat3D_UseEngineDepth (kept above for config back-compat):
     // adds the hook-free D3D12 DSV-observer snapshot as a third source.
