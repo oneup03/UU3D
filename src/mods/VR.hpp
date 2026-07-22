@@ -46,6 +46,12 @@ public:
     CameraData cameraData[2];
     CameraDataMVCorrection cameraDataForMV[2];
     D3D12RendererAPI* d3d12Renderer = nullptr;
+    // AFW init is retried until it succeeds: the plugin device + raw D3D12 hooks
+    // once (m_framewarp_device_initialized), and the DLSS/NGX hooks once nvngx.dll
+    // has loaded (m_ngx_hooks_installed — it loads lazily when the game first uses
+    // DLSS, which can be well after the VR mod initializes).
+    bool m_framewarp_device_initialized = false;
+    bool m_ngx_hooks_installed = false;
 
     ID3D12Resource* rawDepthTex = NULL;
     ID3D12Resource* rawMotionVectorsTex = NULL;
@@ -191,6 +197,12 @@ public:
     std::optional<std::string> on_initialize_d3d_thread() {
         return clean_initialize();
     }
+
+    // AFW (Async Frame Warp) plugin + DLSS/NGX hook init. Idempotent and retryable:
+    // runs for every runtime (incl. Flat3D) and re-attempts the NGX hooks each frame
+    // until nvngx.dll is present. Safe when the plugin is the no-op dummy (InitDevice
+    // returns null -> AFW stays disabled instead of crashing).
+    void init_framewarp_module();
 
     std::vector<SidebarEntryInfo> get_sidebar_entries() override {
         return {

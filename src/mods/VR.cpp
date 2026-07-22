@@ -2518,6 +2518,102 @@ bool VR::is_controller_camera_conflict_guard_active() const {
 }
 
 // Called when the mod is initialized
+void VR::init_framewarp_module() {
+    if (!g_framework->is_dx12()) {
+        return;
+    }
+    if (m_framewarp_device_initialized && m_ngx_hooks_installed) {
+        return; // fully initialized
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr || hook->get_device() == nullptr || hook->get_command_queue() == nullptr) {
+        return; // D3D12 not ready yet; retried next frame
+    }
+
+    // --- Plugin device + raw D3D12 harvest hooks (once) --------------------
+    if (!m_framewarp_device_initialized) {
+        if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
+            const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
+            if (current_path) {
+                auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
+                if (LoadLibraryW(fspath.c_str()) == nullptr) {
+                    spdlog::info("[VR][AFW] Could not load PDAFWPlugin.dll (AFW will be unavailable)");
+                }
+            }
+        }
+
+        is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
+
+        pd::DeviceParams params{};
+        params.d3d12Device = hook->get_device();
+        params.d3d12Queue = hook->get_command_queue();
+        d3d12Renderer = InitDevice(params);
+
+        if (d3d12Renderer == nullptr) {
+            // No real plugin (the shipped no-op dummy returns null, or the DLL is
+            // absent). AFW stays disabled — the Flat3D warp guard falls back to
+            // plain AFR — and there's nothing to hook, so stop retrying.
+            spdlog::warn("[VR][AFW] PDAFWPlugin InitDevice returned null; AFW disabled "
+                         "(drop the real PDAFWPlugin.dll beside UEVRBackend.dll to enable it)");
+            m_framewarp_device_initialized = true;
+            m_ngx_hooks_installed = true;
+            return;
+        }
+
+        *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
+
+        auto cmdList = d3d12Renderer->BeginCommandList(0);
+        *(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
+        *(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
+        d3d12Renderer->EndCommandList(0);
+
+        m_framewarp_device_initialized = true;
+        spdlog::info("[VR][AFW] Frame Warp device initialized");
+    }
+
+    // --- DLSS / NGX harvest hooks (retry until nvngx.dll is loaded) --------
+    // nvngx loads lazily when the game first initializes DLSS, which can be well
+    // after this mod initializes — so this is retried each frame from
+    // on_pre_engine_tick until it succeeds.
+    if (!m_ngx_hooks_installed) {
+        auto dllNGX = GetModuleHandle("_nvngx.dll");
+        if (!dllNGX) {
+            dllNGX = GetModuleHandle("nvngx.dll");
+        }
+        if (!dllNGX) {
+            return; // DLSS not initialized by the game yet
+        }
+
+        auto result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_CreateFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
+
+        result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_ReleaseFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
+
+        result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_EvaluateFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
+
+        m_ngx_hooks_installed = true;
+        spdlog::info("[VR][AFW] DLSS/NGX harvest hooks installed (nvngx.dll found)");
+    }
+}
+
 std::optional<std::string> VR::clean_initialize() try {
     ZoneScopedN(__FUNCTION__);
 
@@ -2531,6 +2627,12 @@ std::optional<std::string> VR::clean_initialize() try {
             m_openvr->was_hmd_active = false;
             m_openvr->needs_pose_update = false;
             m_openxr->needs_pose_update = false;
+
+            // AFW works under Flat3D too: install the plugin device + DLSS/NGX +
+            // raw D3D12 harvest hooks here, since this path returns before the
+            // normal Frame Warp init below. Retryable, so a late-loading nvngx.dll
+            // (DLSS) still gets hooked from the per-frame retry in on_present.
+            init_framewarp_module();
 
             m_init_finished = true;
             return Mod::on_initialize();
@@ -2582,72 +2684,10 @@ std::optional<std::string> VR::clean_initialize() try {
 
     m_init_finished = true;
 
-    // #############################
-    // #Frame Warp Module Start
-    // #############################
-    if (!g_framework->is_dx12())
-        return Mod::on_initialize();
-
-    if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
-        const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
-        if (current_path) {
-            auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
-            if (LoadLibraryW(fspath.c_str()) == nullptr) {
-                spdlog::info("[VR] Could not load PDAFWPlugin.dll");
-            }
-        }
-    }
-
-    is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
-
-    auto& hook = g_framework->get_d3d12_hook();
-    hook->get_command_queue();
-    pd::DeviceParams params{};
-    params.d3d12Device = hook->get_device();
-    params.d3d12Queue = hook->get_command_queue();
-    d3d12Renderer = InitDevice(params);
-
-    *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
-
-    auto cmdList = d3d12Renderer->BeginCommandList(0);
-    *(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
-    *(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
-    d3d12Renderer->EndCommandList(0);
-
-    auto dllNGX = GetModuleHandle("_nvngx.dll");
-    if (!dllNGX)
-        dllNGX = GetModuleHandle("nvngx.dll");
-    if (!dllNGX) {
-        spdlog::error("nvngx.dll not loaded!");
-    } else {
-        auto result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_CreateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_ReleaseFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_EvaluateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
-    }
-
-    // #############################
-    // #Frame Warp Module End
-    // #############################
+    // AFW (Async Frame Warp): plugin device + DLSS/NGX + raw D3D12 harvest hooks.
+    // Retryable and dummy-plugin-safe; also runs for Flat3D (see the flat3d branch
+    // above). Defined in init_framewarp_module().
+    init_framewarp_module();
 
     // all OK
     return Mod::on_initialize();
@@ -4532,6 +4572,10 @@ bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
 
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
+
+    // AFW init retry: no-op once fully installed. Re-attempts the DLSS/NGX hooks
+    // until the game has loaded nvngx.dll (it loads lazily on first DLSS use).
+    init_framewarp_module();
 
     const auto now = std::chrono::steady_clock::now();
     const auto previous_engine_tick = m_last_engine_tick;
