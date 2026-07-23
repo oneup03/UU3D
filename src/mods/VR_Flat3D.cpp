@@ -2048,8 +2048,16 @@ void VR::on_draw_sidebar_flat3d() {
             ImGui::TextDisabled("DSV: %s", m_d3d12.get_flat3d_depth_trace_summary().c_str());
         }
     }
-    if (flat3d_depth_source() == FLAT3D_DEPTH_DLSS && !is_using_afw_without_api_check()) {
-        ImGui::TextDisabled("DLSS Depth is only captured while Alternate Frame Warp is active.");
+    if (flat3d_depth_source() == FLAT3D_DEPTH_DLSS) {
+        if (!m_is_d3d12) {
+            ImGui::TextDisabled("DLSS Depth requires D3D12 - falling back to Per-Draw Capture.");
+        } else if (d3d12Renderer == nullptr) {
+            ImGui::TextDisabled("DLSS Depth needs PDAFWPlugin.dll loaded (drop it beside UEVRBackend.dll).");
+        } else if (last_dlss_frame_count == 0) {
+            ImGui::TextDisabled("DLSS Depth: waiting for the game's DLSS (not detected yet).");
+        } else {
+            ImGui::TextDisabled("DLSS Depth: active.");
+        }
     }
 
     if (ImGui::TreeNode("Auto-Convergence")) {

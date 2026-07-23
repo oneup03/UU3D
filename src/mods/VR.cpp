@@ -125,45 +125,72 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         EyeIndex nEyeOther = (render_frame_count % 2 == 0) ? EyeRight : EyeLeft;
         vr->last_dlss_frame_count = render_frame_count;
         static int lastPausedFrame = render_frame_count;
-        bool bufferValid = vr->is_hmd_active() && motionVectors && vr->motionVectorsDesc[nEye].pTexture && vr->depthDesc[nEye].pTexture;
-        if (!bufferValid)
+
+        const bool wants_afw = vr->is_using_afw();
+        // Flat3D "DLSS Depth" source: harvest the DLSS scene depth for auto-
+        // convergence / crosshair / HUD depth even when AFW is NOT the active
+        // rendering method. Depth only (no motion vectors); still needs the
+        // plugin's D3D12 renderer for the copy, same as AFW.
+        const bool wants_dlss_depth_only = !wants_afw && vr->flat3d_wants_dlss_depth() && vr->d3d12Renderer != nullptr;
+
+        // Without AFW the warp block never allocates depthDesc, so size it here
+        // (AFW keeps allocating both eyes in the warp block, so leave that path).
+        if (wants_dlss_depth_only && depth && vr->d3d12Renderer != nullptr) {
+            const auto dd = depth->GetDesc();
+            if (vr->depthDesc[nEye].pTexture == nullptr ||
+                vr->depthDesc[nEye].pTexture->GetDesc().Width != dd.Width ||
+                vr->depthDesc[nEye].pTexture->GetDesc().Height != dd.Height) {
+                vr->d3d12Renderer->CreateTexture((int)dd.Width, (int)dd.Height, dd.Format,
+                    D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->depthDesc[nEye], true);
+            }
+        }
+
+        // Depth-only validity drives the DLSS-depth path; AFW additionally needs MV.
+        const bool depthValid = vr->is_hmd_active() && depth && vr->depthDesc[nEye].pTexture;
+        bool bufferValid = depthValid && motionVectors && vr->motionVectorsDesc[nEye].pTexture;
+        if (!(wants_afw ? bufferValid : depthValid))
             lastPausedFrame = render_frame_count;
         if (lastPausedFrame > render_frame_count)
             lastPausedFrame = render_frame_count;
-        if (vr->is_using_afw() && vr->afw_resolution_change_skip_frames <= 0 && (render_frame_count - lastPausedFrame > 30) && bufferValid) {
+        if ((wants_afw || wants_dlss_depth_only) && vr->afw_resolution_change_skip_frames <= 0 &&
+            (render_frame_count - lastPausedFrame > 30) && depthValid) {
             TextureDesc src;
             src.pTexture = depth;
             src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             vr->d3d12Renderer->Copy(InCmdList, vr->depthDesc[nEye], src);
-            if (motionVectors && vr->rawMVDesc[nEye].pTexture != motionVectors) {
-                vr->rawMVDesc[nEye].pTexture = motionVectors;
-                vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
-            }
-            if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() && 
-                vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
-                if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
-                    vr->update_camera_data(render_frame_count);
-                    auto inMVDesc = vr->rawVelocityDesc[nEye].pTexture->GetDesc();
-                    auto outMVDesc = vr->rawMVDesc[nEye].pTexture->GetDesc();
-                    CorrectMotionVectorsParams mvParams;
-                    mvParams.InMotionVectors = &vr->rawVelocityDesc[nEye];
-                    mvParams.InDepth = &vr->depthDesc[nEye];
-                    mvParams.CameraData = &vr->cameraDataForMV[nEye];
-                    mvParams.InMotionScale[0] = mvScale[0];
-                    mvParams.InMotionScale[1] = mvScale[1];
-                    mvParams.CorrectMVType = FixUEObjectMotion;
-                    mvParams.ObjectMotionScale = 2.0f;
-                    mvParams.FixUEObjMotionRange = vr->get_fix_object_motion_range();
-                    mvParams.InUEVelocityPrev = &vr->rawVelocityDesc[nEyeOther];
-                    mvParams.InDepthPrev = &vr->depthDesc[nEyeOther];
-                    vr->d3d12Renderer->CorrectMotionVectors(InCmdList, vr->rawMVDesc[nEye], mvParams);
-                    vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], vr->rawMVDesc[nEye]);
+
+            // Motion vectors + object-MV correction are only needed by the AFW warp.
+            if (wants_afw && bufferValid) {
+                if (motionVectors && vr->rawMVDesc[nEye].pTexture != motionVectors) {
+                    vr->rawMVDesc[nEye].pTexture = motionVectors;
+                    vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
                 }
-            } else {
-                src.pTexture = motionVectors;
-                src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
+                if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
+                    vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
+                    if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
+                        vr->update_camera_data(render_frame_count);
+                        auto inMVDesc = vr->rawVelocityDesc[nEye].pTexture->GetDesc();
+                        auto outMVDesc = vr->rawMVDesc[nEye].pTexture->GetDesc();
+                        CorrectMotionVectorsParams mvParams;
+                        mvParams.InMotionVectors = &vr->rawVelocityDesc[nEye];
+                        mvParams.InDepth = &vr->depthDesc[nEye];
+                        mvParams.CameraData = &vr->cameraDataForMV[nEye];
+                        mvParams.InMotionScale[0] = mvScale[0];
+                        mvParams.InMotionScale[1] = mvScale[1];
+                        mvParams.CorrectMVType = FixUEObjectMotion;
+                        mvParams.ObjectMotionScale = 2.0f;
+                        mvParams.FixUEObjMotionRange = vr->get_fix_object_motion_range();
+                        mvParams.InUEVelocityPrev = &vr->rawVelocityDesc[nEyeOther];
+                        mvParams.InDepthPrev = &vr->depthDesc[nEyeOther];
+                        vr->d3d12Renderer->CorrectMotionVectors(InCmdList, vr->rawMVDesc[nEye], mvParams);
+                        vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], vr->rawMVDesc[nEye]);
+                    }
+                } else {
+                    src.pTexture = motionVectors;
+                    src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
+                }
             }
         }
         if (vr->is_renderdoc) {
