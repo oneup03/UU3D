@@ -255,7 +255,7 @@ bool Flat3DCompositorD3D12::create_pipelines(ID3D12Device* device) {
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 32; // max(RepackConstants=24, OverlayConstants=24, HudClassifyConstants=32)
+    params[0].Constants.Num32BitValues = 33; // max(RepackConstants=24, OverlayConstants=24, HudClassifyConstants=33)
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -928,8 +928,10 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
                 cc.excl[e][3] = params.hud_excl[e][3];
             }
 
-            static_assert(sizeof(HudClassifyConstants) == 32 * sizeof(uint32_t), "classify constant size");
-            cmd->SetGraphicsRoot32BitConstants(0, 32, &cc, 0);
+            cc.ui_invert_alpha = params.ui_invert_alpha;
+
+            static_assert(sizeof(HudClassifyConstants) == 36 * sizeof(uint32_t), "classify constant size");
+            cmd->SetGraphicsRoot32BitConstants(0, 33, &cc, 0); // 33 meaningful values (incl. ui_invert_alpha)
 
             auto cls_table = m_srv_heap->GetGPUDescriptorHandleForHeapStart();
             cls_table.ptr += (size_t)21 * m_srv_stride;
@@ -1149,6 +1151,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         cmd->RSSetScissorRects(1, &cov_sc);
 
         cmd->SetPipelineState(m_coverage_pso.Get());
+        const float cov_invert = params.ui_invert_alpha; // undo inverted game-UI alpha
+        cmd->SetGraphicsRoot32BitConstants(0, 1, &cov_invert, 0);
         auto ui_table = m_srv_heap->GetGPUDescriptorHandleForHeapStart(); // t0 = UI (slot 2)
         ui_table.ptr += (size_t)2 * m_srv_stride;
         cmd->SetGraphicsRootDescriptorTable(1, ui_table);

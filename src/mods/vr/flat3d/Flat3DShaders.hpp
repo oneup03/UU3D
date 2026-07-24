@@ -252,8 +252,13 @@ struct HudClassifyConstants {
     float   fill_gate{2.0f};        // #5: coverage fraction above which a tile is a panel/backdrop (>1 = off)
     // rows 4-7: exclusion rects (cx, cy, half_w, half_h) in UV
     float   excl[4][4]{};
+    // row 8
+    float   ui_invert_alpha{0.0f}; // UI_InvertAlpha: undo the game's inverted UI
+                                   // alpha (empty=1, drawn=0) before the silhouette
+                                   // signal, else the whole screen reads as HUD.
+    float   _pad[3]{};             // keep 16-byte aligned for the D3D11 constant buffer
 };
-static_assert(sizeof(HudClassifyConstants) == 32 * sizeof(uint32_t), "hud classify constant size");
+static_assert(sizeof(HudClassifyConstants) == 36 * sizeof(uint32_t), "hud classify constant size");
 
 // HUD classification mask resolution (small: one texel per UI tile).
 constexpr uint32_t kHudMaskW = 64;
@@ -996,6 +1001,7 @@ cbuffer ClassifyParams : register(b0) {
     float  fill_radius;    // #5: areal-fill reject block half-extent (tiles)
     float  fill_gate;      // #5: coverage above which the tile is a big fill (panel/backdrop)
     float4 excl[4];        // cx, cy, half_w, half_h in UV
+    float  ui_invert_alpha; // UI_InvertAlpha: undo inverted game-UI alpha in sil()
 };
 
 Texture2D cur_ui   : register(t0);
@@ -1024,7 +1030,11 @@ VSOut vs_main(uint id : SV_VertexID) {
 // recolors doesn't read as empty. Alpha is a CONTINUOUS weight here, never
 // thresholded to "opaque", so feathered / semi-transparent UI still works.
 float sil(float4 c) {
-    return c.a + dot(c.rgb, float3(0.299, 0.587, 0.114)) * 0.15;
+    // UI_InvertAlpha: some titles (e.g. FF7 Rebirth) store the HUD alpha inverted
+    // (empty screen = 1, drawn UI = 0). Undo it to match the composited opacity —
+    // otherwise the empty screen reads as the silhouette and the HUD reads as void.
+    float a = lerp(c.a, 1.0 - c.a, ui_invert_alpha);
+    return a + dot(c.rgb, float3(0.299, 0.587, 0.114)) * 0.15;
 }
 
 float4 ps_main(VSOut input) : SV_Target {
@@ -1284,6 +1294,9 @@ float ps_main(VSOut input) : SV_Target {
 // cursor-independent full-screen-menu detector. Partial opacity counts — a dim
 // full-screen overlay still reads as covered; it is never a hard "opaque" test.
 static const char* const g_flat3d_coverage_hlsl = R"(
+cbuffer CovParams : register(b0) {
+    float ui_invert_alpha; // UI_InvertAlpha: undo inverted game-UI alpha before the count
+};
 Texture2D ui_tex  : register(t0);
 SamplerState samp : register(s0);
 
@@ -1311,6 +1324,7 @@ float ps_main(VSOut input) : SV_Target {
         for (int x = 0; x < NX; ++x) {
             float2 uv = (float2((float)x, (float)y) + 0.5) / float2((float)NX, (float)NY);
             float a = ui_tex.SampleLevel(samp, uv, 0).a;
+            a = lerp(a, 1.0 - a, ui_invert_alpha); // undo inverted game-UI alpha
             cov += a > 0.15 ? 1.0 : 0.0; // partial opacity still counts
         }
     }

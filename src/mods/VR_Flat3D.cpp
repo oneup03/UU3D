@@ -1768,6 +1768,24 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
         p.hud_excl_count = ec;
     }
 
+    // Diagnostic (throttled): why is adaptive HUD depth (mode 1) on or flat? Shows
+    // the two possible blockers — the in-menus guard (paused / full-screen coverage)
+    // forcing the mode to flat, and the camera-flow signals the classifier needs to
+    // tell world-tracking HUD from screen-anchored HUD (both false = nothing moves,
+    // so nothing gets classified as world-tracking).
+    if (m_flat3d_hud_depth_mode->value() == 1) {
+        static auto s_last_hud_log = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_last_hud_log >= std::chrono::seconds(2)) {
+            s_last_hud_log = now;
+            spdlog::info("[Flat3D][hud-gate] requested=1 effective={} | in_menus={} (paused={} cov_fullscreen={} "
+                         "coverage={:.3f} cov_enter={:.2f}) | flow_valid={} translating={} flow=({:.4f},{:.4f}) dtrans_lat={:.3f}",
+                p.hud_depth_mode, in_menus, flat3d->game_paused.load(), s_cov_fullscreen,
+                flat3d->ui_coverage.load(), cov_enter, p.hud_flow_valid, p.hud_translating,
+                p.hud_flow_du, p.hud_flow_dv, flat3d->cam_dtrans_lat.load());
+        }
+    }
+
     if (p.hud_depth_mode == 2) {
         std::scoped_lock anchors_lock{flat3d->anchors_mtx};
         p.anchor_count = (uint32_t)std::min<size_t>(flat3d->anchors_published.size(),

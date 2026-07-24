@@ -173,6 +173,7 @@ private:
     // runtime for the cursor-independent menu detector.
     ComPtr<ID3D11VertexShader> m_coverage_vs{};
     ComPtr<ID3D11PixelShader> m_coverage_ps{};
+    ComPtr<ID3D11Buffer> m_coverage_cb{};                 // b0: ui_invert_alpha
     ComPtr<ID3D11Texture2D> m_coverage_rt{};              // 1x1 R32_FLOAT
     ComPtr<ID3D11RenderTargetView> m_coverage_rtv{};
     ComPtr<ID3D11Texture2D> m_coverage_staging[kDepthRing]{};

@@ -509,6 +509,12 @@ bool Flat3DCompositorD3D11::create_pipeline(ID3D11Device* device) {
         if (compile_coverage("vs_main", "vs_5_0", vvs_blob) && compile_coverage("ps_main", "ps_5_0", vps_blob)) {
             device->CreateVertexShader(vvs_blob->GetBufferPointer(), vvs_blob->GetBufferSize(), nullptr, &m_coverage_vs);
             device->CreatePixelShader(vps_blob->GetBufferPointer(), vps_blob->GetBufferSize(), nullptr, &m_coverage_ps);
+
+            D3D11_BUFFER_DESC covcb_desc{};
+            covcb_desc.ByteWidth = 16; // one float, 16-byte aligned
+            covcb_desc.Usage = D3D11_USAGE_DEFAULT;
+            covcb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            device->CreateBuffer(&covcb_desc, nullptr, &m_coverage_cb);
         }
     }
 
@@ -785,6 +791,7 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
                     cc.excl[e][2] = params.hud_excl[e][2];
                     cc.excl[e][3] = params.hud_excl[e][3];
                 }
+                cc.ui_invert_alpha = params.ui_invert_alpha;
                 context->UpdateSubresource(m_classify_cb.Get(), 0, nullptr, &cc, 0, 0);
 
                 context->IASetInputLayout(nullptr);
@@ -987,6 +994,13 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
         context->PSSetShaderResources(0, 1, cov_srv);
         ID3D11SamplerState* cov_samp[] = {m_sampler.Get()};
         context->PSSetSamplers(0, 1, cov_samp);
+
+        if (m_coverage_cb != nullptr) {
+            const float cov_cb[4]{params.ui_invert_alpha, 0.0f, 0.0f, 0.0f};
+            context->UpdateSubresource(m_coverage_cb.Get(), 0, nullptr, cov_cb, 0, 0);
+            ID3D11Buffer* cov_cbs[] = {m_coverage_cb.Get()};
+            context->PSSetConstantBuffers(0, 1, cov_cbs);
+        }
 
         context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         context->OMSetDepthStencilState(m_depth.Get(), 0);
