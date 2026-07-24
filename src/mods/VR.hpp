@@ -257,6 +257,14 @@ public:
             m_fake_stereo_hook->on_device_reset();
         }
 
+        // Drop our owned DLSS depth copies; they're lazily re-created on the next
+        // capture (also self-heals on a resolution change via the size check).
+        {
+            std::scoped_lock lock(m_dlss_depth_mutex);
+            m_dlss_depth[0].Reset();
+            m_dlss_depth[1].Reset();
+        }
+
         if (m_is_d3d12) {
             m_d3d12.on_reset(this);
         } else {
@@ -664,7 +672,7 @@ public:
         FLAT3D_DEPTH_PER_DRAW = 0,     // API-level per-draw capture (safe default)
         FLAT3D_DEPTH_ENGINE_POOL = 1,  // UE render-target pool SceneDepthZ (engine hook)
         FLAT3D_DEPTH_DSV_OBSERVER = 2, // D3D12Hook DSV/barrier observer snapshot (no engine hook)
-        FLAT3D_DEPTH_DLSS = 3,         // the AFW-harvested DLSS depth (only in AFW mode)
+        FLAT3D_DEPTH_DLSS = 3,         // our own copy of the game's DLSS input depth (any mode)
     };
 
     int32_t flat3d_depth_source() const {
@@ -698,10 +706,10 @@ public:
         return flat3d_depth_source() == FLAT3D_DEPTH_DSV_OBSERVER && m_is_d3d12;
     }
 
-    // The "DLSS Depth (AFW)" source reuses the per-eye depth the AFW pipeline
-    // harvests from DLSS (or the NeverDLSS raw path) into vr->depthDesc[]. It is
-    // only populated while AFW is engaged, so it's the natural convergence source
-    // under AFW (coherent with the warp). D3D12-only.
+    // The "DLSS Depth" source snapshots the game's DLSS input depth into our own
+    // per-eye copy (m_dlss_depth[], via capture_dlss_depth_copy in the NGX hook) —
+    // the exact render-res scene depth the game feeds DLSS. Plugin-free and works
+    // in any rendering method (not just AFW). D3D12-only; needs DLSS active in-game.
     bool flat3d_wants_dlss_depth() const {
         return flat3d_depth_source() == FLAT3D_DEPTH_DLSS && m_is_d3d12;
     }
@@ -1885,7 +1893,7 @@ private:
         "Per-Draw Capture (Default)",
         "Engine Pool (SceneDepthZ)",
         "DSV Observer (D3D12)",
-        "DLSS Depth (AFW)",
+        "DLSS Depth",
     };
     // Successor to Flat3D_UseEngineDepth (kept above for config back-compat):
     // adds the hook-free D3D12 DSV-observer snapshot as a third source.
