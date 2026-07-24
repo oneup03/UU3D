@@ -320,15 +320,19 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     if (params.want_depth || params.hud_depth_mode == 1) {
         switch (vr->flat3d_depth_source()) {
         case VR::FLAT3D_DEPTH_DLSS: {
-            // The AFW pipeline harvests the DLSS (or NeverDLSS raw) scene depth into
-            // vr->depthDesc[] each frame — the exact per-eye depth the warp uses, so
-            // convergence/crosshair track the warp. Only populated while AFW is
-            // engaged; otherwise stays null and the depth features hold their last
-            // values (same graceful behavior as the other sources).
+            // Our own plugin-free snapshot of the DLSS input depth (captured in the
+            // NGX EvaluateFeature hook into vr->m_dlss_depth[]). The exact render-res
+            // scene depth the game feeds DLSS. Works in any rendering method; stays
+            // null until DLSS is active, in which case the depth features hold their
+            // last values (same graceful behavior as the other sources).
             const int n_eye = (vr->m_render_frame_count % 2 == vr->m_left_eye_interval) ? 0 : 1;
-            if (vr->depthDesc[n_eye].pTexture != nullptr) {
-                scene_depth = vr->depthDesc[n_eye].pTexture; // owned copy, reverse-Z device depth
-                scene_depth_state = kShaderReadState;        // == ALL_SHADER_RESOURCE bits
+            auto dlss_depth = vr->get_dlss_depth_copy(n_eye);
+            if (dlss_depth == nullptr) {
+                dlss_depth = vr->get_dlss_depth_copy(1 - n_eye); // eye-index conventions differ; either is fine
+            }
+            if (dlss_depth != nullptr) {
+                scene_depth = dlss_depth;             // owned copy, reverse-Z device depth
+                scene_depth_state = kShaderReadState; // == ALL_SHADER_RESOURCE bits
             }
             break;
         }

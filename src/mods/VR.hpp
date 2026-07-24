@@ -53,6 +53,12 @@ public:
     bool m_framewarp_device_initialized = false;
     bool m_ngx_hooks_installed = false;
 
+    // Plugin-free capture of the DLSS input depth for the Flat3D "DLSS Depth"
+    // source: an owned per-eye copy made with our OWN D3D12 (game device +
+    // CopyResource on the game's command list), independent of PDAFWPlugin.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_dlss_depth[2]{};
+    std::mutex m_dlss_depth_mutex{};
+
     ID3D12Resource* rawDepthTex = NULL;
     ID3D12Resource* rawMotionVectorsTex = NULL;
 
@@ -203,6 +209,14 @@ public:
     // until nvngx.dll is present. Safe when the plugin is the no-op dummy (InitDevice
     // returns null -> AFW stays disabled instead of crashing).
     void init_framewarp_module();
+
+    // Snapshot the DLSS input depth into m_dlss_depth[eye] using our own D3D12
+    // (no plugin), recorded onto the game's command list. Called from the NGX
+    // EvaluateFeature hook when the Flat3D "DLSS Depth" source is selected.
+    void capture_dlss_depth_copy(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* depth, int eye);
+    // The owned copy for a given eye (AddRef'd under the lock), or null. In
+    // D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.
+    Microsoft::WRL::ComPtr<ID3D12Resource> get_dlss_depth_copy(int eye);
 
     std::vector<SidebarEntryInfo> get_sidebar_entries() override {
         return {

@@ -2052,10 +2052,8 @@ void VR::on_draw_sidebar_flat3d() {
     if (flat3d_depth_source() == FLAT3D_DEPTH_DLSS) {
         if (!m_is_d3d12) {
             ImGui::TextDisabled("DLSS Depth requires D3D12 - falling back to Per-Draw Capture.");
-        } else if (d3d12Renderer == nullptr) {
-            ImGui::TextDisabled("DLSS Depth needs PDAFWPlugin.dll loaded (drop it beside UEVRBackend.dll).");
         } else if (last_dlss_frame_count == 0) {
-            ImGui::TextDisabled("DLSS Depth: waiting for the game's DLSS (not detected yet).");
+            ImGui::TextDisabled("DLSS Depth: waiting for the game's DLSS (enable DLSS in-game).");
         } else {
             ImGui::TextDisabled("DLSS Depth: active.");
         }

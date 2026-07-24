@@ -126,74 +126,60 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         vr->last_dlss_frame_count = render_frame_count;
         static int lastPausedFrame = render_frame_count;
 
-        const bool wants_afw = vr->is_using_afw();
-        // Flat3D "DLSS Depth" source: harvest the DLSS scene depth for auto-
-        // convergence / crosshair / HUD depth even when AFW is NOT the active
-        // rendering method. Depth only (no motion vectors); still needs the
-        // plugin's D3D12 renderer for the copy, same as AFW.
-        const bool wants_dlss_depth_only = !wants_afw && vr->flat3d_wants_dlss_depth() && vr->d3d12Renderer != nullptr;
-
-        // Without AFW the warp block never allocates depthDesc, so size it here
-        // (AFW keeps allocating both eyes in the warp block, so leave that path).
-        if (wants_dlss_depth_only && depth && vr->d3d12Renderer != nullptr) {
-            const auto dd = depth->GetDesc();
-            if (vr->depthDesc[nEye].pTexture == nullptr ||
-                vr->depthDesc[nEye].pTexture->GetDesc().Width != dd.Width ||
-                vr->depthDesc[nEye].pTexture->GetDesc().Height != dd.Height) {
-                vr->d3d12Renderer->CreateTexture((int)dd.Width, (int)dd.Height, dd.Format,
-                    D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->depthDesc[nEye], true);
-            }
+        // Flat3D "DLSS Depth" source: snapshot the DLSS input depth into our OWN
+        // per-eye copy on the game's command list. Plugin-free (uses the game device
+        // + CopyResource), and independent of the rendering method — so it works in
+        // Native / Synced / AFR, not just AFW.
+        if (vr->flat3d_wants_dlss_depth() && depth) {
+            vr->capture_dlss_depth_copy(InCmdList, depth, (int)nEye);
         }
 
-        // Depth-only validity drives the DLSS-depth path; AFW additionally needs MV.
-        const bool depthValid = vr->is_hmd_active() && depth && vr->depthDesc[nEye].pTexture;
-        bool bufferValid = depthValid && motionVectors && vr->motionVectorsDesc[nEye].pTexture;
-        if (!(wants_afw ? bufferValid : depthValid))
+        // --- AFW (plugin) depth + motion-vector harvest -----------------------
+        // depthDesc/motionVectorsDesc are allocated by the AFW warp block and copied
+        // here via the plugin's D3D12 renderer; requires the real PDAFWPlugin.
+        bool bufferValid = vr->is_hmd_active() && motionVectors && vr->motionVectorsDesc[nEye].pTexture && vr->depthDesc[nEye].pTexture;
+        if (!bufferValid)
             lastPausedFrame = render_frame_count;
         if (lastPausedFrame > render_frame_count)
             lastPausedFrame = render_frame_count;
-        if ((wants_afw || wants_dlss_depth_only) && vr->afw_resolution_change_skip_frames <= 0 &&
-            (render_frame_count - lastPausedFrame > 30) && depthValid) {
+        if (vr->is_using_afw() && vr->d3d12Renderer != nullptr && vr->afw_resolution_change_skip_frames <= 0 &&
+            (render_frame_count - lastPausedFrame > 30) && bufferValid) {
             TextureDesc src;
             src.pTexture = depth;
             src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             vr->d3d12Renderer->Copy(InCmdList, vr->depthDesc[nEye], src);
-
-            // Motion vectors + object-MV correction are only needed by the AFW warp.
-            if (wants_afw && bufferValid) {
-                if (motionVectors && vr->rawMVDesc[nEye].pTexture != motionVectors) {
-                    vr->rawMVDesc[nEye].pTexture = motionVectors;
-                    vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                    vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
+            if (motionVectors && vr->rawMVDesc[nEye].pTexture != motionVectors) {
+                vr->rawMVDesc[nEye].pTexture = motionVectors;
+                vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
+            }
+            if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
+                vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
+                if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
+                    vr->update_camera_data(render_frame_count);
+                    auto inMVDesc = vr->rawVelocityDesc[nEye].pTexture->GetDesc();
+                    auto outMVDesc = vr->rawMVDesc[nEye].pTexture->GetDesc();
+                    CorrectMotionVectorsParams mvParams;
+                    mvParams.InMotionVectors = &vr->rawVelocityDesc[nEye];
+                    mvParams.InDepth = &vr->depthDesc[nEye];
+                    mvParams.CameraData = &vr->cameraDataForMV[nEye];
+                    mvParams.InMotionScale[0] = mvScale[0];
+                    mvParams.InMotionScale[1] = mvScale[1];
+                    mvParams.CorrectMVType = FixUEObjectMotion;
+                    mvParams.ObjectMotionScale = 2.0f;
+                    mvParams.FixUEObjMotionRange = vr->get_fix_object_motion_range();
+                    mvParams.InUEVelocityPrev = &vr->rawVelocityDesc[nEyeOther];
+                    mvParams.InDepthPrev = &vr->depthDesc[nEyeOther];
+                    vr->d3d12Renderer->CorrectMotionVectors(InCmdList, vr->rawMVDesc[nEye], mvParams);
+                    vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], vr->rawMVDesc[nEye]);
                 }
-                if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
-                    vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
-                    if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
-                        vr->update_camera_data(render_frame_count);
-                        auto inMVDesc = vr->rawVelocityDesc[nEye].pTexture->GetDesc();
-                        auto outMVDesc = vr->rawMVDesc[nEye].pTexture->GetDesc();
-                        CorrectMotionVectorsParams mvParams;
-                        mvParams.InMotionVectors = &vr->rawVelocityDesc[nEye];
-                        mvParams.InDepth = &vr->depthDesc[nEye];
-                        mvParams.CameraData = &vr->cameraDataForMV[nEye];
-                        mvParams.InMotionScale[0] = mvScale[0];
-                        mvParams.InMotionScale[1] = mvScale[1];
-                        mvParams.CorrectMVType = FixUEObjectMotion;
-                        mvParams.ObjectMotionScale = 2.0f;
-                        mvParams.FixUEObjMotionRange = vr->get_fix_object_motion_range();
-                        mvParams.InUEVelocityPrev = &vr->rawVelocityDesc[nEyeOther];
-                        mvParams.InDepthPrev = &vr->depthDesc[nEyeOther];
-                        vr->d3d12Renderer->CorrectMotionVectors(InCmdList, vr->rawMVDesc[nEye], mvParams);
-                        vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], vr->rawMVDesc[nEye]);
-                    }
-                } else {
-                    src.pTexture = motionVectors;
-                    src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                    vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
-                }
+            } else {
+                src.pTexture = motionVectors;
+                src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
             }
         }
-        if (vr->is_renderdoc) {
+        if (vr->is_renderdoc && vr->d3d12Renderer != nullptr) {
             static TextureDesc colorDesc[2];
             static TextureDesc outputDesc[2];
             if (color && colorDesc[nEye].pTexture != color) {
@@ -2579,24 +2565,25 @@ void VR::init_framewarp_module() {
 
         if (d3d12Renderer == nullptr) {
             // No real plugin (the shipped no-op dummy returns null, or the DLL is
-            // absent). AFW stays disabled — the Flat3D warp guard falls back to
-            // plain AFR — and there's nothing to hook, so stop retrying.
+            // absent). AFW itself and the NeverDLSS raw hooks (which record on the
+            // plugin's command list) stay disabled — but the DLSS/NGX depth harvest
+            // does NOT need the plugin, so we still fall through and install it so
+            // the Flat3D "DLSS Depth" source works via our own copy.
             spdlog::warn("[VR][AFW] PDAFWPlugin InitDevice returned null; AFW disabled "
-                         "(drop the real PDAFWPlugin.dll beside UEVRBackend.dll to enable it)");
-            m_framewarp_device_initialized = true;
-            m_ngx_hooks_installed = true;
-            return;
+                         "(drop the real PDAFWPlugin.dll beside UEVRBackend.dll for AFW). "
+                         "DLSS Depth capture still works via our own copy.");
+        } else {
+            *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
+
+            auto cmdList = d3d12Renderer->BeginCommandList(0);
+            *(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
+            *(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
+            d3d12Renderer->EndCommandList(0);
+
+            spdlog::info("[VR][AFW] Frame Warp device initialized");
         }
 
-        *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
-
-        auto cmdList = d3d12Renderer->BeginCommandList(0);
-        *(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
-        *(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
-        d3d12Renderer->EndCommandList(0);
-
         m_framewarp_device_initialized = true;
-        spdlog::info("[VR][AFW] Frame Warp device initialized");
     }
 
     // --- DLSS / NGX harvest hooks (retry until nvngx.dll is loaded) --------
@@ -2639,6 +2626,91 @@ void VR::init_framewarp_module() {
         m_ngx_hooks_installed = true;
         spdlog::info("[VR][AFW] DLSS/NGX harvest hooks installed (nvngx.dll found)");
     }
+}
+
+void VR::capture_dlss_depth_copy(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* depth, int eye) {
+    if (cmd_list == nullptr || depth == nullptr || eye < 0 || eye > 1) {
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr) {
+        return;
+    }
+    auto* device = hook->get_device();
+    if (device == nullptr) {
+        return;
+    }
+
+    const auto src_desc = depth->GetDesc();
+    // The DLSS input depth is always a plain 2D, single-sample, shader-readable
+    // texture. Bail on anything unexpected rather than issue a bad copy/barrier.
+    if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || src_desc.SampleDesc.Count != 1 ||
+        src_desc.Width == 0 || src_desc.Height == 0 ||
+        (src_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
+        return;
+    }
+
+    std::scoped_lock lock(m_dlss_depth_mutex);
+
+    // (Re)allocate the owned copy to match the source (a plain shader-readable copy
+    // — strip DSV/RTV/UAV/deny flags but keep the format/extent so CopyResource is
+    // an exact whole-resource copy).
+    bool need_alloc = m_dlss_depth[eye] == nullptr;
+    if (!need_alloc) {
+        const auto cur = m_dlss_depth[eye]->GetDesc();
+        need_alloc = cur.Width != src_desc.Width || cur.Height != src_desc.Height ||
+                     cur.Format != src_desc.Format || cur.DepthOrArraySize != src_desc.DepthOrArraySize ||
+                     cur.MipLevels != src_desc.MipLevels;
+    }
+    if (need_alloc) {
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        auto dst_desc = src_desc;
+        dst_desc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        dst_desc.Alignment = 0;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource> tex{};
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &dst_desc,
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex)))) {
+            spdlog::warn("[VR][DLSS depth] Could not allocate the owned depth copy");
+            return;
+        }
+        tex->SetName(L"Flat3D DLSS Depth Copy");
+        m_dlss_depth[eye] = std::move(tex);
+    }
+
+    // The DLSS input depth is passed in NON_PIXEL_SHADER_RESOURCE (DLSS samples it).
+    // Round-trip through COPY_SOURCE and restore it before the copy list is closed,
+    // leaving our owned copy shader-readable for the Flat3D compositor.
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    for (auto& b : barriers) {
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    barriers[0].Transition.pResource = depth;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.pResource = m_dlss_depth[eye].Get();
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cmd_list->ResourceBarrier(2, barriers);
+
+    cmd_list->CopyResource(m_dlss_depth[eye].Get(), depth);
+
+    std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+    std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+    cmd_list->ResourceBarrier(2, barriers);
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> VR::get_dlss_depth_copy(int eye) {
+    if (eye < 0 || eye > 1) {
+        return nullptr;
+    }
+    std::scoped_lock lock(m_dlss_depth_mutex);
+    return m_dlss_depth[eye];
 }
 
 std::optional<std::string> VR::clean_initialize() try {
