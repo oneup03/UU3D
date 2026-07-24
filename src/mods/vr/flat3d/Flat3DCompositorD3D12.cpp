@@ -457,6 +457,7 @@ void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool
             oc.color[2] = laser[2];
             oc.color[3] = laser[3];
             oc.layer = layer;
+            oc.ui_invert_alpha = params.ui_invert_alpha; // shader applies it only to game-UI layers (0/1)
             oc.colorspace = eye_space;
             oc.paper_white = params.paper_white_nits;
             oc.region_radius_uv = (layer == 2 || layer == 4) ? 0.0f
@@ -1193,7 +1194,13 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         m_device->CreateRenderTargetView(ui_tex, &ui_rtv_desc, ui_rtv);
 
         barrier(cmd, ui_tex, kEngineUiState, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        const float ui_clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
+        // Clear empty UI regions to alpha = ui_invert_alpha (NOT 0). Slate only
+        // draws real content on top (with a=0 for titles like FF7 Rebirth), so
+        // this is what lets the UI_InvertAlpha shader (1-a) tell drawn content
+        // (a=0 -> opaque) from untouched empty screen (a=ui_invert_alpha ->
+        // transparent). Matches the VR path's clear_rt. Alpha 0 here made every
+        // empty pixel opaque black under invert, blacking out the geometry.
+        const float ui_clear[4]{0.0f, 0.0f, 0.0f, params.ui_invert_alpha};
         cmd->ClearRenderTargetView(ui_rtv, ui_clear, 0, nullptr);
         barrier(cmd, ui_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, kEngineUiState);
     }

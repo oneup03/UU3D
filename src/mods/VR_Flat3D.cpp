@@ -1627,6 +1627,7 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     };
 
     p.ui_enabled = m_enable_gui->value();
+    p.ui_invert_alpha = get_overlay_component().get_ui_invert_alpha(); // same UI_InvertAlpha config/slider as the VR path
 
     // The UI's FINAL on-screen shift (after the crop map) is px(z_ui); the
     // drawn shift/scale are pre-divided by scene_scale so the crop map's

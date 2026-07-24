@@ -132,6 +132,8 @@ private:
     void wait_for_ue58_slate_ui_consumers();
     void clear_backbuffer();
     bool ensure_2d_screen_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
+    // Lazily (re)create m_ui_invert_tex to match the given UI texture desc.
+    bool ensure_ui_invert_tex(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
 
     enum class ShfSceneMode {
         Unknown,
@@ -213,6 +215,11 @@ private:
     d3d12::TextureContext m_backbuffer_copy{};
 
     d3d12::TextureContext m_game_ui_tex{};
+    // Off-screen destination for the UI alpha-invert pass. The invert used to
+    // render the UI texture onto ITSELF (src == dst), an illegal simultaneous
+    // SRV+RTV bind that removed the device on some titles (FF7 Rebirth). We now
+    // invert into this separate texture and route the UI through it.
+    d3d12::TextureContext m_ui_invert_tex{};
     static constexpr uint32_t UE58_CONVERTED_UI_SLOT_COUNT = 3;
     // Slate can rotate native D3D12 resources between frames. Keep each source
     // SRV alive until the conversion command list that binds it has completed.

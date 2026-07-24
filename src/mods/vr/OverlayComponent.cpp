@@ -228,7 +228,8 @@ void OverlayComponent::on_draw_ui() {
         m_slate_distance->draw("UI Distance");
         m_slate_size->draw("UI Size");
         m_ui_follows_view->draw("UI Follows View");
-        m_ui_invert_alpha->draw("UI Invert Alpha");
+        // UI Invert Alpha now lives in the Compatibility tab (always visible;
+        // Overlay Options is hidden under Flat3D / 3D Display).
 
         m_framework_distance->draw("Framework Distance");
         m_framework_size->draw("Framework Size");

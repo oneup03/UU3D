@@ -72,6 +72,7 @@ struct Flat3DFrameParams {
     bool ui_enabled{false};
     float ui_shift_px{0.0f};    // horizontal shift in EYE pixels
     float ui_scale{1.0f};       // auto-scale so the UI fills the eye after the shift
+    float ui_invert_alpha{0.0f}; // UI_InvertAlpha (0=off..1=full); flips the game UI alpha in the overlay shader
 
     // HUD depth mode: 0 = flat at GUI depth, 1 = depth-adaptive with
     // camera-flow auto-classification (world-tracking UI tiles get scene
@@ -212,7 +213,8 @@ struct OverlayConstants {
     float hud_depth_uscale{1.0f}; // 0.5 when SceneDepthZ is double-wide
     float hud_flat_shift_uv{0.0f};
     int32_t cursor_depth{0};      // layer 4: 1 = sample geometry depth under the tip
-    float _pad[3]{};              // keep the block a 16-byte multiple (D3D11 cbuffer)
+    float ui_invert_alpha{0.0f};  // UI_InvertAlpha: 0 = off, 1 = full alpha invert (game UI layers only)
+    float _pad[2]{};              // keep the block a 16-byte multiple (D3D11 cbuffer)
 };
 
 // Anchor constant buffer (b1) for the world-marker HUD mode. Bound only for
@@ -666,6 +668,7 @@ cbuffer OverlayParams : register(b0) {
     float  hud_depth_uscale;  // 0.5 when SceneDepthZ is double-wide
     float  hud_flat_shift_uv; // fallback drawn shift (non-anchor pixels)
     int    cursor_depth;      // layer 4: 1 = geometry depth under the tip
+    float  ui_invert_alpha;   // UI_InvertAlpha: 0 = off .. 1 = full alpha invert
 };
 
 cbuffer HudAnchors : register(b1) {
@@ -925,6 +928,21 @@ float4 ps_main(VSOut input) : SV_Target {
     }
 
     float4 c = (layer == 3) ? menu_tex.Sample(samp, src_uv) : ui_tex.Sample(samp, src_uv);
+
+    // UI_InvertAlpha: flip the game UI's alpha toward its complement
+    // (lerp(a, 1-a, amount)), matching the VR-path alpha-invert. Some titles
+    // (e.g. FF7 Rebirth) store the HUD/UI alpha inverted, so it reads bright and
+    // transparent until corrected. Not applied to the UEVR ImGui menu (layer 3).
+    if ((layer == 0 || layer == 1) && ui_invert_alpha > 0.0) {
+        // UI_InvertAlpha, matching the VR path exactly: lerp(a, 1-a, amount).
+        // This is correct ONLY because the UI target's EMPTY regions are
+        // pre-cleared to alpha = ui_invert_alpha (see the clear in the Flat3D
+        // submit): the game draws real content (HUD, loading-screen fills) with
+        // a=0, empty stays at the clear value, and 1-a then makes drawn content
+        // opaque and empty transparent. Without that clear this just blacks the
+        // whole frame (empty a=0 -> opaque).
+        c.a = lerp(c.a, 1.0 - c.a, ui_invert_alpha);
+    }
 
     // Classification debug view (hud_mode 3): red = world-anchored, green =
     // static, tinted over the UI plus a faint full-screen wash so empty

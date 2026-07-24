@@ -9383,6 +9383,8 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Compatibility Options")) {
             m_compatibility_ahud->draw("AHUD UI Compatibility");
+            m_overlay_component.draw_ui_invert_alpha("UI Invert Alpha");
+            ImGui::TextWrapped("Inverts/blends the game UI's alpha so it composites correctly (0 = off). Needed by some titles for HUD/UI visibility.");
             m_compatibility_skip_uobjectarray_init->draw("Skip UObjectArray Init");
             m_compatibility_skip_pip->draw("Skip PostInitProperties");
             m_compatibility_direct_aim->draw("Direct Aim Fallback");

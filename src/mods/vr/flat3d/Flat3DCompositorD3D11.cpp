@@ -1192,6 +1192,7 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
             oc.color[2] = laser_b;
             oc.color[3] = laser_a;
             oc.layer = layer;
+            oc.ui_invert_alpha = params.ui_invert_alpha; // shader applies it only to game-UI layers (0/1)
             oc.colorspace = eye_space;
             oc.paper_white = params.paper_white_nits;
             // Region math: the crosshair region rides at the CROSSHAIR shift.

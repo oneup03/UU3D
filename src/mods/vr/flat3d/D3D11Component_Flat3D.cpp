@@ -250,7 +250,11 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     // fresh target shows uninitialized VRAM (the HMD paths clear it the same
     // way after their UI submit).
     if (m_engine_ui_ref.has_texture()) {
-        float ui_clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
+        // Clear empty regions to alpha = ui_invert_alpha (not 0) so the
+        // UI_InvertAlpha (1-a) shader distinguishes drawn content (a=0 -> opaque)
+        // from untouched empty screen (-> transparent). See the D3D12 counterpart.
+        const float inv = VR::get()->get_overlay_component().get_ui_invert_alpha();
+        float ui_clear[4]{0.0f, 0.0f, 0.0f, inv};
         m_engine_ui_ref.clear_rtv(ui_clear);
     }
 
