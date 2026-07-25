@@ -1880,7 +1880,13 @@ private:
     const ModSlider::Ptr m_flat3d_hud_marker_radius{ ModSlider::create(generate_name("Flat3D_HUDMarkerRadius"), 0.02f, 0.15f, 0.06f) };
     // Depth-adaptive: how far around a classified tile the depth shift
     // extends (fraction of screen width) — covers the whole icon + text.
-    const ModSlider::Ptr m_flat3d_hud_icon_radius{ ModSlider::create(generate_name("Flat3D_HUDIconRadius"), 0.015f, 0.075f, 0.035f) };
+    const ModSlider::Ptr m_flat3d_hud_icon_radius{ ModSlider::create(generate_name("Flat3D_HUDIconRadius"), 0.015f, 0.125f, 0.035f) };
+    // Depth-adaptive: extend the icon-region dilation VERTICALLY, the way a
+    // marker's leader-line stem hangs, so a thin stem inherits the icon's
+    // classification + depth without the sideways bleed a bigger symmetric
+    // radius causes. Signed fraction of screen width (converted to tiles like
+    // the radius): >0 stem hangs DOWN, <0 hangs UP, 0 = off.
+    const ModSlider::Ptr m_flat3d_hud_stem_reach{ ModSlider::create(generate_name("Flat3D_HUDStemReach"), -0.25f, 0.25f, 0.0f) };
     const ModToggle::Ptr m_flat3d_hud_debug{ ModToggle::create(generate_name("Flat3D_HUDDepthDebug"), false, true) };
     // Scene-depth source for the Adaptive Crosshair / HUD-depth features. OFF
     // (default) uses the safe API-level per-draw GameDepthCapture. ON reads the
@@ -2130,6 +2136,7 @@ public:
             *m_flat3d_hud_depth_mode,
             *m_flat3d_hud_marker_radius,
             *m_flat3d_hud_icon_radius,
+            *m_flat3d_hud_stem_reach,
             *m_flat3d_use_engine_depth,
             *m_flat3d_depth_source,
             *m_flat3d_hud_trans_gate,

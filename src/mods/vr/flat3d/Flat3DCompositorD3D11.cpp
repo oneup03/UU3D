@@ -1219,8 +1219,13 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
             oc.eye_height_px = (float)m_eye_h;
             // Low 4 bits = mode; high bits = dilation radius in tiles.
             const int32_t base_mode = (layer == 0) ? ((hud_mode == 1 && params.hud_debug) ? 3 : hud_mode) : 0;
-            const int32_t dilate_tiles = std::clamp((int32_t)std::lround(params.hud_icon_radius * 64.0f), 1, 4);
+            const int32_t dilate_tiles = std::clamp((int32_t)std::lround(params.hud_icon_radius * 64.0f), 1, 8);
             oc.hud_mode = base_mode | (dilate_tiles << 4);
+            // Vertical stem reach (depth-adaptive only): signed extra dilation
+            // tiles (>0 down, <0 up), capped so the loop stays bounded.
+            oc.hud_stem_reach = (layer == 0 && hud_mode == 1)
+                ? std::clamp((int32_t)std::lround(params.hud_stem_reach * 64.0f), -16, 16)
+                : 0;
             oc.hud_k_px = dir * params.hud_k_px / params.scene_scale;
             oc.hud_bias_px = dir * params.scene_shift_px / params.scene_scale;
             oc.hud_inv_conv_uu = params.hud_inv_conv_uu;
@@ -1412,6 +1417,14 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
 
     const uint32_t center_stripe = kDepthStripes / 2; // frac 0.5 stripe
     const uint32_t center_x = roi_w / 2;
+    // Aim-window half-width. Wide enough to span the stereo parallax band: we
+    // read the LEFT-eye half, but a near object under the FUSED reticle sits at
+    // eye-center only at the convergence depth — nearer geometry has crossed
+    // disparity and shifts sideways in the left eye, so a center-only sample
+    // reads the background behind it (the reticle only "pops" onto it when the
+    // player aims off-center by the parallax). Sampling out to ~6% of the ROI
+    // and taking the nearest catches the object wherever its disparity puts it.
+    const uint32_t kAimHalfW = std::max<uint32_t>(12u, roi_w / 16);
     // Central sub-region (mid ~40% of the ROI both axes): the aim target sits
     // here even though it is rarely the frame's global nearest object.
     const uint32_t cregion_x0 = (uint32_t)(roi_w * 0.30f);
@@ -1420,7 +1433,6 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     for (uint32_t row = 0; row < kDepthStripes * kStripeRows; ++row) {
         const uint8_t* row_data = (const uint8_t*)mapped.pData + row * mapped.RowPitch;
         const uint32_t stripe = row / kStripeRows;
-        const bool is_center_row = stripe == center_stripe;
         const bool is_center_region_row = stripe >= 3 && stripe <= 5; // mid ~third vertically
 
         for (uint32_t x = 0; x < roi_w; x += 4) {
@@ -1448,10 +1460,33 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
                 if (is_center_region_row && x >= cregion_x0 && x <= cregion_x1) {
                     center_region_samples.push_back(z);
                 }
-                // Crosshair window collects KEPT scene depth only: far-sentinel
-                // and near-plane overlay ("glued") texels must not sink the
-                // nearest estimate the reticle snaps to.
-                if (is_center_row && x + 8 >= center_x && x <= center_x + 8) {
+            }
+        }
+    }
+
+    // Dense aim-point sweep: full-resolution (every texel) scan of the reticle's
+    // rows over the parallax-band window (see kAimHalfW). Sampling every texel
+    // guarantees a thin/small target is hit, and the wide span covers the
+    // crossed-disparity offset of a near object in the left-eye half so the
+    // reticle stops reading the background behind it. Kept scene depth only
+    // (far-sentinel / near-plane "glued" texels excluded), same as the ROI loop.
+    {
+        const uint32_t ax0 = center_x > kAimHalfW ? center_x - kAimHalfW : 0u;
+        const uint32_t ax1 = std::min(center_x + kAimHalfW, roi_w - 1);
+        for (uint32_t r = 0; r < kStripeRows; ++r) {
+            const uint32_t row = center_stripe * kStripeRows + r;
+            const uint8_t* row_data = (const uint8_t*)mapped.pData + row * mapped.RowPitch;
+            for (uint32_t x = ax0; x <= ax1; ++x) {
+                const uint8_t* texel = row_data + (size_t)x * (is_d32s8 ? 8u : 4u);
+                float d;
+                if (is_r32) {
+                    d = *(const float*)texel;
+                } else {
+                    const uint32_t v = *(const uint32_t*)texel;
+                    d = (float)(v & 0xFFFFFF) / 16777215.0f;
+                }
+                const float z = device_to_z(d);
+                if (z < 1e9f && z >= z_glue_uu) {
                     center_samples.push_back(z);
                 }
             }
@@ -1490,7 +1525,11 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     // (~5th) instead of the raw minimum rejects a lone near speck but still
     // pins the crosshair to the closest thing under the aim point.
     if (!center_samples.empty()) {
-        const size_t ci = std::min<size_t>(center_samples.size() / 20, center_samples.size() - 1); // ~5th percentile (nearest)
+        // 3rd-nearest of the dense aim window: rejects a lone 1-2px speck / edge
+        // texel but lets a genuine small target win (a percentile that scales
+        // with the sample count would need MORE coverage as density rises,
+        // defeating the point — a small object covers only a few dense texels).
+        const size_t ci = std::min<size_t>(2, center_samples.size() - 1);
         std::nth_element(center_samples.begin(), center_samples.begin() + ci, center_samples.end());
         const float center_z = center_samples[ci];
 

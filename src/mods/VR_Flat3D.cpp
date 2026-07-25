@@ -1737,6 +1737,7 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
         p.hud_translating = trans_mag > m_flat3d_hud_trans_floor->value() && trans_mag < 0.5f;
         p.hud_debug = m_flat3d_hud_debug->value();
         p.hud_icon_radius = m_flat3d_hud_icon_radius->value();
+        p.hud_stem_reach = m_flat3d_hud_stem_reach->value();
 
         // Mode-1 false-positive rejection tuning (see the classify shader).
         p.hud_trans_gate = m_flat3d_hud_trans_gate->value();
@@ -2183,6 +2184,16 @@ void VR::on_draw_sidebar_flat3d() {
                                   "shift extends. Raise it if icons get cut off or flicker at\n"
                                   "their edges; lower it if nearby static HUD gets dragged along.");
             }
+            m_flat3d_hud_stem_reach->draw("Stem Reach");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Some markers have a thin leader-line stem hanging off the icon\n"
+                                  "(usually straight down). Thin lines classify unstably on their\n"
+                                  "own, so extend the icon region vertically to pull the stem to the\n"
+                                  "icon's depth. Positive = stem hangs DOWN, negative = hangs UP,\n"
+                                  "0 = off. Unlike Icon Region Radius this only reaches one way, so\n"
+                                  "it doesn't drag sideways HUD along. Raise the magnitude until the\n"
+                                  "whole stem picks up depth; back off if HUD past the stem drifts.");
+            }
             m_flat3d_hud_debug->draw("Show Classification (debug)");
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Tints the HUD by its classification: red = world-anchored\n"
@@ -2306,6 +2317,7 @@ void VR::on_draw_sidebar_flat3d() {
             m_flat3d_hud_depth_mode->value() = 0;
             m_flat3d_hud_marker_radius->value() = 0.06f;
             m_flat3d_hud_icon_radius->value() = 0.035f;
+            m_flat3d_hud_stem_reach->value() = 0.0f;
             m_flat3d_gui_depth->value() = 1.0f;
             m_flat3d_menu_depth->value() = 1.0f;
             m_flat3d_cursor_mode->value() = 0;

@@ -96,6 +96,11 @@ struct Flat3DFrameParams {
     // a whole icon (+ its text) moves as one piece and brief classification
     // gaps while it travels across tiles don't cut it apart.
     float hud_icon_radius{0.035f};
+    // Vertical stem reach: extend the dilation window UP or DOWN so a marker's
+    // thin leader line inherits the icon's class + depth without the sideways
+    // bleed a big symmetric radius causes. Signed UV (converted to tiles like
+    // radius): >0 stem hangs down, <0 hangs up, 0 = off.
+    float hud_stem_reach{0.0f};
 
     // Mode-1 classification tuning (false-positive rejection). See the classify
     // shader: gates are live-tunable; anim/occupancy suppress animated HUD and
@@ -214,7 +219,8 @@ struct OverlayConstants {
     float hud_flat_shift_uv{0.0f};
     int32_t cursor_depth{0};      // layer 4: 1 = sample geometry depth under the tip
     float ui_invert_alpha{0.0f};  // UI_InvertAlpha: 0 = off, 1 = full alpha invert (game UI layers only)
-    float _pad[2]{};              // keep the block a 16-byte multiple (D3D11 cbuffer)
+    int32_t hud_stem_reach{0};    // depth-adaptive: signed extra dilation tiles (>0 down, <0 up, 0 off)
+    float _pad{};                 // keep the block a 16-byte multiple (D3D11 cbuffer)
 };
 
 // Anchor constant buffer (b1) for the world-marker HUD mode. Bound only for
@@ -674,6 +680,7 @@ cbuffer OverlayParams : register(b0) {
     float  hud_flat_shift_uv; // fallback drawn shift (non-anchor pixels)
     int    cursor_depth;      // layer 4: 1 = geometry depth under the tip
     float  ui_invert_alpha;   // UI_InvertAlpha: 0 = off .. 1 = full alpha invert
+    int    hud_stem_reach;    // mode 1: signed extra dilation tiles (>0 down, <0 up, 0 off)
 };
 
 cbuffer HudAnchors : register(b1) {
@@ -714,13 +721,25 @@ float ComputeHudShiftUV(float2 uv) {
         int tiles_x = HudTiles();
         int tiles_y = max(1, (tiles_x * 9 + 8) / 16); // 36/64 aspect
 
+        // Vertical stem reach. A marker's leader line is a thin stem hanging off
+        // the icon (usually straight down); thin lines are the least stable case
+        // for the flow classifier. Rather than grow the symmetric radius (which
+        // bleeds sideways into unrelated HUD), extend the dilation window only
+        // OPPOSITE the hang direction: a pixel on the stem then reaches back to
+        // the stable icon and inherits its class + depth. hud_stem_reach is
+        // signed: >0 the stem hangs down (search up), <0 hangs up (search down).
+        int tx_min = -tiles_x, tx_max = tiles_x;
+        int ty_min = -tiles_y, ty_max = tiles_y;
+        if (hud_stem_reach > 0)      ty_min -= hud_stem_reach;  // hangs down -> search up
+        else if (hud_stem_reach < 0) ty_max += -hud_stem_reach; // hangs up   -> search down
+
         float m = 0.0;
         float invz = 0.0; // unified nearest inv-z across the dilated marker
 
         [loop]
-        for (int ty = -tiles_y; ty <= tiles_y; ++ty) {
+        for (int ty = ty_min; ty <= ty_max; ++ty) {
             [loop]
-            for (int tx = -tiles_x; tx <= tiles_x; ++tx) {
+            for (int tx = tx_min; tx <= tx_max; ++tx) {
                 float2 nuv = saturate(tile_uv + float2((float)tx / 64.0, (float)ty / 36.0));
                 m = max(m, hud_mask.SampleLevel(samp, nuv, 0).r);
                 // Tile-depth is already min-z-flooded across each contiguous
