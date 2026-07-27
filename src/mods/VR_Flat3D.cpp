@@ -2522,7 +2522,7 @@ void VR::on_draw_sidebar_flat3d() {
         m_flat3d_opentrack_rot_scale->draw("Look Sensitivity");
         m_flat3d_opentrack_pos_scale->draw("Parallax Sensitivity");
         text_disabled_wrapped("Point OpenTrack's 'UDP over network' output at 127.0.0.1:<port>. "
-                              "Bind a Recenter key in Advanced to zero the neutral pose.");
+                              "Use OpenTrack's own Center hotkey to zero the neutral pose.");
         if (flat3d != nullptr && flat3d->opentrack_active.load()) {
             ImGui::Text("Head: yaw %.1f pitch %.1f (deg)",
                         glm::degrees(flat3d->head_yaw.load()), glm::degrees(flat3d->head_pitch.load()));

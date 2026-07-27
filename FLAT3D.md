@@ -52,10 +52,15 @@ Pick how the stereo pair is packed into the screen image:
 **Swap Eyes** — flips left/right if the depth looks inverted (also flips the
 interlace phase for passive displays).
 
-**VSync Override** — *Use In-Game Setting* (default), *Force On* (tear-free),
-*Force Off* (lowest latency), or *Force Off + 2x Refresh Cap (AFR)*, which
-uncaps VSync and pins the frame cap at twice the refresh so alternate-eye
-rendering can refresh each eye at full rate.
+**VSync Override** — *No-Tear Fast* (default), *Force On*, or *Use In-Game
+Setting*. No-Tear Fast overrides the game's own VSync: presents run uncapped
+at sync interval 0 with the DXGI tearing flag stripped, so a flip-model
+swapchain (all DX12 games) still flips on vblank only — tear-free **and**
+both eyes of an AFR-family pair land every refresh. The frame cap
+(`t.MaxFPS`) is managed automatically: twice the display refresh under
+Synced Sequential / AFR / AFW, native refresh under Native Stereo. (DX11
+exclusive-fullscreen can still tear at interval 0 — use *Force On* there, or
+run borderless windowed.)
 
 **Force SDR Output** — HDR output washes out the 3D modes and disables color
 correction. Leave this on unless you specifically want to experiment with HDR
@@ -80,7 +85,9 @@ aiming down sights keeps the perceived depth constant. The game's FoV is never
 overridden — only the stereo shear is injected into its own projection.
 
 Hotkeys (hold to repeat): **Ctrl+F3 / F4** depth −/+, **Ctrl+F5 / F6**
-convergence −/+. Single-key equivalents can be bound under **Advanced**.
+convergence −/+. **Ctrl+F12** (or the **Take 3D Screenshot** button at the
+top of the menu) saves the canonical side-by-side pair as a PNG under
+`<persistent>/flat3d_screenshots/`, regardless of the on-screen output mode.
 
 ## Depth Source
 
@@ -100,6 +107,10 @@ The scene-depth source for **Adaptive Crosshair**, **HUD Depth**, and
   Installs **no engine hook** (safe where Engine Pool crashes) and sees depth
   allocated at any time (works where Per-Draw stays flat). A status line under
   the combo shows what the observer is tracing.
+- **DLSS Depth** (D3D12 only) — snapshots the exact depth the game feeds DLSS,
+  captured from the DLSS call itself (no engine hook, no plugin). Only has
+  data while DLSS is enabled in the game's graphics settings; works in any
+  rendering method and is the natural choice when playing with AFW.
 
 ## Auto-Convergence
 
@@ -195,8 +206,6 @@ falls back to GUI depth over full-screen menus). **Cursor Size** sets its size.
 
 ## Head Tracking (OpenTrack)
 
-***WIP, not fully implemented yet***
-
 Point OpenTrack's **UDP over network** output at `127.0.0.1:<port>` (default
 4242). Two independent gains:
 
@@ -205,8 +214,8 @@ Point OpenTrack's **UDP over network** output at `127.0.0.1:<port>` (default
 - **Parallax Sensitivity** — shifts the eye origin with head x/y/z for a
   fishtank / head-coupled effect (natural on SR displays).
 
-Bind a **Recenter** key (Advanced) to zero the neutral pose. Off by default and
-a pure no-op when disabled.
+Use OpenTrack's own **Center** hotkey to zero the neutral pose. Off by
+default and a pure no-op when disabled.
 
 ## Color Correction (SDR)
 
@@ -219,23 +228,31 @@ channel **Lift / Gamma / Gain** sliders. SDR output only (ignored under HDR).
 
 - **HDR Paper White (nits)** — reference white used when converting HDR frames
   for anaglyph output.
-- **Depth ± / Convergence ± Key** — optional single-key binds mirroring the
-  Ctrl+F3–F6 hotkeys.
-- **3D Screenshot Key** — saves the canonical side-by-side pair as a PNG under
-  `<persistent>/flat3d_screenshots/` (D3D11), regardless of the on-screen output
-  mode.
-- **Recenter Key** — zeroes the OpenTrack neutral pose.
 - **D3D12 Debug Layer Log** — diagnostic logging of D3D12 validation messages
   for depth-feature crashes (needs the debug layer enabled on the game's device;
   see the in-menu tooltip). D3D12 only.
 
 ## Compatibility notes
 
-- **Alternate-frame (AFR) rendering** works: the compositor keeps a per-eye
-  cache, so each frame one eye is fresh and the other is one frame old (same as
-  the headset AFR path). Fast motion shows the usual AFR shimmer.
+- **Synchronized Sequential** shows only complete, matched pairs: both eyes
+  come from the same game state (a pair lock holds the first eye until its
+  partner arrives), and eye identity is measured per frame rather than
+  inferred — no cross-state judder, no inverted eyes, at roughly half the
+  effective framerate (each world state is rendered twice).
+- **Alternating/AFR** works with a per-eye cache: each frame one eye is fresh
+  and the other is one frame old. Fast motion shows the usual AFR shimmer.
+- **Alternate Frame Warping (AFW)** renders one eye and reprojects the other
+  from color + depth + motion vectors — near-2x scene performance with
+  same-state eyes. D3D12 only, needs DLSS enabled in-game (raw-buffer
+  fallback exists) and the real `PDAFWPlugin.dll` beside `UEVRBackend.dll`;
+  without it, AFW falls back to plain AFR. Pair it with the **DLSS Depth**
+  source so the depth features read the same depth the warp uses.
 - **Native Stereo Fix** titles are handled (eye layout follows the headset
-  logic).
+  logic), including modular DLL builds and engines with customized
+  scene-view-family layouts (Returnal, Hellblade 2).
+- Games that need **AHUD UI compatibility** (UI drawn via the viewport
+  render target, e.g. P3R) can look overly transparent — see **UI Invert
+  Alpha** and **UI Color Gate** on the main Compatibility page.
 - Both UE4 (float) and UE5 (double-precision) projection paths are supported.
 - Quick sanity check: Side by Side with Depth 0 gives two identical halves;
   raise Depth and nearer-than-convergence objects show crossed disparity (use
