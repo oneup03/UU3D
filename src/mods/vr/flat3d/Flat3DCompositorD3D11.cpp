@@ -6,6 +6,9 @@
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
 
+#include <wincodec.h>
+#include <ScreenGrab.h>
+
 #include <spdlog/spdlog.h>
 
 #include "Flat3DCompositorD3D11.hpp"
@@ -1039,6 +1042,13 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
     }
 
     // --- 2. Draw the UI layer + crosshair + UEVR menu into each eye ----------
+    // 3D-screenshot capture: record which eyes are refreshed this present
+    // (draw_overlays below hides the UEVR menu while m_ss_active).
+    if (m_ss_active) {
+        m_ss_captured_mask |= eye_refresh_mask;
+        ++m_ss_frames;
+    }
+
     draw_overlays(context, ui_srv, menu_srv, params, eye_refresh_mask);
 
     // --- 2b. Full-screen-GUI coverage reduction (independent of HUD mode) ----
@@ -1187,15 +1197,19 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
 void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11ShaderResourceView* ui_srv,
                                           ID3D11ShaderResourceView* menu_srv, const Flat3DFrameParams& params,
                                           uint32_t eye_refresh_mask) {
+    // A 3D-screenshot capture hides only the UEVR menu (layer 3) so it doesn't
+    // land in the saved pair; the game HUD, crosshair and stereo cursor stay.
+    // See begin_screenshot().
     const bool want_ui = params.ui_enabled && ui_srv != nullptr;
     const bool want_game_crosshair = params.crosshair_mode == 1 && ui_srv != nullptr;
     const bool want_laser = params.crosshair_mode == 2;
-    const bool want_menu = menu_srv != nullptr;
+    const bool want_menu = !m_ss_active && menu_srv != nullptr;
+    const bool want_cursor = params.cursor_enabled;
 
     // Effective mode computed in composite (depth SRV + classification state).
     const int32_t hud_mode = m_hud_mode_effective;
 
-    if (!want_ui && !want_game_crosshair && !want_laser && !want_menu && !params.cursor_enabled) {
+    if (!want_ui && !want_game_crosshair && !want_laser && !want_menu && !want_cursor) {
         return;
     }
 
@@ -1330,7 +1344,7 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
             // The UEVR menu at its own depth.
             draw_layer(3, menu_shift_uv, params.menu_scale, 0.5f + ch_shift_uv, 0.5f);
         }
-        if (params.cursor_enabled) {
+        if (want_cursor) {
             // Topmost: the stereo cursor, riding the UI layer's transform
             // (fit-scale horizontally, crop-map compensation vertically) so
             // it stays over the element it points at. Geometry mode passes the
@@ -1708,6 +1722,161 @@ struct ScopedPerMonitorDpi {
 } // namespace
 #endif
 
+bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3DFrameParams& params,
+                                      uint32_t out_w, uint32_t out_h) {
+    if (m_sbs_tex == nullptr || m_sbs_w != out_w || m_sbs_h != out_h) {
+        ComPtr<ID3D11Device> device{};
+        context->GetDevice(&device);
+
+        m_sbs_tex.Reset();
+        m_sbs_srv.Reset();
+        m_sbs_rtv.Reset();
+        m_sbs_w = out_w;
+        m_sbs_h = out_h;
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = out_w * 2;
+        desc.Height = out_h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = m_eye_format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_sbs_tex))) {
+            spdlog::error("[Flat3D] Failed to create SbS texture");
+            return false;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = m_eye_format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+
+        if (FAILED(device->CreateShaderResourceView(m_sbs_tex.Get(), &srv_desc, &m_sbs_srv))) {
+            spdlog::error("[Flat3D] Failed to create SbS SRV");
+            m_sbs_tex.Reset();
+            return false;
+        }
+
+        if (FAILED(device->CreateRenderTargetView(m_sbs_tex.Get(), nullptr, &m_sbs_rtv))) {
+            spdlog::error("[Flat3D] Failed to create SbS RTV");
+            m_sbs_tex.Reset();
+            m_sbs_srv.Reset();
+            return false;
+        }
+
+#ifdef UEVR_FLAT3D_HAS_LEIASR
+        m_sr_input_bound = false; // the weaver must rebind the recreated input
+#endif
+    }
+
+    // Render the pair with the repack shader in SBS mode instead of copying:
+    // honors eye swap and applies the SDR color correction (the LeiaSR weaver
+    // and the screenshot PNG both consume SDR sRGB).
+    RepackConstants constants{};
+    constants.out_size[0] = (int32_t)(m_sbs_w * 2);
+    constants.out_size[1] = (int32_t)m_sbs_h;
+    constants.mode = (int32_t)Flat3DOutputMode::SBS;
+    constants.eye_swap = params.eye_swap ? 1 : 0;
+    constants.colorspace = 0; // SDR sRGB
+    constants.paper_white = params.paper_white_nits;
+    constants.src_srgb = 0;
+    constants.correction_enabled = params.correction_enabled ? 1 : 0;
+    for (int i = 0; i < 3; ++i) {
+        constants.lift[i] = params.lift[i];
+        constants.gamma[i] = params.gamma[i];
+        constants.gain[i] = params.gain[i];
+    }
+    constants.curve = params.curve;
+    constants.off_low = params.off_low;
+    constants.off_high = params.off_high;
+    constants.off_both = params.off_both;
+    constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
+    constants.scene_scale = params.scene_scale;
+    context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
+
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(m_vs.Get(), nullptr, 0);
+    context->PSSetShader(m_ps.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->HSSetShader(nullptr, nullptr, 0);
+    context->DSSetShader(nullptr, nullptr, 0);
+
+    ID3D11Buffer* cbs[] = {m_cb.Get()};
+    context->PSSetConstantBuffers(0, 1, cbs);
+
+    ID3D11ShaderResourceView* eye_srvs[] = {m_eye_srv[0].Get(), m_eye_srv[1].Get()};
+    context->PSSetShaderResources(0, 2, eye_srvs);
+
+    ID3D11SamplerState* samplers[] = {m_sampler.Get()};
+    context->PSSetSamplers(0, 1, samplers);
+
+    context->RSSetState(m_rasterizer.Get());
+
+    D3D11_VIEWPORT sbs_viewport{};
+    sbs_viewport.Width = (float)(m_sbs_w * 2);
+    sbs_viewport.Height = (float)m_sbs_h;
+    sbs_viewport.MaxDepth = 1.0f;
+    context->RSSetViewports(1, &sbs_viewport);
+
+    D3D11_RECT sbs_scissor{0, 0, (LONG)(m_sbs_w * 2), (LONG)m_sbs_h};
+    context->RSSetScissorRects(1, &sbs_scissor);
+
+    context->OMSetBlendState(m_blend.Get(), nullptr, 0xFFFFFFFF);
+    context->OMSetDepthStencilState(m_depth.Get(), 0);
+
+    ID3D11RenderTargetView* sbs_rtvs[] = {m_sbs_rtv.Get()};
+    context->OMSetRenderTargets(1, sbs_rtvs, nullptr);
+
+    context->Draw(3, 0);
+
+    // Unbind so the caller (weaver / ScreenGrab) can sample m_sbs_tex.
+    ID3D11RenderTargetView* null_rtvs[] = {nullptr};
+    context->OMSetRenderTargets(1, null_rtvs, nullptr);
+    return true;
+}
+
+bool Flat3DCompositorD3D11::save_screenshot(ID3D11DeviceContext* context, const Flat3DFrameParams& params,
+                                            const std::wstring& parallel_path, const std::wstring& crossview_path) {
+    if (!m_ready || context == nullptr || m_eye_tex[0] == nullptr || m_eye_tex[1] == nullptr ||
+        m_eye_w == 0 || m_eye_h == 0) {
+        return false;
+    }
+
+    // Restore the game's pipeline state on return — the SbS build clobbers it.
+    ScopedD3D11State _state{context};
+
+    // Renders the composited pair into m_sbs_tex at native per-eye resolution and
+    // encodes it. Forced to 8-bit BGRA so HDR eye formats normalize (the SbS
+    // build already emits SDR sRGB values). cross=false gives the geometric
+    // left|right pair; cross=true swaps the halves for cross-eyed viewing.
+    const auto build_and_save = [&](bool cross, const std::wstring& path) -> bool {
+        if (path.empty()) {
+            return true;
+        }
+        Flat3DFrameParams p = params;
+        p.eye_swap = cross; // eye0 is always the left eye: parallel = no swap
+        if (!build_sbs(context, p, m_eye_w, m_eye_h)) {
+            return false;
+        }
+        const HRESULT hr = DirectX::SaveWICTextureToFile(
+            context, m_sbs_tex.Get(), GUID_ContainerFormatPng, path.c_str(),
+            &GUID_WICPixelFormat32bppBGRA);
+        if (FAILED(hr)) {
+            spdlog::error("[Flat3D][D3D11] Screenshot encode failed (hr=0x{:x})", (uint32_t)hr);
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = build_and_save(false, parallel_path);
+    ok = build_and_save(true, crossview_path) && ok;
+    return ok;
+}
+
 bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11RenderTargetView* backbuffer_rtv,
                                          uint32_t out_w, uint32_t out_h, const Flat3DFrameParams& params) {
 #ifdef UEVR_FLAT3D_HAS_LEIASR
@@ -1715,9 +1884,6 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
     // create+weave interaction (maps the weave to the full native panel rather
     // than a DPI-virtualized sub-region under a non-per-monitor-aware host).
     ScopedPerMonitorDpi dpi_guard{};
-
-    ComPtr<ID3D11Device> device{};
-    context->GetDevice(&device);
 
     // Lazy one-shot weaver creation (SRService may block briefly).
     if (m_sr_weaver == nullptr && !m_sr_attempted) {
@@ -1762,114 +1928,8 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
     // Build the SbS input the weaver expects from the two eye textures, at
     // DISPLAY resolution (upscale-then-weave): the SR lenticular pattern is
     // display-pixel-exact only when its input matches the panel.
-    if (m_sbs_tex == nullptr || m_sbs_w != out_w || m_sbs_h != out_h) {
-        m_sbs_tex.Reset();
-        m_sbs_srv.Reset();
-        m_sbs_rtv.Reset();
-        m_sbs_w = out_w;
-        m_sbs_h = out_h;
-
-        D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = out_w * 2;
-        desc.Height = out_h;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = m_eye_format;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-
-        if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_sbs_tex))) {
-            spdlog::error("[Flat3D] Failed to create LeiaSR SbS texture");
-            return false;
-        }
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-        srv_desc.Format = m_eye_format;
-        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srv_desc.Texture2D.MipLevels = 1;
-
-        if (FAILED(device->CreateShaderResourceView(m_sbs_tex.Get(), &srv_desc, &m_sbs_srv))) {
-            spdlog::error("[Flat3D] Failed to create LeiaSR SbS SRV");
-            m_sbs_tex.Reset();
-            return false;
-        }
-
-        if (FAILED(device->CreateRenderTargetView(m_sbs_tex.Get(), nullptr, &m_sbs_rtv))) {
-            spdlog::error("[Flat3D] Failed to create LeiaSR SbS RTV");
-            m_sbs_tex.Reset();
-            m_sbs_srv.Reset();
-            return false;
-        }
-
-        m_sr_input_bound = false;
-    }
-
-    // Render the pair with the repack shader in SBS mode instead of copying:
-    // honors eye swap and applies the SDR color correction to the weaver
-    // input (the weaver bypasses the backbuffer repack pass entirely).
-    {
-        RepackConstants constants{};
-        constants.out_size[0] = (int32_t)(m_sbs_w * 2);
-        constants.out_size[1] = (int32_t)m_sbs_h;
-        constants.mode = (int32_t)Flat3DOutputMode::SBS;
-        constants.eye_swap = params.eye_swap ? 1 : 0;
-        constants.colorspace = 0; // the weaver consumes SDR sRGB
-        constants.paper_white = params.paper_white_nits;
-        constants.src_srgb = 0;
-        constants.correction_enabled = params.correction_enabled ? 1 : 0;
-        for (int i = 0; i < 3; ++i) {
-            constants.lift[i] = params.lift[i];
-            constants.gamma[i] = params.gamma[i];
-            constants.gain[i] = params.gain[i];
-        }
-        constants.curve = params.curve;
-        constants.off_low = params.off_low;
-        constants.off_high = params.off_high;
-        constants.off_both = params.off_both;
-        constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
-        constants.scene_scale = params.scene_scale;
-        context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
-
-        context->IASetInputLayout(nullptr);
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context->VSSetShader(m_vs.Get(), nullptr, 0);
-        context->PSSetShader(m_ps.Get(), nullptr, 0);
-        context->GSSetShader(nullptr, nullptr, 0);
-        context->HSSetShader(nullptr, nullptr, 0);
-        context->DSSetShader(nullptr, nullptr, 0);
-
-        ID3D11Buffer* cbs[] = {m_cb.Get()};
-        context->PSSetConstantBuffers(0, 1, cbs);
-
-        ID3D11ShaderResourceView* eye_srvs[] = {m_eye_srv[0].Get(), m_eye_srv[1].Get()};
-        context->PSSetShaderResources(0, 2, eye_srvs);
-
-        ID3D11SamplerState* samplers[] = {m_sampler.Get()};
-        context->PSSetSamplers(0, 1, samplers);
-
-        context->RSSetState(m_rasterizer.Get());
-
-        D3D11_VIEWPORT sbs_viewport{};
-        sbs_viewport.Width = (float)(m_sbs_w * 2);
-        sbs_viewport.Height = (float)m_sbs_h;
-        sbs_viewport.MaxDepth = 1.0f;
-        context->RSSetViewports(1, &sbs_viewport);
-
-        D3D11_RECT sbs_scissor{0, 0, (LONG)(m_sbs_w * 2), (LONG)m_sbs_h};
-        context->RSSetScissorRects(1, &sbs_scissor);
-
-        context->OMSetBlendState(m_blend.Get(), nullptr, 0xFFFFFFFF);
-        context->OMSetDepthStencilState(m_depth.Get(), 0);
-
-        ID3D11RenderTargetView* sbs_rtvs[] = {m_sbs_rtv.Get()};
-        context->OMSetRenderTargets(1, sbs_rtvs, nullptr);
-
-        context->Draw(3, 0);
-
-        // Unbind before the weaver samples m_sbs_tex.
-        ID3D11RenderTargetView* null_rtvs[] = {nullptr};
-        context->OMSetRenderTargets(1, null_rtvs, nullptr);
+    if (!build_sbs(context, params, out_w, out_h)) {
+        return false;
     }
 
     if (m_sr_weaver != nullptr && !m_sr_input_bound) {

@@ -86,8 +86,14 @@ overridden — only the stereo shear is injected into its own projection.
 
 Hotkeys (hold to repeat): **Ctrl+F3 / F4** depth −/+, **Ctrl+F5 / F6**
 convergence −/+. **Ctrl+F12** (or the **Take 3D Screenshot** button at the
-top of the menu) saves the canonical side-by-side pair as a PNG under
-`<persistent>/flat3d_screenshots/`, regardless of the on-screen output mode.
+top of the menu) saves the composited stereo pair — the game, its own HUD, the
+crosshair and the stereo cursor at the current convergence, with only the UEVR
+menu hidden for the capture and both eyes valid even under AFR — as two PNGs
+under `<persistent>/flat3d_screenshots/`, regardless of the on-screen output
+mode: a canonical parallel-view (`sbs_<timestamp>.png`, left|right) and a
+cross-view companion (`…_crossview.png`, right|left) for cross-eyed free-viewing.
+The capture spans the 1–2 presents it takes to refresh both eyes with the menu
+hidden, so the menu briefly blinks off on screen as the shot is taken.
 
 ## Depth Source
 

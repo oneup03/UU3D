@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
 
 #include <d3d12.h>
 #include <wrl.h>
@@ -81,6 +82,29 @@ public:
     uint32_t eye_height() const { return m_eye_h; }
     DXGI_FORMAT eye_format() const { return m_eye_format; }
 
+    // Saves a 3D screenshot of the last composited frame: renders the two
+    // composited eye textures into an SbS image via the repack shader (so the
+    // configured SDR color correction is applied and HDR eye formats are
+    // normalized), then encodes PNGs — a parallel-view (left|right) and a
+    // cross-view (right|left, for cross-eyed free-viewing). Either path may be
+    // empty to skip that variant. Must be called after composite() on the same
+    // command queue. Returns true only if every requested variant was written.
+    bool save_screenshot(ID3D12CommandQueue* queue, const Flat3DFrameParams& params,
+                         const std::wstring& parallel_path, const std::wstring& crossview_path);
+
+    // 3D screenshot capture control. begin_screenshot() starts a short capture
+    // during which composite() hides the UEVR menu — keeping the game HUD,
+    // crosshair and stereo cursor — and waits for BOTH eyes to be refreshed
+    // that way (AFR-correct). Once screenshot_capture_complete() returns true
+    // the caller saves via save_screenshot (the eye cache now holds the
+    // menu-free pair) and calls end_screenshot().
+    void begin_screenshot() { m_ss_active = true; m_ss_captured_mask = 0; m_ss_frames = 0; }
+    bool screenshot_active() const { return m_ss_active; }
+    bool screenshot_capture_complete() const {
+        return m_ss_active && (m_ss_captured_mask == 0b11u || m_ss_frames >= kScreenshotMaxFrames);
+    }
+    void end_screenshot() { m_ss_active = false; }
+
 private:
     bool create_pipelines(ID3D12Device* device);
     // eye_refresh_mask: bit N set = eye N's scene content was refreshed this
@@ -128,6 +152,20 @@ private:
     // reuse also guarantees its depth-readback buffer is safe to map.
     static constexpr uint32_t kRing = 3;
     d3d12::CommandContext m_cmds[kRing]{};
+
+    // Dedicated (lazily created) command context for the rare, synchronous
+    // screenshot SbS build — kept off the frame ring so it can't disturb the
+    // depth/coverage readback slot bookkeeping.
+    d3d12::CommandContext m_screenshot_ctx{};
+
+    // 3D screenshot capture state (see begin_screenshot). While active, composite
+    // hides the UEVR menu and accumulates which eyes have been refreshed that
+    // way; the capture completes once both have (or after the frame budget — a
+    // backstop for a stuck pair-lock that never republishes).
+    static constexpr int kScreenshotMaxFrames = 16;
+    bool m_ss_active{false};
+    uint32_t m_ss_captured_mask{0};
+    int m_ss_frames{0};
 
     // HUD anchor constants (b1): per-ring-slot upload buffers, persistently
     // mapped. Depth-adaptive HUD state is refreshed per composite.

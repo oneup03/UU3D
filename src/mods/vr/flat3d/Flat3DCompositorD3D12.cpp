@@ -6,6 +6,9 @@
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler")
 
+#include <wincodec.h>
+#include <../../directxtk12-src/Inc/ScreenGrab.h>
+
 #include <spdlog/spdlog.h>
 
 #include "Flat3DCompositorD3D12.hpp"
@@ -396,14 +399,19 @@ bool Flat3DCompositorD3D12::create_pipelines(ID3D12Device* device) {
 
 void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool have_ui, bool have_menu,
                                             const Flat3DFrameParams& params, uint32_t eye_refresh_mask) {
+    // A 3D-screenshot capture hides only the UEVR menu (layer 3) so it doesn't
+    // land in the saved pair; the game HUD, crosshair and stereo cursor stay.
+    // See begin_screenshot().
     const bool want_ui = params.ui_enabled && have_ui;
     const bool want_game_crosshair = params.crosshair_mode == 1 && have_ui;
     const bool want_laser = params.crosshair_mode == 2;
+    const bool want_menu = !m_ss_active && have_menu;
+    const bool want_cursor = params.cursor_enabled;
 
     // Effective mode computed in composite (depth SRV + classification state).
     const int32_t hud_mode = m_hud_mode_effective;
 
-    if (!want_ui && !want_game_crosshair && !want_laser && !have_menu && !params.cursor_enabled) {
+    if (!want_ui && !want_game_crosshair && !want_laser && !want_menu && !want_cursor) {
         return;
     }
 
@@ -515,11 +523,11 @@ void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool
         if (want_laser) {
             draw_layer(2, ch_shift_uv, 1.0f, 0.5f + ch_shift_uv, 0.5f);
         }
-        if (have_menu) {
+        if (want_menu) {
             // The UEVR menu at its own depth.
             draw_layer(3, menu_shift_uv, params.menu_scale, 0.5f + ch_shift_uv, 0.5f);
         }
-        if (params.cursor_enabled) {
+        if (want_cursor) {
             // Topmost: the stereo cursor, riding the UI layer's transform
             // (fit-scale horizontally, crop-map compensation vertically) so
             // it stays over the element it points at. Geometry mode passes the
@@ -1227,6 +1235,13 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         m_hud_mode_effective = 0;
     }
 
+    // 3D-screenshot capture: record which eyes are refreshed this present
+    // (record_overlays below hides the UEVR menu while m_ss_active).
+    if (m_ss_active) {
+        m_ss_captured_mask |= eye_refresh_mask;
+        ++m_ss_frames;
+    }
+
     record_overlays(cmd, have_ui, have_menu, params, eye_refresh_mask);
 
     // --- Full-screen-GUI coverage reduction (independent of HUD mode) --------
@@ -1826,6 +1841,61 @@ void Flat3DCompositorD3D12::build_sbs(ID3D12GraphicsCommandList* cmd, const Flat
     cmd->DrawInstanced(3, 1, 0, 0);
 
     barrier(cmd, m_sbs_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Flat3DFrameParams& params,
+                                            const std::wstring& parallel_path, const std::wstring& crossview_path) {
+    if (!m_ready || queue == nullptr || m_sbs_pso == nullptr ||
+        m_eye_tex[0] == nullptr || m_eye_tex[1] == nullptr || m_eye_w == 0 || m_eye_h == 0) {
+        return false;
+    }
+
+    if (!m_screenshot_ctx.ready() && !m_screenshot_ctx.setup(L"Flat3D screenshot")) {
+        spdlog::error("[Flat3D][D3D12] Screenshot command context setup failed");
+        return false;
+    }
+
+    // Renders the composited pair into m_sbs_tex (leaving it in PSR) with the
+    // repack shader — cross=false yields the geometric left|right pair, cross=
+    // true swaps the halves — then encodes it. Forced to 8-bit BGRA so HDR eye
+    // formats are normalized (the SbS build already emits SDR sRGB values).
+    const auto build_and_save = [&](bool cross, const std::wstring& path) -> bool {
+        if (path.empty()) {
+            return true;
+        }
+
+        m_screenshot_ctx.wait(INFINITE); // resets the list into the recording state
+        auto* cmd = m_screenshot_ctx.cmd_list.Get();
+
+        ID3D12DescriptorHeap* heaps[] = {m_srv_heap.Get()};
+        cmd->SetDescriptorHeaps(1, heaps);
+        cmd->SetGraphicsRootSignature(m_root_sig.Get());
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        // Canonical pair independent of the display eye-swap: eye0 is always the
+        // left eye, so parallel = no swap and cross = swap.
+        Flat3DFrameParams p = params;
+        p.eye_swap = cross;
+        build_sbs(cmd, p, m_eye_w, m_eye_h);
+
+        m_screenshot_ctx.has_commands = true;
+        m_screenshot_ctx.execute();
+        m_screenshot_ctx.wait(INFINITE); // block until the SbS build is on the GPU
+
+        const HRESULT hr = DirectX::SaveWICTextureToFile(
+            queue, m_sbs_tex.Get(), GUID_ContainerFormatPng, path.c_str(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            &GUID_WICPixelFormat32bppBGRA);
+        if (FAILED(hr)) {
+            spdlog::error("[Flat3D][D3D12] Screenshot encode failed (hr=0x{:x})", (uint32_t)hr);
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = build_and_save(false, parallel_path);
+    ok = build_and_save(true, crossview_path) && ok;
+    return ok;
 }
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12

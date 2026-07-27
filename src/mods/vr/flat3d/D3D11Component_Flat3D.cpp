@@ -6,9 +6,6 @@
 #include <filesystem>
 #include <string>
 
-#include <wincodec.h>
-#include <ScreenGrab.h>
-
 #include <utility/Logging.hpp>
 #include <utility/String.hpp>
 
@@ -237,6 +234,12 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     // (Framework skips its flat backbuffer draw when we consumed it).
     ID3D11Texture2D* menu_tex = g_framework->get_rendertarget_d3d11().Get();
 
+    // 3D screenshot: begin a capture (composite hides the UEVR menu while it
+    // runs) the present the hotkey / menu button fired.
+    if (vr->get_flat3d_runtime()->screenshot_requested.exchange(false)) {
+        m_flat3d_compositor.begin_screenshot();
+    }
+
     float ui_coverage = 0.0f;
     const bool composited = m_flat3d_compositor.composite(context.Get(), double_wide.Get(), right_eye_src.Get(), ui_srv,
                                                           menu_tex, scene_depth.Get(), m_backbuffer_rtv.Get(),
@@ -278,8 +281,11 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
         }
     }
 
-    // 3D screenshot: save the engine double-wide (canonical SbS pair) as PNG.
-    if (vr->get_flat3d_runtime()->screenshot_requested.exchange(false)) {
+    // 3D screenshot: once both eyes have been refreshed with the UEVR menu
+    // hidden (AFR-correct), save the composited pair — game HUD, crosshair,
+    // cursor and convergence, but no UEVR menu — as a parallel-view PNG plus a
+    // cross-view companion.
+    if (m_flat3d_compositor.screenshot_capture_complete()) {
         namespace fs = std::filesystem;
         std::error_code ec;
         const auto dir = fs::path(Framework::get_persistent_dir()) / "flat3d_screenshots";
@@ -287,18 +293,18 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
 
         SYSTEMTIME st{};
         GetLocalTime(&st);
-        wchar_t name[64];
-        swprintf_s(name, L"sbs_%04u%02u%02u_%02u%02u%02u_%03u.png",
+        wchar_t stamp[32];
+        swprintf_s(stamp, L"%04u%02u%02u_%02u%02u%02u_%03u",
                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        const auto path = (dir / name).wstring();
+        const auto parallel_path = (dir / (std::wstring(L"sbs_") + stamp + L".png")).wstring();
+        const auto crossview_path = (dir / (std::wstring(L"sbs_") + stamp + L"_crossview.png")).wstring();
 
-        const auto hr = DirectX::SaveWICTextureToFile(context.Get(), double_wide.Get(),
-                                                      GUID_ContainerFormatPng, path.c_str());
-        if (SUCCEEDED(hr)) {
-            spdlog::info("[Flat3D] Saved 3D screenshot: {}", utility::narrow(path));
+        if (m_flat3d_compositor.save_screenshot(context.Get(), params, parallel_path, crossview_path)) {
+            spdlog::info("[Flat3D] Saved 3D screenshot: {}", utility::narrow(parallel_path));
         } else {
-            SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Screenshot save failed (hr=0x{:x})", (uint32_t)hr);
+            SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Screenshot save failed");
         }
+        m_flat3d_compositor.end_screenshot();
     }
 
     // Drives the one-time window activation / mouse centering. The overlay

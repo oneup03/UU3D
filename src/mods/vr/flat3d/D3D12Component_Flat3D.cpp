@@ -4,9 +4,6 @@
 
 #include <filesystem>
 
-#include <wincodec.h>
-#include <../../directxtk12-src/Inc/ScreenGrab.h>
-
 #include <utility/Logging.hpp>
 #include <utility/String.hpp>
 
@@ -467,6 +464,12 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     // (Framework skips its flat backbuffer draw when we consumed it).
     ID3D12Resource* menu_tex = g_framework->get_rendertarget_d3d12().Get();
 
+    // 3D screenshot: begin a capture (composite hides the UEVR menu while it
+    // runs) the present the hotkey / menu button fired.
+    if (vr->get_flat3d_runtime()->screenshot_requested.exchange(false)) {
+        m_flat3d_compositor.begin_screenshot();
+    }
+
     if (!m_flat3d_compositor.composite(double_wide.Get(), second_eye_src, ui_tex, menu_tex, real_backbuffer.Get(),
                                        (uint32_t)bb_desc.Width, bb_desc.Height, params,
                                        scene_depth.Get(), vr->get_flat3d_runtime()->game_nearz.load(),
@@ -501,8 +504,11 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
         }
     }
 
-    // 3D screenshot: save the engine double-wide (canonical SbS pair) as PNG.
-    if (vr->get_flat3d_runtime()->screenshot_requested.exchange(false)) {
+    // 3D screenshot: once both eyes have been refreshed with the UEVR menu
+    // hidden (AFR-correct), save the composited pair — game HUD, crosshair,
+    // cursor and convergence, but no UEVR menu — as a parallel-view PNG plus a
+    // cross-view companion.
+    if (m_flat3d_compositor.screenshot_capture_complete()) {
         namespace fs = std::filesystem;
         std::error_code ec;
         const auto dir = fs::path(Framework::get_persistent_dir()) / "flat3d_screenshots";
@@ -510,21 +516,18 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
 
         SYSTEMTIME st{};
         GetLocalTime(&st);
-        wchar_t name[64];
-        swprintf_s(name, L"sbs_%04u%02u%02u_%02u%02u%02u_%03u.png",
+        wchar_t stamp[32];
+        swprintf_s(stamp, L"%04u%02u%02u_%02u%02u%02u_%03u",
                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        const auto path = (dir / name).wstring();
+        const auto parallel_path = (dir / (std::wstring(L"sbs_") + stamp + L".png")).wstring();
+        const auto crossview_path = (dir / (std::wstring(L"sbs_") + stamp + L"_crossview.png")).wstring();
 
-        // The engine double-wide sits in RENDER_TARGET between our copies.
-        const auto hr = DirectX::SaveWICTextureToFile(
-            hook->get_command_queue(), double_wide.Get(),
-            GUID_ContainerFormatPng, path.c_str(),
-            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        if (SUCCEEDED(hr)) {
-            spdlog::info("[Flat3D] Saved 3D screenshot: {}", utility::narrow(path));
+        if (m_flat3d_compositor.save_screenshot(hook->get_command_queue(), params, parallel_path, crossview_path)) {
+            spdlog::info("[Flat3D] Saved 3D screenshot: {}", utility::narrow(parallel_path));
         } else {
-            SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Screenshot save failed (hr=0x{:x})", (uint32_t)hr);
+            SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Screenshot save failed");
         }
+        m_flat3d_compositor.end_screenshot();
     }
 
     // Drives the one-time window activation / mouse centering; overlay
