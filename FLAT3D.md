@@ -268,6 +268,8 @@ channel **Lift / Gamma / Gain** sliders. SDR output only (ignored under HDR).
 
 - **[praydog](https://github.com/praydog)** — creator and principal author of
   UEVR, the injection and stereo-rendering framework this mode is built on.
+- **joeyhodge** - got more recent UE 5.x games working
+- **PureDark** - created Alternate Frame Warping
 - The UEVR contributors whose work this builds on: narknon, keton, cursey,
   mark-mon, mrbelowski, npt-1707, Raicuparta, Anton-4, and markmontec.
 - **MidlifeCrisis / EvilKermitReturns** — for early exploratory work on Unreal
