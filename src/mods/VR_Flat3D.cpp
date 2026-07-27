@@ -1485,7 +1485,7 @@ void VR::update_flat3d_params() {
     // skips the UncapFramerate write); restores uncapped on exit.
     {
         static bool cap_was_active = false;
-        const bool cap_active = m_flat3d_vsync->value() == 3;
+        const bool cap_active = m_flat3d_vsync->value() >= 2; // No-Tear Fast
 
         if (cap_active) {
             int hz = 0;
@@ -1498,7 +1498,19 @@ void VR::update_flat3d_params() {
                 hz = 60;
             }
 
-            sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", (float)(2 * hz));
+            // AFR-family: one eye per present -> 2x refresh gives each eye a
+            // full-refresh update. Native stereo: both eyes per present ->
+            // 2x would render twice what the display can show; cap at 1x.
+            const int mult = is_using_afr() ? 2 : 1;
+            const int cap = mult * hz;
+
+            static int s_last_logged_cap = -1;
+            if (cap != s_last_logged_cap) {
+                s_last_logged_cap = cap;
+                spdlog::info("[Flat3D] No-Tear Fast cap: t.MaxFPS={} (display {} Hz x {})", cap, hz, mult);
+            }
+
+            sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", (float)cap);
         } else if (cap_was_active) {
             sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 0.0f);
         }
@@ -1576,6 +1588,181 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     p.afr_frame = is_using_afr() && !p.warp_frame;
     // afr_left_eye stays meaningful under warp_frame: which eye the engine rendered.
     p.afr_left_eye = (is_using_afr() || p.warp_frame) && (m_render_frame_count % 2 == m_left_eye_interval);
+    // Synced Sequential renders matched same-game-state eye pairs; the pair
+    // lock keeps the compositor from displaying the half-updated in-between.
+    // Engage it whenever the ENGINE is forcing synced draws — that's
+    // is_using_synchronized_afr(), which also covers AFW's warmup /
+    // resolution-change windows and extreme-compat Native, not just the
+    // explicit Synced Sequential method.
+    p.afr_synced_pair = p.afr_frame && is_using_synchronized_afr();
+
+    // Pair-second detection: camera identity ONLY. The view-offset hook pushes
+    // one record per eye draw — true when that draw's raw game camera was
+    // bit-identical to the previous draw's, which is exactly the forced
+    // same-state second draw. Consumed FIFO, one per present, so alignment
+    // cannot drift the way a parity guess can (and it self-corrects at motion
+    // onset: a static camera matches every draw, which degrades to publish-
+    // per-present — invisible without motion). When no record is available,
+    // default to TRUE = publish naively (no pair hold): naive shows a matched
+    // pair every other present, while a wrongly-guessed hold shows cross-state
+    // pairs on EVERY present. Never lock without evidence — this is why the
+    // old engine-frame-repeat fallback is gone (it fired on the wrong half in
+    // some titles and pinned the lock misaligned).
+    bool pair_second = true;
+    if (flat3d != nullptr) {
+        // Engine frame advanced this present? (Read BEFORE on_post_present
+        // syncs the counters.) Two title classes exist:
+        //   P3R-class: EVERY draw advances the frame number — a same-frame
+        //   present is a draw-less re-present and must not eat a record.
+        //   Hogwarts-class: the forced draw KEEPS the frame number — the
+        //   same-frame present IS the pair-second and owns a (match=true)
+        //   record.
+        // Disambiguate by peeking: pop on a same-frame present only when the
+        // front record is a camera match. First-half records are never
+        // consumed by re-presents, and Hogwarts' pair-seconds consume theirs.
+        const bool new_engine_frame = m_frame_count != m_render_frame_count;
+
+        std::scoped_lock _{flat3d->pair_mtx};
+        if (p.afr_synced_pair) {
+            bool popped = false;
+
+            static int s_prev_pop_eye = -1;
+            static uint32_t s_same_eye_pairs = 0;
+            static uint32_t s_slot_mismatch = 0;
+            static uint32_t s_rec_dropped = 0;
+
+            // Discard records for engine frames that will never present
+            // (dropped frames, menu transitions) — matching by frame number
+            // makes the alignment exact instead of order-inferred.
+            // KEY BY m_render_frame_count, NOT m_frame_count: the fresh latch
+            // (m_frame_count) is captured when the render thread BEGINS a
+            // frame — one ahead of what this present displays. With eyes
+            // alternating per frame, keying on it inverted every slot. The
+            // one-present-lagged m_render_frame_count is the engine frame the
+            // present actually shows — the same clock plain AFR's slot parity
+            // has always used correctly.
+            const uint32_t presenting_frame = (uint32_t)m_render_frame_count;
+            while (!flat3d->pair_second_fifo.empty() &&
+                   (int32_t)(flat3d->pair_second_fifo.front().frame - presenting_frame) < 0) {
+                flat3d->pair_second_fifo.pop_front();
+                ++s_rec_dropped;
+            }
+
+            if (!flat3d->pair_second_fifo.empty() &&
+                flat3d->pair_second_fifo.front().frame == presenting_frame) {
+                const uint8_t record = flat3d->pair_second_fifo.front().flags;
+                pair_second = (record & 1u) != 0;
+                const int rec_eye = (record >> 1) & 1;
+
+                // A published pair whose two draws rendered the SAME eye is the
+                // depth-squish failure mode — count it directly.
+                if (pair_second && s_prev_pop_eye >= 0 && rec_eye == s_prev_pop_eye) {
+                    ++s_same_eye_pairs;
+                }
+                s_prev_pop_eye = rec_eye;
+
+                // Present-side alignment: the compositor copies this present's
+                // image into the slot picked by frame parity (afr_left_eye).
+                // If that slot differs from the eye the draw actually rendered,
+                // every image lands in the OPPOSITE eye — inverted stereo,
+                // which reads as squished/broken depth.
+                const int fresh_slot = p.afr_left_eye ? 0 : 1;
+                if (rec_eye != fresh_slot) {
+                    ++s_slot_mismatch;
+                }
+
+                // Slot by the MEASURED eye, not the parity model. The frame-
+                // counter regime differs per title and can even change within
+                // one (Hogwarts: stalled on forced draws in one session,
+                // advanced in another once the NSF hook was live — flipping
+                // the parity phase and inverting every eye slot = depth
+                // squish). The record carries the eye the draw actually
+                // rendered; FIFO order keeps it aligned with this present.
+                // slot_mismatch above now just tracks the parity model's
+                // drift as a diagnostic.
+                p.afr_left_eye = (rec_eye == 0);
+
+                flat3d->pair_second_fifo.pop_front();
+                flat3d->pair_pop_count++;
+                popped = true;
+
+                // NOTE: no eye flip here. m_render_frame_count lags one
+                // present, so its parity across a Hogwarts pair runs
+                // A,B,B,A,A,B... — it already flips exactly once per pair and
+                // mirrors the per-draw eye alternation (L,R,R,L,L,R...) on the
+                // game thread, whose g_frame_count is one frame stale for the
+                // same reason. An extra flip on the pair-second present slots
+                // both halves into the SAME eye again (depth squish).
+            } else {
+                if (new_engine_frame) {
+                    flat3d->pair_empty_count++;
+                }
+
+                // No record for this present (menus / non-stereo scenes push
+                // nothing): keep ALTERNATING from the last measured eye
+                // rather than falling back to frame parity — the parity phase
+                // is arbitrary and differs between counter regimes, which
+                // surfaced as the eyes swapping between the main menu and
+                // gameplay (user had to toggle Eye Swap per context).
+                if (s_prev_pop_eye >= 0) {
+                    const int guessed = s_prev_pop_eye ^ 1;
+                    s_prev_pop_eye = guessed;
+                    p.afr_left_eye = (guessed == 0);
+                }
+            }
+
+            // Visible world-update pacing: the screen only changes on presents
+            // that publish (pair_second true with a fresh engine frame). Their
+            // rate is the effective world framerate the user perceives —
+            // HALF the draw rate under synced sequential — and their max gap
+            // exposes pacing hitches the averages hide.
+            static uint32_t s_publish_count = 0;
+            static double s_max_gap_ms = 0.0;
+            static auto s_last_publish = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+
+            if (pair_second && (popped || new_engine_frame)) {
+                if (s_last_publish.time_since_epoch().count() != 0) {
+                    const auto gap_ms = std::chrono::duration<double, std::milli>(now - s_last_publish).count();
+                    s_max_gap_ms = std::max(s_max_gap_ms, gap_ms);
+                }
+                s_last_publish = now;
+                s_publish_count++;
+            }
+
+            // Compact 5s diagnostic so a log tells us what the detector sees:
+            // pushes (eye draws), match rate (should be ~50% while the camera
+            // moves, ~100% static), pops vs empty (draw->present correspondence),
+            // world-updates/s + worst visible gap (perceived smoothness).
+            static auto s_last_diag = std::chrono::steady_clock::now();
+            if (now - s_last_diag >= std::chrono::seconds(5)) {
+                const auto window_s = std::chrono::duration<double>(now - s_last_diag).count();
+                s_last_diag = now;
+                spdlog::info("[Flat3D][sync-pair] pushes={} matches={} pops={} empty={} fifo={} world_ups={:.1f}/s max_gap={:.0f}ms same_eye_pairs={} stalls={} slot_mismatch={} drops={}",
+                    flat3d->pair_push_count, flat3d->pair_match_count,
+                    flat3d->pair_pop_count, flat3d->pair_empty_count,
+                    flat3d->pair_second_fifo.size(),
+                    window_s > 0.0 ? (double)s_publish_count / window_s : 0.0,
+                    s_max_gap_ms,
+                    s_same_eye_pairs,
+                    flat3d->pair_stall_count.exchange(0, std::memory_order_relaxed),
+                    s_slot_mismatch,
+                    s_rec_dropped);
+                s_same_eye_pairs = 0;
+                s_slot_mismatch = 0;
+                s_rec_dropped = 0;
+                flat3d->pair_push_count = 0;
+                flat3d->pair_match_count = 0;
+                flat3d->pair_pop_count = 0;
+                flat3d->pair_empty_count = 0;
+                s_publish_count = 0;
+                s_max_gap_ms = 0.0;
+            }
+        } else if (!flat3d->pair_second_fifo.empty()) {
+            flat3d->pair_second_fifo.clear(); // mode switched: drop stale records
+        }
+    }
+    p.afr_pair_second = pair_second;
     p.native_stereo_layout = is_native_stereo_fix_enabled();
     p.paper_white_nits = m_flat3d_hdr_paper_white->value();
 
@@ -1713,6 +1900,7 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     p.hud_inv_conv_uu = 1.0f / conv_uu;
     p.hud_nearz_uu = flat3d->game_nearz.load();
     p.hud_marker_radius = m_flat3d_hud_marker_radius->value();
+    p.ui_color_gate = m_flat3d_ui_color_gate->value();
 
     // Predicted screen flow of world-anchored UI from the camera rotation:
     // yaw moves it horizontally, pitch vertically (markers track both).
@@ -1767,24 +1955,6 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
             }
         }
         p.hud_excl_count = ec;
-    }
-
-    // Diagnostic (throttled): why is adaptive HUD depth (mode 1) on or flat? Shows
-    // the two possible blockers — the in-menus guard (paused / full-screen coverage)
-    // forcing the mode to flat, and the camera-flow signals the classifier needs to
-    // tell world-tracking HUD from screen-anchored HUD (both false = nothing moves,
-    // so nothing gets classified as world-tracking).
-    if (m_flat3d_hud_depth_mode->value() == 1) {
-        static auto s_last_hud_log = std::chrono::steady_clock::now() - std::chrono::seconds(10);
-        const auto now = std::chrono::steady_clock::now();
-        if (now - s_last_hud_log >= std::chrono::seconds(2)) {
-            s_last_hud_log = now;
-            spdlog::info("[Flat3D][hud-gate] requested=1 effective={} | in_menus={} (paused={} cov_fullscreen={} "
-                         "coverage={:.3f} cov_enter={:.2f}) | flow_valid={} translating={} flow=({:.4f},{:.4f}) dtrans_lat={:.3f}",
-                p.hud_depth_mode, in_menus, flat3d->game_paused.load(), s_cov_fullscreen,
-                flat3d->ui_coverage.load(), cov_enter, p.hud_flow_valid, p.hud_translating,
-                p.hud_flow_du, p.hud_flow_dv, flat3d->cam_dtrans_lat.load());
-        }
     }
 
     if (p.hud_depth_mode == 2) {
@@ -1871,31 +2041,22 @@ void VR::handle_flat3d_keybinds() {
         adjust_conv(0.005f);
     }
 
-    // Optional remapped single-key binds (held-repeat like the chords).
-    const auto key_down = [](int32_t k) {
-        return k != ModKey::UNBOUND_KEY && k > 0 && (GetAsyncKeyState(k) & 0x8000) != 0;
-    };
-
-    if (key_down(m_keybind_flat3d_depth_dec->value())) {
-        adjust_depth(-0.001f);
-    }
-    if (key_down(m_keybind_flat3d_depth_inc->value())) {
-        adjust_depth(0.001f);
-    }
-    if (key_down(m_keybind_flat3d_conv_dec->value())) {
-        adjust_conv(-0.005f);
-    }
-    if (key_down(m_keybind_flat3d_conv_inc->value())) {
-        adjust_conv(0.005f);
-    }
-
-    if (m_keybind_flat3d_screenshot->is_key_down_once()) {
-        if (auto* f = get_flat3d_runtime()) {
-            f->screenshot_requested.store(true);
+    // 3D screenshot: fixed hotkey Ctrl+F12 (also a button in the menu header).
+    {
+        static bool s_ss_was_down = false;
+        const bool ss_down = ctrl && (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+        if (ss_down && !s_ss_was_down) {
+            request_flat3d_screenshot();
         }
+        s_ss_was_down = ss_down;
     }
-    if (m_keybind_flat3d_recenter->is_key_down_once()) {
-        g_opentrack.want_center.store(true);
+}
+
+// Queues a 3D screenshot of the next composited stereo frame (Ctrl+F12 / the
+// menu-header button).
+void VR::request_flat3d_screenshot() {
+    if (auto* f = get_flat3d_runtime()) {
+        f->screenshot_requested.store(true);
     }
 }
 
@@ -1985,10 +2146,14 @@ void VR::on_draw_sidebar_flat3d() {
 
     m_flat3d_vsync->draw("VSync Override");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Force On = tear-free (in-game VSync usually paces better).\n"
-                          "Force Off = lowest latency / uncapped presents.\n"
-                          "2x Refresh Cap = VSync off + t.MaxFPS at twice the display refresh,\n"
-                          "so AFR/Synced Sequential update each eye at the full refresh rate.");
+        ImGui::SetTooltip("Force On = tear-free at the display rate (classic vsync pacing).\n"
+                          "No-Tear Fast (default) = overrides the game's own VSync: presents run\n"
+                          "uncapped at sync interval 0 with the DXGI tearing flag stripped. A\n"
+                          "flip-model swapchain (all DX12 games) still flips on vblank only -\n"
+                          "tear-free AND both AFR eye frames land each refresh. t.MaxFPS\n"
+                          "auto-caps at 2x refresh under AFR/Synced/AFW, 1x under Native Stereo.\n"
+                          "(DX11 exclusive-fullscreen can still tear at interval 0 - use Force On\n"
+                          "there, or run borderless windowed.)");
     }
 
     m_flat3d_force_sdr->draw("Force SDR Output");
@@ -2058,7 +2223,11 @@ void VR::on_draw_sidebar_flat3d() {
                           "DSV Observer (D3D12 only): watch depth-stencil views and resource\n"
                           "   barriers at the API level and snapshot the live scene depth.\n"
                           "   No engine hook (safe where Engine Pool crashes) and sees depth\n"
-                          "   allocated at any time (works where Per-Draw stays flat).");
+                          "   allocated at any time (works where Per-Draw stays flat).\n"
+                          "DLSS Depth (D3D12 only): copy the depth buffer the game hands to\n"
+                          "   DLSS each frame. No plugin and no AFW needed; exact and cheap,\n"
+                          "   but only has data while the game's DLSS is enabled and active\n"
+                          "   (render-resolution copy). Best pick for DLSS titles.");
     }
 
     if (flat3d_depth_source() == FLAT3D_DEPTH_DSV_OBSERVER) {
@@ -2176,6 +2345,7 @@ void VR::on_draw_sidebar_flat3d() {
                               "gameplay HUD trips it; lower it if a full-screen menu isn't caught.\n"
                               "0 disables coverage (mouse-cursor + game-paused detection still apply).");
         }
+
 
         if (m_flat3d_hud_depth_mode->value() == 1) {
             m_flat3d_hud_icon_radius->draw("Icon Region Radius");
@@ -2388,13 +2558,6 @@ void VR::on_draw_sidebar_flat3d() {
 
     if (ImGui::TreeNode("Advanced")) {
         m_flat3d_hdr_paper_white->draw("HDR Paper White (nits)");
-
-        m_keybind_flat3d_depth_dec->draw("Depth - Key");
-        m_keybind_flat3d_depth_inc->draw("Depth + Key");
-        m_keybind_flat3d_conv_dec->draw("Convergence - Key");
-        m_keybind_flat3d_conv_inc->draw("Convergence + Key");
-        m_keybind_flat3d_screenshot->draw("3D Screenshot Key");
-        m_keybind_flat3d_recenter->draw("Recenter Key");
 
         m_flat3d_d3d12_debug_layer->draw("D3D12 Debug Layer Log");
         if (ImGui::IsItemHovered()) {

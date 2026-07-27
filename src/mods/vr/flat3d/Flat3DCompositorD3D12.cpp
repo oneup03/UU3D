@@ -117,6 +117,11 @@ bool Flat3DCompositorD3D12::setup(ID3D12Device* device, uint32_t eye_w, uint32_t
     tex_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     tex_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
+    // Eye size/format changed: drop the synced-pair stash so it is lazily
+    // recreated at the new dimensions.
+    m_pair_pending.Reset();
+    m_pair_pending_valid = false;
+
     for (int i = 0; i < 2; ++i) {
         if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &tex_desc,
                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
@@ -255,7 +260,7 @@ bool Flat3DCompositorD3D12::create_pipelines(ID3D12Device* device) {
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 33; // max(RepackConstants=24, OverlayConstants=24, HudClassifyConstants=33)
+    params[0].Constants.Num32BitValues = 34; // max(RepackConstants=24, OverlayConstants=28, HudClassifyConstants=34)
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -390,7 +395,7 @@ bool Flat3DCompositorD3D12::create_pipelines(ID3D12Device* device) {
 }
 
 void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool have_ui, bool have_menu,
-                                            const Flat3DFrameParams& params) {
+                                            const Flat3DFrameParams& params, uint32_t eye_refresh_mask) {
     const bool want_ui = params.ui_enabled && have_ui;
     const bool want_game_crosshair = params.crosshair_mode == 1 && have_ui;
     const bool want_laser = params.crosshair_mode == 2;
@@ -429,6 +434,15 @@ void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool
     };
 
     for (int eye = 0; eye < 2; ++eye) {
+        // Bake overlays ONLY into eyes whose scene content was refreshed this
+        // present. The eye caches are persistent under AFR/pair-lock; a fresh
+        // scene copy washes out the previous bake, but re-drawing the
+        // translucent UI onto an eye that was NOT re-copied blends it on top of
+        // its own previous bake — opacity ratchets between presents, which
+        // reads as HUD flicker/shimmer (AHUD + Synced Sequential).
+        if ((eye_refresh_mask & (1u << eye)) == 0) {
+            continue;
+        }
         const float dir = (eye == 0) ? 1.0f : -1.0f;
 
         auto rtv = m_rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -458,6 +472,7 @@ void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool
             oc.color[3] = laser[3];
             oc.layer = layer;
             oc.ui_invert_alpha = params.ui_invert_alpha; // shader applies it only to game-UI layers (0/1)
+            oc.ui_color_gate = params.ui_color_gate;     // zero alpha on colourless pixels (invert-0.5 tint fix)
             oc.colorspace = eye_space;
             oc.paper_white = params.paper_white_nits;
             oc.region_radius_uv = (layer == 2 || layer == 4) ? 0.0f
@@ -636,12 +651,90 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
     };
 
     // Both eyes go through RENDER_TARGET so overlay recording is uniform;
-    // AFR frames still refresh only the fresh eye's contents.
+    // AFR frames still refresh only the fresh eye's contents. The mask records
+    // which eyes actually got new scene content this present — overlays bake
+    // only into those (see record_overlays).
+    uint32_t eye_refresh_mask = 0b11;
+
     if (params.afr_frame) {
-        copy_half(params.afr_left_eye ? 0 : 1);
-        const int other = params.afr_left_eye ? 1 : 0;
-        barrier(cmd, m_eye_tex[other].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const int fresh = params.afr_left_eye ? 0 : 1;
+        const int other = 1 - fresh;
+        // Synced Sequential pair lock: publish only complete pairs. On the
+        // pair's FIRST present, stash the fresh eye and keep showing the
+        // previous complete pair; on the second (same engine frame — the forced
+        // same-state draw) publish both halves together. No fresh@T + stale@T-1
+        // mismatch ever reaches the screen (judder + animated-HUD shimmer; an
+        // HMD runtime would hide it via reprojection, a monitor shows it raw).
+        // Anti-freeze: if a stash is already held, always publish — a missed
+        // pair-second signal degrades to plain AFR instead of freezing.
+        if (!params.afr_synced_pair) {
+            m_pair_pending_valid = false; // left synced mode: a stale stash must never publish
+        }
+        const bool publish = !params.afr_synced_pair || params.afr_pair_second || m_pair_pending_valid;
+
+        if (!publish) {
+            if (m_pair_pending == nullptr && m_eye_tex[0] != nullptr) {
+                D3D12_HEAP_PROPERTIES heap{};
+                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+                auto pd = m_eye_tex[0]->GetDesc();
+                pd.Flags = D3D12_RESOURCE_FLAG_NONE;
+                if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pd,
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_pair_pending)))) {
+                    m_pair_pending.Reset();
+                }
+            }
+
+            if (m_pair_pending != nullptr) {
+                // AFR sources always render into the LEFT half (see copy_half).
+                D3D12_BOX box{};
+                box.right = m_eye_w;
+                box.bottom = m_eye_h;
+                box.back = 1;
+
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = double_wide;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = m_pair_pending.Get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+                cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+                m_pair_pending_valid = true;
+                m_pair_pending_eye = fresh;
+                eye_refresh_mask = 0; // held pair: both eyes keep their composited image
+
+                // Neither eye cache was touched; both still need RENDER_TARGET
+                // for the (uniform) overlay pass.
+                barrier(cmd, m_eye_tex[0].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                barrier(cmd, m_eye_tex[1].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            } else {
+                copy_half(fresh); // allocation failed: fall back to plain AFR
+                eye_refresh_mask = 1u << fresh;
+                barrier(cmd, m_eye_tex[other].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            }
+        } else {
+            // Publish the stashed first half into ITS eye slot (recorded at
+            // stash time — the pair boundary is not a stable parity, so never
+            // assume the stash is simply the complement of the current eye).
+            if (m_pair_pending_valid && m_pair_pending != nullptr && m_pair_pending_eye != fresh) {
+                barrier(cmd, m_eye_tex[m_pair_pending_eye].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                barrier(cmd, m_pair_pending.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                cmd->CopyResource(m_eye_tex[m_pair_pending_eye].Get(), m_pair_pending.Get());
+                barrier(cmd, m_pair_pending.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                barrier(cmd, m_eye_tex[m_pair_pending_eye].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                m_pair_pending_valid = false;
+                copy_half(fresh);
+                eye_refresh_mask = 0b11; // both halves republished together
+            } else {
+                m_pair_pending_valid = false;
+                copy_half(fresh);
+                eye_refresh_mask = 1u << fresh;
+                barrier(cmd, m_eye_tex[other].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            }
+        }
     } else {
+        m_pair_pending_valid = false; // native/warp frame: any held stash is stale
         copy_half(0);
         copy_half(1);
     }
@@ -934,9 +1027,10 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
             }
 
             cc.ui_invert_alpha = params.ui_invert_alpha;
+            cc.ui_color_gate = params.ui_color_gate;
 
             static_assert(sizeof(HudClassifyConstants) == 36 * sizeof(uint32_t), "classify constant size");
-            cmd->SetGraphicsRoot32BitConstants(0, 33, &cc, 0); // 33 meaningful values (incl. ui_invert_alpha)
+            cmd->SetGraphicsRoot32BitConstants(0, 34, &cc, 0); // 34 meaningful values (incl. ui_invert_alpha + ui_color_gate)
 
             auto cls_table = m_srv_heap->GetGPUDescriptorHandleForHeapStart();
             cls_table.ptr += (size_t)21 * m_srv_stride;
@@ -1133,7 +1227,7 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         m_hud_mode_effective = 0;
     }
 
-    record_overlays(cmd, have_ui, have_menu, params);
+    record_overlays(cmd, have_ui, have_menu, params, eye_refresh_mask);
 
     // --- Full-screen-GUI coverage reduction (independent of HUD mode) --------
     // Average the UI's alpha coverage to the 1x1 target and copy it into this
@@ -1156,8 +1250,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         cmd->RSSetScissorRects(1, &cov_sc);
 
         cmd->SetPipelineState(m_coverage_pso.Get());
-        const float cov_invert = params.ui_invert_alpha; // undo inverted game-UI alpha
-        cmd->SetGraphicsRoot32BitConstants(0, 1, &cov_invert, 0);
+        const float cov_consts[2]{params.ui_invert_alpha, params.ui_color_gate}; // undo inverted alpha + colour gate
+        cmd->SetGraphicsRoot32BitConstants(0, 2, cov_consts, 0);
         auto ui_table = m_srv_heap->GetGPUDescriptorHandleForHeapStart(); // t0 = UI (slot 2)
         ui_table.ptr += (size_t)2 * m_srv_stride;
         cmd->SetGraphicsRootDescriptorTable(1, ui_table);
@@ -1183,6 +1277,7 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         cmd->CopyTextureRegion(&cov_dst, 0, 0, 0, &cov_src, nullptr);
         m_coverage_copied[slot] = true;
     }
+
 
     // Clear the redirected UI target after consuming it — Slate only draws
     // deltas on top, so without this the HUD accumulates ghost trails and a
@@ -1918,6 +2013,9 @@ void Flat3DCompositorD3D12::reset() {
     for (int i = 0; i < 2; ++i) {
         m_eye_tex[i].Reset();
     }
+
+    m_pair_pending.Reset();
+    m_pair_pending_valid = false;
 
     for (uint32_t i = 0; i < kRing; ++i) {
         m_depth_readback[i].Reset();

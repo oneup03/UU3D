@@ -516,6 +516,10 @@ public:
         return m_has_seen_prerender_viewfamily;
     }
 
+    safetyhook::InlineHook& get_render_module_begin_render_viewfamily_hook() {
+        return m_render_module_begin_render_viewfamily_hook;
+    }
+
     bool has_scene_view_family_offsets_ready() const {
         return m_has_scene_view_family_offsets_ready;
     }
@@ -738,7 +742,11 @@ public:
     static void setup_view_projection_matrix(ISceneViewExtension* extension, void* projection_data);
     static void localplayer_setup_viewpoint(void* localplayer, void* view_info, void* pass);
     static void setup_view_family(ISceneViewExtension* extension, sdk::FSceneViewFamily& view_family);
-    static void begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family);
+    // hook: the inline hook whose trampoline reaches the original for THIS
+    // call site (multiple candidate addresses can be hooked simultaneously in
+    // modular builds where the resolver cannot be certain — see the Returnal
+    // notes at the resolution site). tag identifies the candidate in logs.
+    static void begin_render_viewfamily_real(safetyhook::InlineHook& hook, const char* tag, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family);
     static void begin_render_viewfamily(ISceneViewExtension* extension, sdk::FSceneViewFamily& view_family);
     static void pre_render_viewfamily_renderthread(ISceneViewExtension* extension, sdk::FRHICommandListBase* cmd_list, sdk::FSceneViewFamily& view_family);
 
@@ -965,6 +973,17 @@ private:
 
     Rotator<float> m_last_afr_rotation{};
     Rotator<double> m_last_afr_rotation_double{};
+
+    // Flat3D AFR eye alternation (game thread only). g_frame_count is slaved
+    // to the ENGINE's frame number, which some titles (Hogwarts) do NOT
+    // advance for the forced synced-sequential draw — raw %2 then renders the
+    // same eye twice per pair and the pair has no stereo baseline (depth
+    // collapses). The view-offset hook alternates per DRAW instead (a stalled
+    // frame number takes the complement of the previous draw's eye) and the
+    // projection hook reuses the stored index so both stay coherent within a
+    // draw.
+    int64_t m_afr_draw_frame{-1};
+    int m_afr_draw_index{-1};
 
     Rotator<float> m_last_pre_rotation{};
     Rotator<double> m_last_pre_rotation_double{};

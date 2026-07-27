@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -164,6 +165,36 @@ struct Flat3D final : public VRRuntime {
     // Set by the screenshot hotkey; the D3D component saves the SbS pair to a
     // PNG on the next composited frame and clears it.
     std::atomic<bool>  screenshot_requested{false};
+
+    // Camera-identity pair detector (Synced Sequential): the forced second
+    // draw of a pair runs on unticked game state, so its raw game camera
+    // (pre-eye-offset view location + rotation) is bit-identical to the first
+    // draw's. Each per-eye draw pushes whether its camera matched the previous
+    // draw's; the present path pops one record per composited frame (FIFO
+    // keeps the draw->present alignment that a latest-value read would lose).
+    // When the FIFO has no record for a present, the consumer publishes
+    // NAIVELY (no pair hold) — never guess an alignment. prev_cam_sig is
+    // game-thread-only; the counters feed the 5s diagnostic line.
+    std::mutex pair_mtx;
+    // Frame-KEYED records: consumed only by the present whose latched engine
+    // frame matches, so pipeline lead can never become a permanent order
+    // offset (order-keyed FIFO alignment inverted every eye slot when the
+    // in-flight count at engagement was odd). flags: bit0 = camera matched
+    // previous draw (pair second), bit1 = the eye the draw rendered.
+    struct PairRecord {
+        uint32_t frame;
+        uint8_t flags;
+    };
+    std::deque<PairRecord> pair_second_fifo;
+    // Draws where the engine frame number STALLED and the per-draw eye
+    // alternation took the complement path (diagnostics).
+    std::atomic<uint32_t> pair_stall_count{0};
+    uint8_t prev_cam_sig[48]{};
+    size_t prev_cam_sig_len{0};
+    uint32_t pair_push_count{0};  // draws that pushed a record (under pair_mtx)
+    uint32_t pair_match_count{0}; // of those, camera matched previous draw
+    uint32_t pair_pop_count{0};   // presents that consumed a record
+    uint32_t pair_empty_count{0}; // presents that found the FIFO empty (naive)
 
     uint32_t w{0};
     uint32_t h{0};

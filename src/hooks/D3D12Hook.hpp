@@ -52,6 +52,21 @@ public:
 	bool hook();
 	bool unhook();
 
+    // Raw AFW/NeverDLSS harvest callbacks (registered by VR's frame-warp init).
+    // Invoked AFTER the original call from D3D12Hook's own vtable hooks. The AFW
+    // base used to patch these same vtable slots with a second, untracked hook
+    // layer (hookVtable) — when either layer re-installed, each one's "original"
+    // pointed at the other and every barrier call recursed to a stack overflow.
+    // Registering here keeps exactly ONE patcher per slot.
+    using RawResourceBarrierFn = void(WINAPI*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+    using RawClearDepthStencilViewFn = void(WINAPI*)(
+        ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+    using RawCreateDepthStencilViewFn = void(WINAPI*)(
+        ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    static inline std::atomic<RawResourceBarrierFn> s_on_raw_resource_barrier{nullptr};
+    static inline std::atomic<RawClearDepthStencilViewFn> s_on_raw_clear_depth_stencil_view{nullptr};
+    static inline std::atomic<RawCreateDepthStencilViewFn> s_on_raw_create_depth_stencil_view{nullptr};
+
     bool is_hooked() {
         return m_hooked;
     }
@@ -181,6 +196,14 @@ public:
         m_ignore_next_present = true;
     }
 
+    // One-shot: with interval 0, strip DXGI_PRESENT_ALLOW_TEARING instead of
+    // adding it. Flip-model swapchains never tear without that flag — the
+    // display still flips on vblank while presents run unthrottled, so AFR /
+    // Synced Sequential can present both eye frames per refresh tear-free.
+    void set_next_present_no_tearing() {
+        m_next_present_no_tearing = true;
+    }
+
     void set_next_present_interval(uint32_t interval) {
         m_next_present_interval = interval;
     }
@@ -222,6 +245,7 @@ protected:
     uint32_t m_proton_swapchain_offset{};
 
     std::optional<uint32_t> m_next_present_interval{};
+    bool m_next_present_no_tearing{false};
 
     bool m_using_proton_swapchain{ false };
     bool m_using_frame_generation_swapchain{ false };
@@ -249,12 +273,14 @@ protected:
     std::vector<std::unique_ptr<PointerHook>> m_create_depth_stencil_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_set_pipeline_state_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_resource_barrier_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_clear_depth_stencil_view_cmd_hooks{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_graphics_pipeline_state_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_state_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_create_depth_stencil_view_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_set_pipeline_state_hook_lookup{};
     std::unordered_map<uintptr_t, PointerHook*> m_resource_barrier_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_clear_depth_stencil_view_cmd_hook_lookup{};
     std::atomic<D3D12DepthStencilObserver*> m_depth_stencil_observer{nullptr};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
     //std::unique_ptr<FunctionHook> m_create_swap_chain_hook{};
@@ -275,6 +301,8 @@ protected:
     static void WINAPI create_depth_stencil_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
     static void WINAPI set_pipeline_state(ID3D12GraphicsCommandList* command_list, ID3D12PipelineState* pipeline_state);
     static void WINAPI resource_barrier(ID3D12GraphicsCommandList* command_list, UINT count, const D3D12_RESOURCE_BARRIER* barriers);
+    static void WINAPI clear_depth_stencil_view_cmd(ID3D12GraphicsCommandList* command_list, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+        D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT num_rects, const D3D12_RECT* rects);
     static HRESULT WINAPI resize_buffers(IDXGISwapChain3* swap_chain, UINT buffer_count, UINT width, UINT height, DXGI_FORMAT new_format, UINT swap_chain_flags);
     static HRESULT WINAPI resize_target(IDXGISwapChain3* swap_chain, const DXGI_MODE_DESC* new_target_parameters);
     static HRESULT WINAPI set_color_space1(IDXGISwapChain3* swap_chain, DXGI_COLOR_SPACE_TYPE color_space);
@@ -286,5 +314,6 @@ protected:
     PointerHook* find_create_depth_stencil_view_hook(void* slot) const;
     PointerHook* find_set_pipeline_state_hook(void* slot) const;
     PointerHook* find_resource_barrier_hook(void* slot) const;
+    PointerHook* find_clear_depth_stencil_view_cmd_hook(void* slot) const;
 };
 

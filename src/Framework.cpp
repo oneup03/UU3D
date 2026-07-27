@@ -216,14 +216,14 @@ void Framework::hook_monitor() {
     // reflection dumps.
     //
     // Normal UEVR bootstraps plugins in two phases:
-    //   1. Framework ctor calls PluginLoader::early_init ¡ú LoadLibrary each DLL
+    //   1. Framework ctor calls PluginLoader::early_init ï¿½ï¿½ LoadLibrary each DLL
     //   2. On first D3D Present, Framework::on_frame_d3d11/12 calls
-    //      Mods::on_initialize_d3d_thread ¡ú PluginLoader queries device/
+    //      Mods::on_initialize_d3d_thread ï¿½ï¿½ PluginLoader queries device/
     //      swapchain, calls uevr_plugin_required_version + uevr_plugin_initialize
     //   3. Stereo hook's on_frame installs UGameEngine::Tick hook
     //   4. Engine tick hook fans out on_pre_engine_tick to all mods + plugins
     //
-    // In dumper mode there's no Present ¡ú phases 2-4 never fire without
+    // In dumper mode there's no Present ï¿½ï¿½ phases 2-4 never fire without
     // intervention. We drive them from here instead: first mods::on_initialize
     // + on_initialize_d3d_thread (which now skips the D3D device queries),
     // then the stereo-hook's on_frame to install the tick hook.
@@ -233,7 +233,7 @@ void Framework::hook_monitor() {
 
         // One-shot phase-2: mods + plugin init. Equivalent of what the first
         // D3D Present would trigger. Must also set m_game_data_initialized
-        // so the engine_tick_hook fans out on_pre_engine_tick to mods ¡ª
+        // so the engine_tick_hook fans out on_pre_engine_tick to mods ï¿½ï¿½
         // otherwise the hook runs but returns before dispatching.
         if (!m_dumper_mods_initialized) {
             try {
@@ -241,7 +241,7 @@ void Framework::hook_monitor() {
                 (void)m_mods->on_initialize();
                 (void)m_mods->on_initialize_d3d_thread();
                 // m_game_data_initialized is the gate on engine_tick_hook
-                // fanning out to mods. Don't set m_initialized ¡ª that gates
+                // fanning out to mods. Don't set m_initialized ï¿½ï¿½ that gates
                 // imgui rendering which requires D3D in dumper mode.
                 m_game_data_initialized = true;
                 m_mods_fully_initialized = true;
@@ -1601,6 +1601,12 @@ void Framework::draw_ui() {
     ImGui::Text("Gamepad L3 + R3: Toggle Menu");
     ImGui::Text("Gamepad RT: Shortcuts");
     ImGui::Text("Gamepad LB/RB: Change Sidebar Page");
+
+    if (m_vr != nullptr && m_vr->is_using_flat3d()) {
+        if (ImGui::Button("Take 3D Screenshot (Ctrl+F12)")) {
+            m_vr->request_flat3d_screenshot();
+        }
+    }
 
     ImGui::EndGroup();
     ImGui::EndGroup();

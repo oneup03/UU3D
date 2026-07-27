@@ -106,7 +106,10 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     if (params.vsync_override == 1) {
         hook->set_next_present_interval(1);
     } else if (params.vsync_override >= 2) {
+        // No-Tear Fast: interval 0 with ALLOW_TEARING stripped (see the D3D12
+        // component).
         hook->set_next_present_interval(0);
+        hook->set_next_present_no_tearing();
     }
 
     // Native-stereo-fix titles render the RIGHT eye into a dedicated

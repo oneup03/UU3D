@@ -193,6 +193,11 @@ bool Flat3DCompositorD3D11::setup(ID3D11Device* device, uint32_t eye_w, uint32_t
 
     const auto view_fmt = view_format_for(eye_format);
 
+    // Eye size/format changed: drop the synced-pair stash so it is lazily
+    // recreated at the new dimensions.
+    m_pair_pending.Reset();
+    m_pair_pending_valid = false;
+
     for (int i = 0; i < 2; ++i) {
         if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_eye_tex[i]))) {
             spdlog::error("[Flat3D] Failed to create eye texture {}", i);
@@ -665,9 +670,67 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
         context->CopySubresourceRegion(m_eye_tex[eye].Get(), 0, 0, 0, 0, double_wide, 0, &box);
     };
 
+    // Records which eyes actually got new scene content this present —
+    // overlays bake only into those (see draw_overlays).
+    uint32_t eye_refresh_mask = 0b11;
+
     if (params.afr_frame) {
-        copy_half(params.afr_left_eye ? 0 : 1);
+        const int fresh = params.afr_left_eye ? 0 : 1;
+        // Synced Sequential pair lock: publish only complete pairs. On the
+        // pair's FIRST present, stash the fresh eye and keep showing the
+        // previous complete pair; on the second (same engine frame — the forced
+        // same-state draw) publish both halves together. No fresh@T + stale@T-1
+        // mismatch ever reaches the screen (judder + animated-HUD shimmer; an
+        // HMD runtime would hide it via reprojection, a monitor shows it raw).
+        // Anti-freeze: if a stash is already held, always publish — a missed
+        // pair-second signal degrades to plain AFR instead of freezing.
+        if (!params.afr_synced_pair) {
+            m_pair_pending_valid = false; // left synced mode: a stale stash must never publish
+        }
+        const bool publish = !params.afr_synced_pair || params.afr_pair_second || m_pair_pending_valid;
+
+        if (!publish) {
+            if (m_pair_pending == nullptr && m_eye_tex[0] != nullptr) {
+                ComPtr<ID3D11Device> pair_device{};
+                context->GetDevice(&pair_device);
+                D3D11_TEXTURE2D_DESC pd{};
+                m_eye_tex[0]->GetDesc(&pd);
+                pd.BindFlags = 0; // copy staging between the halves only
+                pd.MiscFlags = 0;
+                if (pair_device == nullptr || FAILED(pair_device->CreateTexture2D(&pd, nullptr, &m_pair_pending))) {
+                    m_pair_pending.Reset();
+                }
+            }
+
+            if (m_pair_pending != nullptr) {
+                // AFR sources always render into the LEFT half (see copy_half).
+                D3D11_BOX box{};
+                box.right = m_eye_w;
+                box.bottom = m_eye_h;
+                box.back = 1;
+                context->CopySubresourceRegion(m_pair_pending.Get(), 0, 0, 0, 0, double_wide, 0, &box);
+                m_pair_pending_valid = true;
+                m_pair_pending_eye = fresh;
+                eye_refresh_mask = 0; // held pair: both eyes keep their composited image
+            } else {
+                copy_half(fresh); // allocation failed: fall back to plain AFR
+                eye_refresh_mask = 1u << fresh;
+            }
+        } else {
+            // Publish the stashed first half into ITS eye slot (recorded at
+            // stash time — the pair boundary is not a stable parity, so never
+            // assume the stash is simply the complement of the current eye).
+            if (m_pair_pending_valid && m_pair_pending_eye != fresh) {
+                context->CopyResource(m_eye_tex[m_pair_pending_eye].Get(), m_pair_pending.Get());
+                eye_refresh_mask = 0b11; // both halves republished together
+            } else {
+                eye_refresh_mask = 1u << fresh;
+            }
+            m_pair_pending_valid = false;
+            copy_half(fresh);
+        }
     } else {
+        m_pair_pending_valid = false; // native frame: any held stash is stale
         copy_half(0);
         copy_half(1);
     }
@@ -792,6 +855,7 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
                     cc.excl[e][3] = params.hud_excl[e][3];
                 }
                 cc.ui_invert_alpha = params.ui_invert_alpha;
+                cc.ui_color_gate = params.ui_color_gate;
                 context->UpdateSubresource(m_classify_cb.Get(), 0, nullptr, &cc, 0, 0);
 
                 context->IASetInputLayout(nullptr);
@@ -975,7 +1039,7 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
     }
 
     // --- 2. Draw the UI layer + crosshair + UEVR menu into each eye ----------
-    draw_overlays(context, ui_srv, menu_srv, params);
+    draw_overlays(context, ui_srv, menu_srv, params, eye_refresh_mask);
 
     // --- 2b. Full-screen-GUI coverage reduction (independent of HUD mode) ----
     // Average the UI's alpha coverage to the 1x1 target and read back the
@@ -996,7 +1060,7 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
         context->PSSetSamplers(0, 1, cov_samp);
 
         if (m_coverage_cb != nullptr) {
-            const float cov_cb[4]{params.ui_invert_alpha, 0.0f, 0.0f, 0.0f};
+            const float cov_cb[4]{params.ui_invert_alpha, params.ui_color_gate, 0.0f, 0.0f};
             context->UpdateSubresource(m_coverage_cb.Get(), 0, nullptr, cov_cb, 0, 0);
             ID3D11Buffer* cov_cbs[] = {m_coverage_cb.Get()};
             context->PSSetConstantBuffers(0, 1, cov_cbs);
@@ -1121,7 +1185,8 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
 // aim depth), and/or the procedural laser dot into BOTH eye textures with
 // per-eye parallax. dir = +1 for the left eye, -1 for the right.
 void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11ShaderResourceView* ui_srv,
-                                          ID3D11ShaderResourceView* menu_srv, const Flat3DFrameParams& params) {
+                                          ID3D11ShaderResourceView* menu_srv, const Flat3DFrameParams& params,
+                                          uint32_t eye_refresh_mask) {
     const bool want_ui = params.ui_enabled && ui_srv != nullptr;
     const bool want_game_crosshair = params.crosshair_mode == 1 && ui_srv != nullptr;
     const bool want_laser = params.crosshair_mode == 2;
@@ -1178,6 +1243,16 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
     const float laser_b = (argb & 0xFF) / 255.0f;
 
     for (int eye = 0; eye < 2; ++eye) {
+        // Bake overlays ONLY into eyes whose scene content was refreshed this
+        // present. The eye caches are persistent under AFR/pair-lock; a fresh
+        // scene copy washes out the previous bake, but re-drawing the
+        // translucent UI onto an eye that was NOT re-copied blends it on top of
+        // its own previous bake — opacity ratchets between presents, which
+        // reads as HUD flicker/shimmer (AHUD + Synced Sequential).
+        if ((eye_refresh_mask & (1u << eye)) == 0) {
+            continue;
+        }
+
         const float dir = (eye == 0) ? 1.0f : -1.0f;
 
         ID3D11RenderTargetView* rtvs[] = {m_eye_rtv[eye].Get()};
@@ -1207,6 +1282,7 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
             oc.color[3] = laser_a;
             oc.layer = layer;
             oc.ui_invert_alpha = params.ui_invert_alpha; // shader applies it only to game-UI layers (0/1)
+            oc.ui_color_gate = params.ui_color_gate;     // zero alpha on colourless pixels (invert-0.5 tint fix)
             oc.colorspace = eye_space;
             oc.paper_white = params.paper_white_nits;
             // Region math: the crosshair region rides at the CROSSHAIR shift.
@@ -1857,6 +1933,9 @@ void Flat3DCompositorD3D11::reset() {
         m_eye_srv[i].Reset();
         m_eye_rtv[i].Reset();
     }
+
+    m_pair_pending.Reset();
+    m_pair_pending_valid = false;
 
     m_menu_srv.Reset();
     m_menu_src = nullptr;

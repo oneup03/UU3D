@@ -45,6 +45,7 @@ constexpr size_t DISPATCH_VTABLE_INDEX = 14;
 constexpr size_t RS_SET_VIEWPORTS_VTABLE_INDEX = 21;
 constexpr size_t SET_PIPELINE_STATE_VTABLE_INDEX = 25;
 constexpr size_t RESOURCE_BARRIER_VTABLE_INDEX = 26;
+constexpr size_t CLEAR_DEPTH_STENCIL_VIEW_CMDLIST_VTABLE_INDEX = 47;
 constexpr size_t SET_DESCRIPTOR_HEAPS_VTABLE_INDEX = 28;
 constexpr size_t SET_COMPUTE_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX = 31;
 constexpr size_t SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE_VTABLE_INDEX = 32;
@@ -635,12 +636,14 @@ bool D3D12Hook::hook() {
         m_create_depth_stencil_view_hooks.clear();
         m_set_pipeline_state_hooks.clear();
         m_resource_barrier_hooks.clear();
+        m_clear_depth_stencil_view_cmd_hooks.clear();
         m_create_graphics_pipeline_state_hook_lookup.clear();
         m_create_pipeline_state_hook_lookup.clear();
         m_create_render_target_view_hook_lookup.clear();
         m_create_depth_stencil_view_hook_lookup.clear();
         m_set_pipeline_state_hook_lookup.clear();
         m_resource_barrier_hook_lookup.clear();
+        m_clear_depth_stencil_view_cmd_hook_lookup.clear();
         m_swapchain_hook.reset();
 
         m_is_phase_1 = true;
@@ -656,6 +659,7 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> depth_stencil_view_slots{};
         std::unordered_set<uintptr_t> set_pipeline_state_slots{};
         std::unordered_set<uintptr_t> resource_barrier_slots{};
+        std::unordered_set<uintptr_t> clear_depth_stencil_view_cmd_slots{};
 
         add_unique_pointer_hook(
             device,
@@ -771,6 +775,15 @@ bool D3D12Hook::hook() {
             resource_barrier_slots
         );
 
+        add_unique_pointer_hook(
+            command_list,
+            CLEAR_DEPTH_STENCIL_VIEW_CMDLIST_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::clear_depth_stencil_view_cmd),
+            m_clear_depth_stencil_view_cmd_hooks,
+            m_clear_depth_stencil_view_cmd_hook_lookup,
+            clear_depth_stencil_view_cmd_slots
+        );
+
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> command_list1{};
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> command_list2{};
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList3> command_list3{};
@@ -814,6 +827,15 @@ bool D3D12Hook::hook() {
                 m_resource_barrier_hooks,
                 m_resource_barrier_hook_lookup,
                 resource_barrier_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                CLEAR_DEPTH_STENCIL_VIEW_CMDLIST_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::clear_depth_stencil_view_cmd),
+                m_clear_depth_stencil_view_cmd_hooks,
+                m_clear_depth_stencil_view_cmd_hook_lookup,
+                clear_depth_stencil_view_cmd_slots
             );
         }
 
@@ -863,12 +885,14 @@ bool D3D12Hook::unhook() {
     m_create_depth_stencil_view_hooks.clear();
     m_set_pipeline_state_hooks.clear();
     m_resource_barrier_hooks.clear();
+    m_clear_depth_stencil_view_cmd_hooks.clear();
     m_create_graphics_pipeline_state_hook_lookup.clear();
     m_create_pipeline_state_hook_lookup.clear();
     m_create_render_target_view_hook_lookup.clear();
     m_create_depth_stencil_view_hook_lookup.clear();
     m_set_pipeline_state_hook_lookup.clear();
     m_resource_barrier_hook_lookup.clear();
+    m_clear_depth_stencil_view_cmd_hook_lookup.clear();
     m_depth_stencil_observer.store(nullptr, std::memory_order_release);
     m_swapchain_hook.reset();
 
@@ -924,6 +948,14 @@ PointerHook* D3D12Hook::find_resource_barrier_hook(void* slot) const {
     }
 
     return m_resource_barrier_hooks.empty() ? nullptr : m_resource_barrier_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_clear_depth_stencil_view_cmd_hook(void* slot) const {
+    if (const auto it = m_clear_depth_stencil_view_cmd_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_clear_depth_stencil_view_cmd_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_clear_depth_stencil_view_cmd_hooks.empty() ? nullptr : m_clear_depth_stencil_view_cmd_hooks.front().get();
 }
 
 thread_local int32_t g_present_depth = 0;
@@ -1060,7 +1092,9 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
 
         if (d3d12->m_next_present_interval) {
             const auto requested_sync_interval = *d3d12->m_next_present_interval;
+            const auto no_tearing = d3d12->m_next_present_no_tearing;
             d3d12->m_next_present_interval = std::nullopt;
+            d3d12->m_next_present_no_tearing = false;
 
             const auto swapchain_key = reinterpret_cast<uintptr_t>(swap_chain);
             const auto preserve_for_current_game = should_preserve_present_params_for_current_game();
@@ -1090,7 +1124,14 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
                     DXGI_SWAP_CHAIN_DESC swap_desc{};
                     swap_chain->GetDesc(&swap_desc);
 
-                    if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+                    if (no_tearing) {
+                        // No-Tear Fast: interval 0 WITHOUT ALLOW_TEARING. On a
+                        // flip-model swapchain this cannot tear (the display
+                        // still flips on vblank; the newest present wins) while
+                        // presents run unthrottled — both AFR eye frames land
+                        // each refresh.
+                        flags &= ~DXGI_PRESENT_ALLOW_TEARING;
+                    } else if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
                         flags |= DXGI_PRESENT_ALLOW_TEARING;
                     }
                 } else {
@@ -1312,6 +1353,12 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
         observer != nullptr) {
         observer->on_depth_stencil_view_created(resource, desc, descriptor);
     }
+
+    // AFW/NeverDLSS raw harvest DSV map (see resource_barrier for why this is a
+    // callback instead of a second vtable patch on the same slot).
+    if (const auto cb = s_on_raw_create_depth_stencil_view.load(std::memory_order_acquire); cb != nullptr) {
+        cb(device, resource, desc, descriptor);
+    }
 }
 
 void WINAPI D3D12Hook::resource_barrier(
@@ -1337,6 +1384,31 @@ void WINAPI D3D12Hook::resource_barrier(
 
     if (original != nullptr) {
         original(command_list, count, barriers);
+    }
+
+    // AFW/NeverDLSS raw harvest (post-original, matching its old vtable patch
+    // which called the original first). Registered here instead of a second
+    // vtable patch on the same slot — that double-hook went mutually recursive.
+    if (const auto cb = s_on_raw_resource_barrier.load(std::memory_order_acquire); cb != nullptr) {
+        cb(command_list, count, barriers);
+    }
+}
+
+void WINAPI D3D12Hook::clear_depth_stencil_view_cmd(ID3D12GraphicsCommandList* command_list, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+    D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT num_rects, const D3D12_RECT* rects)
+{
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[CLEAR_DEPTH_STENCIL_VIEW_CMDLIST_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_clear_depth_stencil_view_cmd_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::clear_depth_stencil_view_cmd)*>() : nullptr;
+
+    if (original != nullptr) {
+        original(command_list, dsv, flags, depth, stencil, num_rects, rects);
+    }
+
+    // AFW/NeverDLSS raw depth harvest (see resource_barrier above).
+    if (const auto cb = s_on_raw_clear_depth_stencil_view.load(std::memory_order_acquire); cb != nullptr) {
+        cb(command_list, dsv, flags, depth, stencil, num_rects, rects);
     }
 }
 

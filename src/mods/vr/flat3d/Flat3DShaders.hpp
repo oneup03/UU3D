@@ -57,11 +57,26 @@ enum class Flat3DColorSpace : int32_t {
 struct Flat3DFrameParams {
     int32_t mode{0};            // Flat3DOutputMode
     // 0 = respect the game's present interval, 1 = force vsync on,
-    // 2/3 = force vsync off (3 additionally caps t.MaxFPS at 2x refresh).
+    // 0 = respect the game, 1 = force interval 1, >=2 = "No-Tear Fast":
+    // interval 0 with ALLOW_TEARING stripped (flip-model scanout stays
+    // tear-free while both AFR eye frames present every refresh; t.MaxFPS
+    // auto-caps at 2x refresh under AFR, 1x under native stereo).
     int32_t vsync_override{0};
     bool eye_swap{false};
     bool afr_frame{false};      // only one eye is fresh this frame
     bool afr_left_eye{false};   // which eye is fresh (when afr_frame OR warp_frame)
+    // Synced Sequential pair lock: the engine renders the two eyes back-to-back
+    // from the SAME game state; only flip the displayed pair when BOTH halves
+    // have arrived (stash the first, re-present the previous complete pair).
+    // Without this, every other present shows a fresh@T + stale@T-1 mismatch —
+    // on an HMD the runtime's reprojection hides that, on a monitor it reads as
+    // camera judder + inter-eye shimmer on animated HUD elements.
+    bool afr_synced_pair{false};
+    // This present is the pair's SECOND half: the engine frame number did not
+    // advance (the forced same-state draw), detected per-present in VR — the
+    // pair boundary is NOT a stable frame parity (consecutive pairs swap eye
+    // order), so it cannot be derived from afr_left_eye.
+    bool afr_pair_second{false};
     bool native_stereo_layout{false}; // native-stereo-fix: sample left half
     // AFW: the engine rendered one eye (the afr_left_eye half of the double-wide)
     // and the OTHER eye is supplied as a discrete warped texture (via right_eye_src,
@@ -73,6 +88,11 @@ struct Flat3DFrameParams {
     float ui_shift_px{0.0f};    // horizontal shift in EYE pixels
     float ui_scale{1.0f};       // auto-scale so the UI fills the eye after the shift
     float ui_invert_alpha{0.0f}; // UI_InvertAlpha (0=off..1=full); flips the game UI alpha in the overlay shader
+    // Color-gated UI alpha: zero the UI's alpha where it has ~no color (max rgb
+    // below this threshold). Rescues the "invert alpha 0.5" workaround (which
+    // collapses ALL alpha to a flat 0.5, tinting the whole scene through the
+    // empty UI regions): drawn UI has color, empty screen doesn't. 0 = off.
+    float ui_color_gate{0.0f};
 
     // HUD depth mode: 0 = flat at GUI depth, 1 = depth-adaptive with
     // camera-flow auto-classification (world-tracking UI tiles get scene
@@ -220,7 +240,7 @@ struct OverlayConstants {
     int32_t cursor_depth{0};      // layer 4: 1 = sample geometry depth under the tip
     float ui_invert_alpha{0.0f};  // UI_InvertAlpha: 0 = off, 1 = full alpha invert (game UI layers only)
     int32_t hud_stem_reach{0};    // depth-adaptive: signed extra dilation tiles (>0 down, <0 up, 0 off)
-    float _pad{};                 // keep the block a 16-byte multiple (D3D11 cbuffer)
+    float ui_color_gate{0.0f};    // zero UI alpha where max rgb < gate (fixes invert-0.5 full-screen tint)
 };
 
 // Anchor constant buffer (b1) for the world-marker HUD mode. Bound only for
@@ -262,7 +282,10 @@ struct HudClassifyConstants {
     float   ui_invert_alpha{0.0f}; // UI_InvertAlpha: undo the game's inverted UI
                                    // alpha (empty=1, drawn=0) before the silhouette
                                    // signal, else the whole screen reads as HUD.
-    float   _pad[3]{};             // keep 16-byte aligned for the D3D11 constant buffer
+    float   ui_color_gate{0.0f};   // zero UI alpha where max rgb < gate — restores a
+                                   // real silhouette when a partial invert (0.5)
+                                   // flattens the alpha channel. 0 = off.
+    float   _pad[2]{};             // keep 16-byte aligned for the D3D11 constant buffer
 };
 static_assert(sizeof(HudClassifyConstants) == 36 * sizeof(uint32_t), "hud classify constant size");
 
@@ -681,6 +704,7 @@ cbuffer OverlayParams : register(b0) {
     int    cursor_depth;      // layer 4: 1 = geometry depth under the tip
     float  ui_invert_alpha;   // UI_InvertAlpha: 0 = off .. 1 = full alpha invert
     int    hud_stem_reach;    // mode 1: signed extra dilation tiles (>0 down, <0 up, 0 off)
+    float  ui_color_gate;     // zero UI alpha where max rgb < gate (0 = off)
 };
 
 cbuffer HudAnchors : register(b1) {
@@ -858,7 +882,7 @@ static const float2 kNavWingR = float2(0.969, 0.375);
 bool nav_any(float2 p) {
     return in_tri(p, kNavTip, kNavWingL, kNavNotch) || in_tri(p, kNavTip, kNavNotch, kNavWingR);
 }
-
+)" /* split: MSVC caps a single string literal at 16 KB; adjacent literals concatenate */ R"(
 float4 ps_main(VSOut input) : SV_Target {
     // Elliptical distance to the crosshair region center, in eye-U units
     // (y corrected by the eye aspect via uv_scale-free heuristic: region is
@@ -968,6 +992,16 @@ float4 ps_main(VSOut input) : SV_Target {
         c.a = lerp(c.a, 1.0 - c.a, ui_invert_alpha);
     }
 
+    // Color-gated alpha: partial invert amounts (esp. 0.5) collapse ALL alpha to
+    // a flat constant — including the EMPTY screen (cleared black), which then
+    // tints the whole scene dark. Drawn UI has color, empty screen doesn't, so
+    // fade the alpha in with the pixel's max colour channel. Dark-but-drawn UI
+    // is partially kept (smooth ramp); tune the gate low (~0.03-0.08).
+    if ((layer == 0 || layer == 1) && ui_color_gate > 0.0) {
+        float maxc = max(max(c.r, c.g), c.b);
+        c.a *= smoothstep(0.0, ui_color_gate, maxc);
+    }
+
     // Classification debug view (hud_mode 3): red = world-anchored, green =
     // static, tinted over the UI plus a faint full-screen wash so empty
     // tiles are visible too.
@@ -1021,6 +1055,7 @@ cbuffer ClassifyParams : register(b0) {
     float  fill_gate;      // #5: coverage above which the tile is a big fill (panel/backdrop)
     float4 excl[4];        // cx, cy, half_w, half_h in UV
     float  ui_invert_alpha; // UI_InvertAlpha: undo inverted game-UI alpha in sil()
+    float  ui_color_gate;   // zero UI alpha where max rgb < gate (0 = off)
 };
 
 Texture2D cur_ui   : register(t0);
@@ -1053,6 +1088,11 @@ float sil(float4 c) {
     // (empty screen = 1, drawn UI = 0). Undo it to match the composited opacity —
     // otherwise the empty screen reads as the silhouette and the HUD reads as void.
     float a = lerp(c.a, 1.0 - c.a, ui_invert_alpha);
+    // Color gate: a partial invert (0.5) flattens alpha to a constant, erasing
+    // the silhouette; gate on colour so only drawn content carries the signal.
+    if (ui_color_gate > 0.0) {
+        a *= smoothstep(0.0, ui_color_gate, max(max(c.r, c.g), c.b));
+    }
     return a + dot(c.rgb, float3(0.299, 0.587, 0.114)) * 0.15;
 }
 
@@ -1315,6 +1355,8 @@ float ps_main(VSOut input) : SV_Target {
 static const char* const g_flat3d_coverage_hlsl = R"(
 cbuffer CovParams : register(b0) {
     float ui_invert_alpha; // UI_InvertAlpha: undo inverted game-UI alpha before the count
+    float ui_color_gate;   // zero UI alpha where max rgb < gate (0 = off) — else a
+                           // partial invert (0.5) reads the empty screen as covered
 };
 Texture2D ui_tex  : register(t0);
 SamplerState samp : register(s0);
@@ -1342,8 +1384,11 @@ float ps_main(VSOut input) : SV_Target {
         [loop]
         for (int x = 0; x < NX; ++x) {
             float2 uv = (float2((float)x, (float)y) + 0.5) / float2((float)NX, (float)NY);
-            float a = ui_tex.SampleLevel(samp, uv, 0).a;
-            a = lerp(a, 1.0 - a, ui_invert_alpha); // undo inverted game-UI alpha
+            float4 c = ui_tex.SampleLevel(samp, uv, 0);
+            float a = lerp(c.a, 1.0 - c.a, ui_invert_alpha); // undo inverted game-UI alpha
+            if (ui_color_gate > 0.0) { // colour gate, same as the overlay/classify passes
+                a *= smoothstep(0.0, ui_color_gate, max(max(c.r, c.g), c.b));
+            }
             cov += a > 0.15 ? 1.0 : 0.0; // partial opacity still counts
         }
     }

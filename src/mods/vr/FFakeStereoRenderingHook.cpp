@@ -3702,6 +3702,20 @@ bool direct_call_returns_to(uintptr_t return_address, uintptr_t expected_target)
     return static_cast<uintptr_t>(return_address + displacement) == expected_target;
 }
 
+// SEH-probed read. Hooked functions can be reached with arbitrary arguments
+// (ICF-folded modular builds — Returnal), including pointers into live thread
+// stacks whose contents change between a validity check and the dereference.
+// Pointwise IsBadReadPtr/VirtualQuery checks can never make that safe — copy
+// first, interpret the copy.
+static bool nsf_seh_read(const void* src, void* dst, size_t n) {
+    __try {
+        memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool has_begin_rendering_viewfamily_wrapper_shape(const RuntimeFunctionRange& wrapper) {
     // UE5's singular wrapper builds a one-element TArrayView on the stack. Keep
     // this as corroborating evidence rather than the sole resolver condition.
@@ -3742,9 +3756,22 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack() {
     // geometry in the left eye), the scene-capture pass never runs (black
     // right eye), and calling that function twice corrupts engine state.
     // Resolve the direct caller instead, exactly like the pre-rework code.
+    //
+    // The direct caller is NOT necessarily in the main exe: modular shipping
+    // builds exist (Returnal ships the engine as per-module DLLs — the real
+    // caller lives in Returnal-Renderer-Win64-Shipping.dll). An exe-only
+    // filter skips it and lands on an unrelated exe frame high up the stack
+    // (Returnal: stack_index=10 → wrong function → silent NSF no-op, doubled
+    // left eye + black right eye). Accept the first frame in ANY module that
+    // isn't our own backend; unknown-module frames (hook trampolines) are
+    // still skipped.
     if (!is_ue_5_7_or_newer()) {
+        const auto our_module = (HMODULE)g_framework->get_framework_module();
+
         for (uint32_t i = 1; i < depth; ++i) {
-            if (utility::get_module_within(stack[i]).value_or(nullptr) != (HMODULE)game_module) {
+            const auto frame_module = utility::get_module_within(stack[i]).value_or(nullptr);
+
+            if (frame_module == nullptr || frame_module == our_module) {
                 continue;
             }
 
@@ -3752,6 +3779,14 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack() {
             // find_virtual_function_start alone can land on a false positive.
             const auto unwind = utility::find_function_start_unwind(stack[i]);
             const auto candidate = utility::find_virtual_function_start(unwind ? *unwind : stack[i]);
+
+            // Do NOT size-filter this candidate. In modular DLL builds the
+            // vtable points at a tiny page-aligned export/jmp thunk (Returnal:
+            // 0x17 bytes) — hooking the THUNK is correct, every virtual call
+            // routes through it. Upstream praydog resolves and hooks the same
+            // page-aligned address in Returnal and works; a size guard here
+            // rejected it (nothing hooked → black right eye), and "improving"
+            // it to the unwind-resolved body did not intercept either.
 
             if (candidate) {
                 SPDLOG_INFO(
@@ -8853,10 +8888,32 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     // UE5.5+ indexes the primary view while constructing a
                     // secondary pass, so the list is still only hidden when the
                     // temporary constructor pass has been relabeled as PRIMARY.
-                    views_original_count = views->count;
-                    views->count = 0;
-                    SPDLOG_INFO_ONCE(
-                        "[NativeStereoFix] Hiding FSceneViewFamily views during secondary-view construction");
+                    //
+                    // Only write through a views array that LOOKS like one:
+                    // custom family layouts (Returnal/Housemarque) put other
+                    // members at the scanned offset, and writing 0 there
+                    // scribbles the family (driver-crash class).
+                    struct {
+                        void* data;
+                        uint32_t count;
+                        uint32_t capacity;
+                    } hide_probe{};
+
+                    const bool hide_plausible = nsf_seh_read(views, &hide_probe, sizeof(hide_probe)) &&
+                        hide_probe.count <= 8 && hide_probe.capacity >= hide_probe.count &&
+                        (hide_probe.count == 0 || hide_probe.data != nullptr);
+
+                    if (hide_plausible) {
+                        views_original_count = views->count;
+                        views->count = 0;
+                        SPDLOG_INFO_ONCE(
+                            "[NativeStereoFix] Hiding FSceneViewFamily views during secondary-view construction");
+                    } else {
+                        SPDLOG_WARN_ONCE(
+                            "[NativeStereoFix] NOT hiding views: array at scanned offset fails plausibility "
+                            "(count={} cap={} data={:x}) — family layout differs from scan",
+                            hide_probe.count, hide_probe.capacity, (uintptr_t)hide_probe.data);
+                    }
                 }
             }
         }
@@ -9947,7 +10004,33 @@ void FFakeStereoRenderingHook::localplayer_setup_viewpoint(void* localplayer, vo
     g_hook->m_localplayer_get_viewpoint_hook.call<void>(localplayer, view_info, pass);
 }
 
-void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+// SEH isolation for the native-stereo-fix render passes: Returnal's modular
+// build AVs inside BeginRenderingViewFamilies (FSR2 view extension calling
+// through nulled state) a few frames after the NSF flow engages. Contain the
+// fault so the interaction disables NSF for the session instead of killing
+// the game — and so the log pinpoints which pass faulted. Plain args only
+// (no unwindable objects in a __try frame).
+static bool nsf_run_pass_guarded(
+    SafetyHookInline& hook, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+    __try {
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// One fault anywhere in the NSF flow permanently reverts this session to a
+// plain passthrough (no view suppression, no capture pass).
+static bool s_nsf_flow_disabled = false;
+
+
+static void nsf_brvf_member_handler(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+    FFakeStereoRenderingHook::begin_render_viewfamily_real(
+        g_hook->get_render_module_begin_render_viewfamily_hook(), "primary", render_module, canvas, view_family_candidate);
+}
+
+void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHook& hook, const char* tag, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
     ZoneScopedN("BeginRenderViewFamilyReal");
     const auto profile_engine_render = should_profile_engine_render_timing();
     const auto begin_render_viewfamily_real_start =
@@ -9964,45 +10047,228 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamilyReal for the first time");
 
     if (!g_framework->is_game_data_intialized()) {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         return;
     }
 
     auto& vr = VR::get();
     auto rtm = g_hook->get_render_target_manager();
 
-    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled()) {
+    if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || s_nsf_flow_disabled) {
         avowed_native_fix_gate_reset("hmd inactive or native stereo fix disabled");
         rtm->destroy_scene_capture();
 
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
         return;
     }
 
-    struct TArrayViewViewFamily {
-        sdk::FSceneViewFamily** data;
+    // POSITIVE identification on SEH-PROBED COPIES only. In modular builds
+    // (Returnal) this hooked address can be a shared/ICF-folded stub reached
+    // by unrelated callers with arbitrary arguments — including pointers into
+    // live thread stacks (observed: "family" 0x430 bytes above our own RSP)
+    // whose contents mutate under us, and vtable identity is unreliable (ICF
+    // folds identical vtables). Rules: every read is probed, and NOTHING is
+    // mutated until the views pass the definitive test — each view's
+    // back-pointer must name this exact family.
+    static uint32_t s_nsf_rejected = 0;
+    static uint32_t s_nsf_reject_logged = 0;
+
+    void* first_field = nullptr;
+
+    // Log the first several rejects with their reason so a log can show WHY
+    // NSF is inert in a title instead of silently degrading (doubled left
+    // eye + black right = every call rejected).
+    const auto reject_passthrough = [&](const char* reason) {
+        ++s_nsf_rejected;
+        if (s_nsf_reject_logged < 8) {
+            ++s_nsf_reject_logged;
+            SPDLOG_WARN("[NativeStereoFix] reject #{}: {} (candidate={:x} first_field={:x})",
+                s_nsf_reject_logged, reason, (uintptr_t)view_family_candidate, (uintptr_t)first_field);
+        }
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+    };
+    if (view_family_candidate == nullptr ||
+        !nsf_seh_read(view_family_candidate, &first_field, sizeof(first_field))) {
+        reject_passthrough("argument null/unreadable");
+        return;
+    }
+
+    bool uses_tarrayview = false;
+    sdk::FSceneViewFamily* view_family = view_family_candidate;
+
+    if (sdk::FSceneViewFamily::has_vtable()) {
+        if (first_field == sdk::FSceneViewFamily::get_vtable_ptr()) {
+            // Known family vtable: direct family (still verified below).
+        } else if (first_field != nullptr && utility::get_module_within(first_field).has_value()) {
+            // Module-range pointer = a (subclass) vtable — direct family. A
+            // UE5 TArrayView's first field is a heap pointer, never a vtable.
+            SPDLOG_INFO_ONCE(
+                "[NativeStereoFix] Family with a subclass vtable — treating as a direct family");
+        } else {
+            // Possible UE5 TArrayView{data,count}: only accept it when entry 0
+            // itself positively looks like a family (known or module vtable).
+            sdk::FSceneViewFamily* entry0 = nullptr;
+            void* entry0_vtable = nullptr;
+
+            if (first_field == nullptr ||
+                !nsf_seh_read(first_field, &entry0, sizeof(entry0)) ||
+                entry0 == nullptr ||
+                !nsf_seh_read(entry0, &entry0_vtable, sizeof(entry0_vtable)) ||
+                entry0_vtable == nullptr ||
+                (entry0_vtable != sdk::FSceneViewFamily::get_vtable_ptr() &&
+                 !utility::get_module_within(entry0_vtable).has_value())) {
+                reject_passthrough("first field neither vtable nor TArrayView of families");
+                return;
+            }
+
+            uses_tarrayview = true;
+            view_family = entry0;
+        }
+    }
+
+    // The views array offset can differ per title: Returnal's Housemarque
+    // family has NO vtable and a custom leading member (float — its raw first
+    // field reads as 0x..3f800000), which shifts Views to +0x8 while the
+    // scanner latched the no-vtable default of 0. Instead of trusting one
+    // scanned offset, probe the plausible offsets and accept whichever passes
+    // FULL verification: sane TArray header, readable pointer array, and
+    // every view's owning-family back-pointer (first field on UE4, after the
+    // vtable on UE5.6+) naming this exact family. Requires count >= 1 —
+    // empty families cannot be verified and do not need NSF anyway.
+    struct ViewsCopy {
+        sdk::FSceneView** data;
         uint32_t count;
+        uint32_t capacity;
     };
 
-    const auto uses_tarrayview = sdk::FSceneViewFamily::has_vtable() && *(void**)view_family_candidate != sdk::FSceneViewFamily::get_vtable_ptr();
-    const auto ue5_view_family_array = (TArrayViewViewFamily*)view_family_candidate;
+    ViewsCopy vcopy{};
+    sdk::FSceneView* view_copies[8]{};
+    sdk::TArray<sdk::FSceneView*>* views_ptr = nullptr;
 
-    if (uses_tarrayview && ue5_view_family_array->data == nullptr) {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
-        return;
+    {
+        const auto scanned = view_family->get_views(); // pointer arithmetic only, no deref
+        const uintptr_t base = (uintptr_t)view_family;
+        const uintptr_t candidates[6] = {
+            scanned != nullptr ? (uintptr_t)scanned : 0,
+            base + 0x8,
+            base,
+            base + 0x10,
+            base + 0x18,
+            base + 0x20,
+        };
+
+        for (const auto cand : candidates) {
+            if (cand == 0) {
+                continue;
+            }
+
+            ViewsCopy probe{};
+            sdk::FSceneView* probe_views[8]{};
+
+            if (!nsf_seh_read((void*)cand, &probe, sizeof(probe)) ||
+                probe.count == 0 || probe.count > 8 || probe.capacity < probe.count ||
+                probe.data == nullptr ||
+                !nsf_seh_read(probe.data, probe_views, sizeof(void*) * probe.count)) {
+                continue;
+            }
+
+            bool all_backptrs_ok = true;
+            for (uint32_t i = 0; i < probe.count && all_backptrs_ok; ++i) {
+                // The owning-family back-pointer's position varies: UE4 puts it
+                // at slot 0, UE5.6+ after the vtable, Hellblade 2's UE5 build
+                // deeper still ({vtable, 0, ...}). Search the first 16 qwords —
+                // a random struct containing this exact family pointer is
+                // essentially impossible, so the test stays definitive.
+                sdk::FSceneViewFamily* owner_slots[16]{};
+                bool matched = false;
+
+                if (probe_views[i] != nullptr &&
+                    nsf_seh_read(probe_views[i], owner_slots, sizeof(owner_slots))) {
+                    for (auto* slot : owner_slots) {
+                        if (slot == view_family) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+
+                all_backptrs_ok = matched;
+            }
+
+            if (all_backptrs_ok) {
+                views_ptr = (sdk::TArray<sdk::FSceneView*>*)cand;
+                vcopy = probe;
+                memcpy(view_copies, probe_views, sizeof(view_copies));
+                SPDLOG_INFO_ONCE(
+                    "[NativeStereoFix] Views verified at family+{:x} (count={}, scanned offset {})",
+                    cand - base, probe.count,
+                    scanned != nullptr ? (int64_t)((uintptr_t)scanned - base) : -1);
+                break;
+            }
+        }
     }
 
-    // UE5 passes an TArrayView of ViewFamily pointers instead of a single ViewFamily
-    sdk::FSceneViewFamily* view_family = uses_tarrayview ? ue5_view_family_array->data[0] : view_family_candidate;
-
-    auto views_ptr = view_family->get_views();
     if (views_ptr == nullptr) {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        static uint32_t s_nsf_probe_dumps = 0;
+        if (s_nsf_probe_dumps < 2) {
+            ++s_nsf_probe_dumps;
+            const uintptr_t base = (uintptr_t)view_family;
+            for (const auto off : {(uintptr_t)0x0, (uintptr_t)0x8, (uintptr_t)0x10, (uintptr_t)0x18, (uintptr_t)0x20, (uintptr_t)0x28}) {
+                ViewsCopy probe{};
+                sdk::FSceneViewFamily* owner_slots[2]{};
+                sdk::FSceneView* v0 = nullptr;
+                if (nsf_seh_read((void*)(base + off), &probe, sizeof(probe)) &&
+                    probe.data != nullptr && probe.count > 0 && probe.count <= 8 &&
+                    nsf_seh_read(probe.data, &v0, sizeof(v0)) && v0 != nullptr) {
+                    nsf_seh_read(v0, owner_slots, sizeof(owner_slots));
+                }
+                SPDLOG_WARN(
+                    "[NativeStereoFix] probe family+{:x}: data={:x} count={} cap={} v0={:x} v0_owner0={:x} v0_owner1={:x} (family={:x})",
+                    off, (uintptr_t)probe.data, probe.count, probe.capacity, (uintptr_t)v0,
+                    (uintptr_t)owner_slots[0], (uintptr_t)owner_slots[1], base);
+            }
+        }
+        reject_passthrough("no views candidate passed back-pointer verification");
         return;
     }
 
-    auto& views = *views_ptr;
+    auto& views = *views_ptr; // verified above — safe to use directly now
     const auto prev_count = views.count;
+
+    // NSF effectiveness telemetry. The pre-5.7 resolver hooks a stack-walk
+    // GUESS (first game-module frame); if that lands on the wrong function
+    // this hook never sees a multi-view family and silently degrades to a
+    // passthrough — the second view is never suppressed (doubled geometry in
+    // the left eye) and the capture pass never runs (black right eye). Make
+    // that state loud instead of silent (seen in Returnal: stack_index=10).
+    static uint32_t s_nsf_calls = 0;
+    static uint32_t s_nsf_multiview = 0;
+    static uint32_t s_nsf_capture_passes = 0;
+    static auto s_nsf_last_log = std::chrono::steady_clock::now();
+
+    ++s_nsf_calls;
+    if (prev_count > 1) {
+        ++s_nsf_multiview;
+        SPDLOG_INFO_ONCE("[NativeStereoFix] First VERIFIED multi-view family arrived via candidate '{}'", tag);
+    }
+
+    if (const auto nsf_now = std::chrono::steady_clock::now(); nsf_now - s_nsf_last_log >= std::chrono::seconds(5)) {
+        s_nsf_last_log = nsf_now;
+        if (s_nsf_multiview == 0) {
+            SPDLOG_WARN(
+                "[NativeStereoFix] BeginRenderingViewFamilies hook saw NO multi-view family in 5s "
+                "(calls={}) — likely hooked the wrong function (stack-walk guess); the right eye "
+                "will stay black and the left eye gets both views",
+                s_nsf_calls);
+        } else {
+            spdlog::info("[NativeStereoFix] hook stats: calls={} multiview={} capture_passes={} rejected={}",
+                s_nsf_calls, s_nsf_multiview, s_nsf_capture_passes, s_nsf_rejected);
+        }
+        s_nsf_calls = 0;
+        s_nsf_multiview = 0;
+        s_nsf_capture_passes = 0;
+        s_nsf_rejected = 0;
+    }
 
     if (auto view_family_target = view_family->get_render_target(); view_family_target != nullptr) {
         g_hook->try_adopt_scene_viewport_render_target(
@@ -10042,7 +10308,13 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         // that gets unset after the texture is fully created. This function exits early otherwise.
         rtm->create_scene_capture();
         views.count = 1;
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate)) {
+            s_nsf_flow_disabled = true;
+            vr->m_native_stereo_fix->value() = false; // full coherent fallback: stops capture churn
+            SPDLOG_ERROR(
+                "[NativeStereoFix] Suppressed (pre-capture) render pass CRASHED — turning Native Stereo "
+                "Fix OFF for this session");
+        }
         views.count = prev_count;
         return;
     }
@@ -10058,7 +10330,8 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
             scene_capture_native,
             false);
 
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        views.count = prev_count;
         return;
     }
 
@@ -10126,9 +10399,19 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         view_family.views.data[1]->constructor((sdk::FSceneViewInitOptions*)init_options_copy2.data());*/
     }
 
-    g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+    if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate)) {
+        s_nsf_flow_disabled = true;
+        vr->m_native_stereo_fix->value() = false; // full coherent fallback: stops capture churn
+        SPDLOG_ERROR(
+            "[NativeStereoFix] Main (first) render pass CRASHED with the NSF flow active — turning "
+            "Native Stereo Fix OFF for this session");
+        views.count = prev_count;
+        return;
+    }
 
-    if (wants_swap) {
+    if (wants_swap && !s_nsf_flow_disabled) {
+        ++s_nsf_capture_passes;
+
         if (avowed_is_current_game()) {
             SPDLOG_INFO_EVERY_N_SEC(2, "[Avowed][NativeStereoFix] Executing right-eye second render pass into scene capture target");
         }
@@ -10143,15 +10426,34 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
 
         auto scene = (sdk::FScene*)view_family->get_scene_interface();
 
+        bool decremented = false;
         if (scene != nullptr) {
-            // We decrement the frame count because it fixes motion vectors in the right eye.
-            scene->decrement_frame_count();
+            // Sanity: a wrong scanned FScene frame-count offset corrupts the
+            // scene object here. Only decrement through a plausible counter.
+            const auto fc = scene->get_frame_count();
+            if (fc != 0 && fc < 100'000'000u) {
+                // We decrement the frame count because it fixes motion vectors in the right eye.
+                scene->decrement_frame_count();
+                decremented = true;
+            } else {
+                SPDLOG_WARN_ONCE(
+                    "[NativeStereoFix] FScene frame count reads implausible value {:x} — skipping the "
+                    "motion-vector decrement (scanned offset suspect)",
+                    fc);
+            }
         }
-        
+
         std::swap(views[0], views[1]);
 
-        // Call it again
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        // Call it again — SEH-contained (see nsf_run_pass_guarded).
+        if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate)) {
+            s_nsf_flow_disabled = true;
+            vr->m_native_stereo_fix->value() = false; // full coherent fallback: stops capture churn
+            SPDLOG_ERROR(
+                "[NativeStereoFix] Second (capture) render pass CRASHED — turning Native Stereo Fix OFF "
+                "for this session. decrement_applied={}",
+                decremented);
+        }
 
         std::swap(views[0], views[1]);
 
@@ -10404,7 +10706,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
 
             g_hook->m_render_module_begin_render_viewfamily_hook = safetyhook::create_inline(
                 reinterpret_cast<uintptr_t>(begin_rendering_view_family_real_fn),
-                reinterpret_cast<uintptr_t>(&begin_render_viewfamily_real));
+                reinterpret_cast<uintptr_t>(&nsf_brvf_member_handler));
 
             if (g_hook->m_render_module_begin_render_viewfamily_hook) {
                 SPDLOG_INFO("[NativeStereoFix] Hooked BeginRenderingViewFamilies real function");
@@ -12431,7 +12733,32 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     if (vr->is_using_afr() && !is_full_pass) {
         true_index = g_frame_count % 2;
 
-        if (!vr->is_using_synchronized_afr() && !vr->is_using_afw()) {
+        // Flat3D: alternate the eye per DRAW, not per engine frame number.
+        // Some titles (Hogwarts) keep the frame number for the forced synced-
+        // sequential draw — raw %2 then renders the SAME eye twice per pair,
+        // collapsing the stereo baseline (squished depth). A stalled frame
+        // number takes the complement of the previous draw's eye; the
+        // projection hook consumes m_afr_draw_index for the same draw.
+        if (vr->is_using_flat3d()) {
+            int idx = (int)(g_frame_count % 2);
+            if (g_hook->m_afr_draw_frame == (int64_t)g_frame_count && g_hook->m_afr_draw_index >= 0) {
+                idx = g_hook->m_afr_draw_index ^ 1;
+                if (auto* f = vr->get_flat3d_runtime(); f != nullptr) {
+                    f->pair_stall_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            g_hook->m_afr_draw_frame = (int64_t)g_frame_count;
+            g_hook->m_afr_draw_index = idx;
+            true_index = idx;
+        }
+
+        // Plain-AFR rotation latch: freeze one HMD pose across the AFR pair so
+        // the eyes don't shear apart under head motion. HMD-only — under
+        // Flat3D the rotation IS the game camera: latching makes the right eye
+        // lag a frame, and any special pass that enters here on even parity
+        // (map/portrait scene captures are typically top-down) poisons the
+        // latch and pins the right eye looking at the ground.
+        if (!vr->is_using_synchronized_afr() && !vr->is_using_afw() && !vr->is_using_flat3d()) {
             if (g_hook->m_has_double_precision) {
                 if (true_index == 1) {
                     *rot_d = g_hook->m_last_afr_rotation_double;
@@ -12444,6 +12771,44 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 } else {
                     g_hook->m_last_afr_rotation = *view_rotation;
                 }
+            }
+        }
+    }
+
+    // Synced Sequential pair detector (Flat3D): the forced second draw of a
+    // pair runs on unticked game state, so its RAW camera (view location +
+    // rotation as passed in, before any eye offset / OpenTrack mutation) is
+    // bit-identical to the first draw's. Push one match record per eye draw;
+    // the present path consumes them FIFO to publish complete same-state
+    // pairs (build_flat3d_frame_params). No de-dup and no other heuristics:
+    // when this signal is absent or ambiguous the consumer falls back to
+    // NAIVE per-present publishing — a wrongly-aligned pair lock shows a
+    // cross-state pair on EVERY present, which is strictly worse than naive
+    // (matched pair every other present).
+    if (!is_full_pass && vr->is_using_flat3d() && vr->is_using_synchronized_afr()) {
+        if (auto* f = vr->get_flat3d_runtime(); f != nullptr) {
+            uint8_t sig[48]{};
+            const size_t comp = has_double_precision ? sizeof(double) : sizeof(float);
+            memcpy(sig, view_location, comp * 3);
+            memcpy(sig + comp * 3, view_rotation, comp * 3);
+            const size_t len = comp * 6;
+            const bool match = f->prev_cam_sig_len == len && memcmp(f->prev_cam_sig, sig, len) == 0;
+            memcpy(f->prev_cam_sig, sig, len);
+            f->prev_cam_sig_len = len;
+
+            std::scoped_lock _{f->pair_mtx};
+            f->pair_push_count++;
+            if (match) {
+                f->pair_match_count++;
+            }
+            const uint8_t flags = (match ? 1u : 0u) |
+                ((g_hook->m_afr_draw_index >= 0 ? ((uint8_t)g_hook->m_afr_draw_index & 1u) : 0u) << 1);
+            f->pair_second_fifo.push_back({(uint32_t)g_frame_count, flags});
+            if (f->pair_second_fifo.size() > 8) {
+                // Draw->present correspondence lost (draws outpacing presents):
+                // records no longer describe the frames being presented. Reset
+                // to naive rather than consume stale, misaligning values.
+                f->pair_second_fifo.clear();
             }
         }
     }
@@ -13027,7 +13392,11 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
 
         if (vr->is_using_afr()) {
-            true_index = g_frame_count % 2;
+            // Use the per-draw eye the view-offset hook chose (it alternates
+            // even when the engine keeps its frame number for the forced
+            // synced draw — see m_afr_draw_index). Raw %2 here would put the
+            // same shear on both halves of such a pair.
+            true_index = g_hook->m_afr_draw_index >= 0 ? g_hook->m_afr_draw_index : (int)(g_frame_count % 2);
         }
 
         auto* flat3d = vr->get_flat3d_runtime();
@@ -13083,6 +13452,26 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
 
         vr->m_nearz = near_z;
         flat3d->update_matrices(near_z, 10000.0f);
+
+        // AFW warp camera data: this branch returns before the HMD path's
+        // render_projection_matrix write below, which used to leave the matrix
+        // zero — update_camera_data() then fed the frame-warp plugin garbage
+        // view->clip matrices under Flat3D. Mirror that write here with the
+        // same conversion (UE z-forward/w=z clip -> RH w=-z, near plane scaled
+        // to meters via -1/world_to_meters, off-center terms sign-flipped).
+        {
+            const auto wtm = vr->get_world_to_meters();
+            const float near_m = wtm != 0.0f ? (-near_z / wtm) : -near_z;
+            Matrix4x4f warp_proj{
+                xs, 0.0f, 0.0f, 0.0f,
+                0.0f, ys, 0.0f, 0.0f,
+                -shear, 0.0f, -1.0f, -1.0f,
+                0.0f, 0.0f, near_m, 0.0f
+            };
+            vr->render_projection_matrix[true_index].curr = warp_proj;
+            warp_proj[2][0] = shear; // the other eye mirrors the shear
+            vr->render_projection_matrix[true_index].other = warp_proj;
+        }
 
         if (!g_hook->m_has_double_precision) {
             *out = Matrix4x4f {

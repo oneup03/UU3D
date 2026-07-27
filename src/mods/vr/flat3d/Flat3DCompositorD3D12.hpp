@@ -83,7 +83,11 @@ public:
 
 private:
     bool create_pipelines(ID3D12Device* device);
-    void record_overlays(ID3D12GraphicsCommandList* cmd, bool have_ui, bool have_menu, const Flat3DFrameParams& params);
+    // eye_refresh_mask: bit N set = eye N's scene content was refreshed this
+    // present; overlays bake only into refreshed eyes (persistent caches —
+    // re-baking translucent UI onto an unrefreshed eye ratchets its opacity).
+    void record_overlays(ID3D12GraphicsCommandList* cmd, bool have_ui, bool have_menu, const Flat3DFrameParams& params,
+                         uint32_t eye_refresh_mask);
     void read_depth_slot(uint32_t slot, float nearz_uu, float* out_center_uu, float* out_nearest_uu);
     // Builds the SbS resource (LeiaSR input) at DISPLAY resolution from the
     // two eye textures via the repack shader (upscale + eye swap + SDR color
@@ -152,6 +156,13 @@ private:
     ComPtr<ID3D12Resource> m_huddepth_tex[2]{};
     ComPtr<ID3D12DescriptorHeap> m_huddepth_rtv_heap{};
     bool m_huddepth_srv_made{false}; // whether the persistent td SRVs were created
+
+    // Synced-sequential pair lock: mid-pair stash of the first eye so only
+    // matched (same game-state) stereo pairs are ever displayed. Kept in
+    // COPY_DEST at rest.
+    ComPtr<ID3D12Resource> m_pair_pending{};
+    bool m_pair_pending_valid{false};
+    int m_pair_pending_eye{0}; // which eye slot the stash belongs to
 
     // Depth readback (one buffer per ring slot).
     static constexpr uint32_t kDepthStripes = 9;

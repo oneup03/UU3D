@@ -33,32 +33,67 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     bool extreme,
     uint32_t backbuffer_index)
 {
+    // State trace: log only on transitions so the log shows when the warp
+    // actually engages vs falls back to plain AFR (and why).
+    static int s_afw_state = -1;
+    const auto trace = [](int state, const char* what) {
+        if (s_afw_state != state) {
+            s_afw_state = state;
+            spdlog::info("[Flat3D][AFW] {}", what);
+        }
+    };
+
     // Only once AFW has engaged (post-warmup, DX12) and the real plugin device is
     // live. The dummy PDAFWPlugin returns a null renderer from InitDevice, so this
     // stays a no-op and the caller falls back to plain AFR (stale-eye reuse).
-    if (!vr->is_using_afw() || vr->d3d12Renderer == nullptr || double_wide == nullptr) {
+    if (!vr->is_using_afw() || double_wide == nullptr) {
+        trace(1, "warp idle (warmup / resolution-change window)");
+        return nullptr;
+    }
+    if (vr->d3d12Renderer == nullptr) {
+        trace(2, "warp unavailable: real PDAFWPlugin.dll not loaded — plain AFR fallback");
         return nullptr;
     }
 
     const EyeIndex nEye = (vr->m_render_frame_count % 2 == vr->m_left_eye_interval) ? EyeLeft : EyeRight;
     const EyeIndex nEyeOther = (nEye == EyeLeft) ? EyeRight : EyeLeft;
 
+    // The plugin creates its eye buffers AND their SRV/UAV/RTV views directly
+    // from the format we hand it. UE's double-wide is often a *_TYPELESS
+    // format (Hogwarts: B8G8R8A8_TYPELESS) — views created off a typeless
+    // format are invalid/undefined, which corrupts the warp output. Hand the
+    // plugin the typed equivalent; Crop's CopyTextureRegion stays legal (same
+    // format family). PureDark's own path always passes a concrete swapchain
+    // format here.
+    const auto typed_eye_format = [](DXGI_FORMAT f) {
+        switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS:     return DXGI_FORMAT_B8G8R8X8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default:                                return f;
+        }
+    }(eye_format);
+
     // (Re)allocate the plugin-owned per-eye framebuffers at the Flat3D eye extent
     // (NOT hmd dims — see the OpenXR setup()'s InitFrameWarp block, which uses
     // get_hmd_width/height). Only re-init on a size/format change.
     static uint32_t s_last_w = 0, s_last_h = 0;
-    static DXGI_FORMAT s_last_fmt = DXGI_FORMAT_UNKNOWN;
-    if (s_last_w != eye_w || s_last_h != eye_h || s_last_fmt != backbuffer_format) {
-        FrameWarpInitParams ip{ (int)eye_w, (int)eye_h, eye_format, backbuffer_format };
+    static DXGI_FORMAT s_last_eye_fmt = DXGI_FORMAT_UNKNOWN;
+    static DXGI_FORMAT s_last_bb_fmt = DXGI_FORMAT_UNKNOWN;
+    if (s_last_w != eye_w || s_last_h != eye_h || s_last_eye_fmt != typed_eye_format || s_last_bb_fmt != backbuffer_format) {
+        FrameWarpInitParams ip{ (int)eye_w, (int)eye_h, typed_eye_format, backbuffer_format };
         m_eyeFrameBuffers = InitFrameWarp(ip);
-        s_last_w = eye_w; s_last_h = eye_h; s_last_fmt = backbuffer_format;
-        SPDLOG_INFO("[Flat3D][AFW] InitFrameWarp {}x{} eyeFmt={} bbFmt={}",
-            eye_w, eye_h, (uint32_t)eye_format, (uint32_t)backbuffer_format);
+        s_last_w = eye_w; s_last_h = eye_h; s_last_eye_fmt = typed_eye_format; s_last_bb_fmt = backbuffer_format;
+        SPDLOG_INFO("[Flat3D][AFW] InitFrameWarp {}x{} eyeFmt={} (raw {}) bbFmt={}",
+            eye_w, eye_h, (uint32_t)typed_eye_format, (uint32_t)eye_format, (uint32_t)backbuffer_format);
     }
 
     auto& eyeFB = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
     auto& otherFB = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
     if (eyeFB.color.pTexture == nullptr || otherFB.color.pTexture == nullptr) {
+        trace(3, "warp unavailable: plugin eye framebuffers not allocated — plain AFR fallback");
         return nullptr; // plugin didn't allocate (dummy / init failed)
     }
 
@@ -111,6 +146,7 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     // Don't warp against garbage: require harvested depth for this eye. Until DLSS
     // (or the NeverDLSS raw path) produces depth, fall back to plain AFR.
     if (vr->depthDesc[nEye].pTexture == nullptr) {
+        trace(4, "warp waiting for depth + motion-vector harvest (DLSS active?) — plain AFR fallback");
         return nullptr;
     }
 
@@ -162,6 +198,8 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     EvaluateFrameWarp(p);
 
     vr->d3d12Renderer->EndCommandList((int)backbuffer_index);
+
+    trace(0, "warp ENGAGED — reprojecting the second eye from depth + motion vectors");
 
     // The plugin reprojected into the OTHER eye's buffer, left in ALL_SHADER_RESOURCE.
     return otherFB.color.pTexture;
@@ -239,7 +277,11 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     if (params.vsync_override == 1) {
         hook->set_next_present_interval(1);
     } else if (params.vsync_override >= 2) {
+        // No-Tear Fast: interval 0 with ALLOW_TEARING stripped — flip-model
+        // scanout stays tear-free while presents run unthrottled, so both
+        // AFR/Synced-Sequential eye frames land every refresh.
         hook->set_next_present_interval(0);
+        hook->set_next_present_no_tearing();
     }
 
     // Native-stereo-fix titles render the RIGHT eye into a dedicated

@@ -121,8 +121,11 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         }
         RHIThreadID = std::this_thread::get_id();
         auto render_frame_count = vr->get_render_frame_count();
-        EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
-        EyeIndex nEyeOther = (render_frame_count % 2 == 0) ? EyeRight : EyeLeft;
+        // Same eye-parity expression as run_flat3d_framewarp / update_camera_data /
+        // the compositors — a hardcoded ==0 here swaps the harvest's eye slots
+        // whenever m_left_eye_interval is 1.
+        EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
+        EyeIndex nEyeOther = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeRight : EyeLeft;
         vr->last_dlss_frame_count = render_frame_count;
         static int lastPausedFrame = render_frame_count;
 
@@ -203,9 +206,12 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     return result;
 }
 
-decltype(&ID3D12GraphicsCommandList::ResourceBarrier) ptrResourceBarrier; // 26
+// AFW/NeverDLSS raw harvest. Invoked as callbacks from D3D12Hook's own vtable
+// hooks (post-original) — NOT as a second vtable patch on the same slots: the
+// old hookVtable layer and D3D12Hook's PointerHooks each captured the other as
+// "original" after a re-hook, recursing every ResourceBarrier to a stack
+// overflow (P3R crash).
 void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
-    (This->*ptrResourceBarrier)(NumBarriers, pBarriers);
     const auto& vr = VR::get();
 
     // Only track barriers submitted in RHISubmissionThread
@@ -221,7 +227,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
     ID3D12Resource* velocityCandidate = nullptr;
     ID3D12Resource* motionVectorsCandidate = nullptr;
     auto render_frame_count = vr->get_render_frame_count();
-    EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
+    EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
     bool isNeverDLSS = vr->is_never_dlss();
     for (int i = 0; i < NumBarriers; i++) {
         auto& barrier = pBarriers[i];
@@ -301,18 +307,13 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
 }
 
 static std::map<SIZE_T, ID3D12Resource*> DSVMap = {};
-decltype(&ID3D12Device::CreateDepthStencilView) ptrCreateDepthStencilView; // 21
 void WINAPI hk_ID3D12Device_CreateDepthStencilView(
     ID3D12Device* This, ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    (This->*ptrCreateDepthStencilView)(pResource, pDesc, DestDescriptor);
     DSVMap[DestDescriptor.ptr] = pResource;
 }
 
-decltype(&ID3D12GraphicsCommandList::ClearDepthStencilView) ptrClearDepthStencilView; // 47
-void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This, 
+void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This,
     D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView, D3D12_CLEAR_FLAGS ClearFlags, FLOAT Depth, UINT8 Stencil, UINT NumRects, const D3D12_RECT* pRects) {
-
-    (This->*ptrClearDepthStencilView)(DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
 
     const auto& vr = VR::get();
 
@@ -321,7 +322,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
 
     auto render_frame_count = vr->get_render_frame_count();
     bool isNeverDLSS = vr->is_never_dlss();
-    EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
+    EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
     if (isNeverDLSS && DSVMap.contains(DepthStencilView.ptr)) {
         auto depth = DSVMap[DepthStencilView.ptr];
         auto desc = depth->GetDesc();
@@ -350,15 +351,6 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
             }
         }
     }
-}
-
-uintptr_t hookVtable(void* target, int index, void* detours) {
-    uintptr_t* pVTable = *(uintptr_t**)target;
-    DWORD dwOldProct = 0;
-    BOOL bRet = ::VirtualProtect(pVTable, 4, PAGE_READWRITE, &dwOldProct);
-    auto origFunc = pVTable[index];
-    pVTable[index] = (uintptr_t)detours;
-    return origFunc;
 }
 
 std::shared_ptr<VR>& VR::get() {
@@ -2573,12 +2565,13 @@ void VR::init_framewarp_module() {
                          "(drop the real PDAFWPlugin.dll beside UEVRBackend.dll for AFW). "
                          "DLSS Depth capture still works via our own copy.");
         } else {
-            *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
-
-            auto cmdList = d3d12Renderer->BeginCommandList(0);
-            *(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
-            *(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
-            d3d12Renderer->EndCommandList(0);
+            // Raw harvest via D3D12Hook's own vtable hooks (post-original
+            // callbacks). Never patch these slots directly: D3D12Hook already
+            // owns them, and a second untracked patch (the old hookVtable) went
+            // mutually recursive with it on re-hook (stack overflow in P3R).
+            D3D12Hook::s_on_raw_create_depth_stencil_view.store(&hk_ID3D12Device_CreateDepthStencilView, std::memory_order_release);
+            D3D12Hook::s_on_raw_resource_barrier.store(&hk_ID3D12GraphicsCommandList_ResourceBarrier, std::memory_order_release);
+            D3D12Hook::s_on_raw_clear_depth_stencil_view.store(&hk_ID3D12GraphicsCommandList_ClearDepthStencilView, std::memory_order_release);
 
             spdlog::info("[VR][AFW] Frame Warp device initialized");
         }
@@ -7260,7 +7253,11 @@ float VR::flat3d_effective_nearz() {
     // is 0 until set, so only adopt a positive value.
     try {
         if (auto data = sdk::find_cvar_data_cached(L"Engine", L"r.SetNearClipPlane"); data) {
-            if (auto* cv = data->get<float>(); cv != nullptr && cv->get() > 0.0f) {
+            // Only adopt a PLAUSIBLE near plane (UE units; default is 10).
+            // FF7 Rebirth's cvar read produced a tiny-positive garbage value —
+            // it passed a bare >0 check and poisoned the depth->world
+            // conversion (game_nearz ~0 → every sample classified far).
+            if (auto* cv = data->get<float>(); cv != nullptr && cv->get() >= 1.0f && cv->get() <= 1000.0f) {
                 SPDLOG_INFO_ONCE("[Flat3D] near plane fallback via r.SetNearClipPlane cvar");
                 return cv->get();
             }
@@ -9456,7 +9453,20 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         if (ImGui::TreeNode("Compatibility Options")) {
             m_compatibility_ahud->draw("AHUD UI Compatibility");
             m_overlay_component.draw_ui_invert_alpha("UI Invert Alpha");
-            ImGui::TextWrapped("Inverts/blends the game UI's alpha so it composites correctly (0 = off). Needed by some titles for HUD/UI visibility.");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Inverts/blends the game UI's alpha so it composites correctly\n"
+                                  "(0 = off). Needed by some titles for HUD/UI visibility.");
+            }
+            m_flat3d_ui_color_gate->draw("UI Color Gate");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Zeroes the game UI's alpha where it has (almost) no color. Fixes the\n"
+                                  "dark film over the whole scene when using UI Invert Alpha 0.5 (that\n"
+                                  "collapses every pixel's alpha to a flat 0.5, including the empty\n"
+                                  "screen): drawn UI has color, empty screen doesn't. Also keeps the\n"
+                                  "full-screen-menu detector and the adaptive-HUD classifier working\n"
+                                  "under a partial invert. Try 0.03-0.08; 0 = off. Side effect: pure-\n"
+                                  "black opaque UI (dark panels) turns transparent - keep the gate low.");
+            }
             m_compatibility_skip_uobjectarray_init->draw("Skip UObjectArray Init");
             m_compatibility_skip_pip->draw("Skip PostInitProperties");
             m_compatibility_direct_aim->draw("Direct Aim Fallback");

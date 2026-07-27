@@ -81,8 +81,12 @@ public:
 
 private:
     bool create_pipeline(ID3D11Device* device);
+    // eye_refresh_mask: bit N set = eye N's scene content was refreshed this
+    // present; overlays bake only into refreshed eyes (persistent caches —
+    // re-baking translucent UI onto an unrefreshed eye ratchets its opacity).
     void draw_overlays(ID3D11DeviceContext* context, ID3D11ShaderResourceView* ui_srv,
-                       ID3D11ShaderResourceView* menu_srv, const Flat3DFrameParams& params);
+                       ID3D11ShaderResourceView* menu_srv, const Flat3DFrameParams& params,
+                       uint32_t eye_refresh_mask);
     bool weave_leiasr(ID3D11DeviceContext* context, ID3D11RenderTargetView* backbuffer_rtv,
                       uint32_t out_w, uint32_t out_h, const Flat3DFrameParams& params);
     void destroy_leiasr();
@@ -101,6 +105,12 @@ private:
     ComPtr<ID3D11Texture2D> m_eye_tex[2]{};
     ComPtr<ID3D11ShaderResourceView> m_eye_srv[2]{};
     ComPtr<ID3D11RenderTargetView> m_eye_rtv[2]{};
+
+    // Synced-sequential pair lock: mid-pair stash of the first eye so only
+    // matched (same game-state) stereo pairs are ever displayed.
+    ComPtr<ID3D11Texture2D> m_pair_pending{};
+    bool m_pair_pending_valid{false};
+    int m_pair_pending_eye{0}; // which eye slot the stash belongs to
 
     // Cached SRV over the Framework's IMGUI RT (recreated when the texture
     // pointer changes, e.g. after a device reset).

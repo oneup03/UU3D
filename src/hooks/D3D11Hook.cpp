@@ -331,14 +331,21 @@ HRESULT WINAPI D3D11Hook::present(IDXGISwapChain* swap_chain, UINT sync_interval
 
         if (d3d11->m_next_present_interval) {
             sync_interval = *d3d11->m_next_present_interval;
+            const auto no_tearing = d3d11->m_next_present_no_tearing;
             d3d11->m_next_present_interval = std::nullopt;
+            d3d11->m_next_present_no_tearing = false;
 
             if (sync_interval == 0) {
                 BOOL is_fullscreen = 0;
                 swap_chain->GetFullscreenState(&is_fullscreen, nullptr);
                 flags &= ~DXGI_PRESENT_DO_NOT_SEQUENCE;
 
-                if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+                if (no_tearing) {
+                    // No-Tear Fast: interval 0 WITHOUT ALLOW_TEARING — a
+                    // flip-model swapchain cannot tear without the flag while
+                    // presents run unthrottled (see the D3D12 hook).
+                    flags &= ~DXGI_PRESENT_ALLOW_TEARING;
+                } else if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
                     flags |= DXGI_PRESENT_ALLOW_TEARING;
                 }
             } else {

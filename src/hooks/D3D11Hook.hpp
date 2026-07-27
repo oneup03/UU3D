@@ -35,6 +35,13 @@ public:
         m_next_present_interval = interval;
     }
 
+    // One-shot: with interval 0, strip DXGI_PRESENT_ALLOW_TEARING instead of
+    // adding it (flip-model swapchains never tear without the flag; see
+    // D3D12Hook::set_next_present_no_tearing).
+    void set_next_present_no_tearing() {
+        m_next_present_no_tearing = true;
+    }
+
     bool hook();
     bool unhook();
 
@@ -106,6 +113,7 @@ protected:
     bool m_ignore_next_present{false};
 
     std::optional<uint32_t> m_next_present_interval{};
+    bool m_next_present_no_tearing{false};
 
     // Forced minimum swapchain size (0 = off).
     std::atomic<uint32_t> m_forced_resize_w{ 0 };

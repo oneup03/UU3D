@@ -103,6 +103,7 @@ public:
     int get_render_frame_count() { return m_render_frame_count; };
     int get_vr_frame_count() { return m_frame_count; };
     bool is_left_eye() { return m_frame_count % 2 == m_left_eye_interval; };
+    uint8_t get_left_eye_interval() const { return m_left_eye_interval; };
 
     bool is_use_uint64() { return m_use_uint64->value(); };
     bool is_fix_object_motion_vector() { return m_fix_object_motion_vector->value(); };
@@ -431,6 +432,10 @@ public:
     bool is_using_flat3d() const {
         return m_runtime != nullptr && m_runtime->is_flat3d();
     }
+
+    // Queues a 3D screenshot of the next composited stereo frame (Ctrl+F12 /
+    // the menu-header button drawn by Framework).
+    void request_flat3d_screenshot();
 
     float get_flat3d_opentrack_rot_scale() const { return m_flat3d_opentrack_rot_scale->value(); }
     float get_flat3d_opentrack_pos_scale() const { return m_flat3d_opentrack_pos_scale->value(); }
@@ -1806,8 +1811,7 @@ private:
     static const inline std::vector<std::string> s_flat3d_vsync_names{
         "Use In-Game Setting",
         "Force On",
-        "Force Off",
-        "Force Off + 2x Refresh Cap (AFR)",
+        "No-Tear Fast",
     };
     static const inline std::vector<std::string> s_flat3d_hud_depth_names{
         "Flat (GUI Depth)",
@@ -1844,12 +1848,17 @@ private:
     // Present-interval override. The 2x mode disables vsync AND caps the game
     // at twice the display refresh so AFR/Synced Sequential update each eye
     // at the full refresh rate.
-    const ModCombo::Ptr m_flat3d_vsync{ ModCombo::create(generate_name("Flat3D_VSyncOverride"), s_flat3d_vsync_names) };
+    // Default: No-Tear Fast (2) — on flip-model swapchains (all DX12, i.e. the
+    // common case) it is tear-free AND presents both AFR eye frames per
+    // refresh (t.MaxFPS auto-caps at 2x refresh under AFR, 1x under native).
+    // Force On stays for DX11 blit-model exclusive fullscreen, which tears at
+    // interval 0 no matter the flags.
+    const ModCombo::Ptr m_flat3d_vsync{ ModCombo::create(generate_name("Flat3D_VSyncOverride"), s_flat3d_vsync_names, 2) };
     // HDR swapchains (PQ/scRGB) wash out the SDR-defined 3D output modes and
     // color correction — ask the engine to switch HDR output off while on.
     const ModToggle::Ptr m_flat3d_force_sdr{ ModToggle::create(generate_name("Flat3D_ForceSDR"), true) };
     const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 0.5f, 0.1f) };
-    const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.01f, 25.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_reference_fov{ ModSlider::create(generate_name("Flat3D_ReferenceFOV"), 40.0f, 140.0f, 90.0f) };
     const ModToggle::Ptr m_flat3d_autoconv_enabled{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
     const ModSlider::Ptr m_flat3d_autoconv_target_disparity{ ModSlider::create(generate_name("Flat3D_AutoConvTargetDisparity"), 0.001f, 0.03f, 0.005f) };
@@ -1888,6 +1897,11 @@ private:
     // the radius): >0 stem hangs DOWN, <0 hangs UP, 0 = off.
     const ModSlider::Ptr m_flat3d_hud_stem_reach{ ModSlider::create(generate_name("Flat3D_HUDStemReach"), -0.25f, 0.25f, 0.0f) };
     const ModToggle::Ptr m_flat3d_hud_debug{ ModToggle::create(generate_name("Flat3D_HUDDepthDebug"), false, true) };
+    // Color-gated UI alpha: zero the redirected UI's alpha where it has ~no
+    // color. Rescues the "UI Invert Alpha 0.5" workaround (P3R battles): that
+    // collapses all alpha to a flat 0.5, tinting the scene through the EMPTY
+    // UI regions; drawn UI has color, empty screen doesn't. 0 = off.
+    const ModSlider::Ptr m_flat3d_ui_color_gate{ ModSlider::create(generate_name("Flat3D_UIColorGate"), 0.0f, 0.25f, 0.0f) };
     // Scene-depth source for the Adaptive Crosshair / HUD-depth features. OFF
     // (default) uses the safe API-level per-draw GameDepthCapture. ON reads the
     // engine's own render-target pool (SceneDepthZ by name), which finds a depth
@@ -1958,7 +1972,7 @@ private:
     // convergence), < 1 pops out, > 1 sits behind. Relative-to-convergence
     // keeps the overlays' disparity (and the cover-zoom that eats their
     // edges) from blowing up when convergence moves (slider or auto).
-    const ModSlider::Ptr m_flat3d_gui_depth{ ModSlider::create(generate_name("Flat3D_GUIDepthFactor"), 0.25f, 4.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_gui_depth{ ModSlider::create(generate_name("Flat3D_GUIDepthFactor"), 0.25f, 8.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_menu_depth{ ModSlider::create(generate_name("Flat3D_MenuDepthFactor"), 0.25f, 4.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_hdr_paper_white{ ModSlider::create(generate_name("Flat3D_HDRPaperWhiteNits"), 80.0f, 400.0f, 200.0f) };
     // Diagnostic: enable the D3D12 debug layer's InfoQueue and log its validation
@@ -1989,12 +2003,6 @@ private:
     const ModSlider::Ptr m_flat3d_opentrack_rot_scale{ ModSlider::create(generate_name("Flat3D_OpenTrackRotScale"), 0.0f, 2.0f, 1.0f) };
 
     // Keybinds matching VRto3D's hotkeys/step sizes (Ctrl+F3/F4 depth, Ctrl+F5/F6 convergence).
-    const ModKey::Ptr m_keybind_flat3d_depth_dec{ ModKey::create(generate_name("Flat3D_DepthDecKey")) };
-    const ModKey::Ptr m_keybind_flat3d_depth_inc{ ModKey::create(generate_name("Flat3D_DepthIncKey")) };
-    const ModKey::Ptr m_keybind_flat3d_conv_dec{ ModKey::create(generate_name("Flat3D_ConvDecKey")) };
-    const ModKey::Ptr m_keybind_flat3d_conv_inc{ ModKey::create(generate_name("Flat3D_ConvIncKey")) };
-    const ModKey::Ptr m_keybind_flat3d_screenshot{ ModKey::create(generate_name("Flat3D_ScreenshotKey")) };
-    const ModKey::Ptr m_keybind_flat3d_recenter{ ModKey::create(generate_name("Flat3D_RecenterKey")) };
     // ------------------------------------------------------------------------
 
     std::chrono::high_resolution_clock::time_point m_last_lerp_update{};
@@ -2137,6 +2145,7 @@ public:
             *m_flat3d_hud_marker_radius,
             *m_flat3d_hud_icon_radius,
             *m_flat3d_hud_stem_reach,
+            *m_flat3d_ui_color_gate,
             *m_flat3d_use_engine_depth,
             *m_flat3d_depth_source,
             *m_flat3d_hud_trans_gate,
@@ -2170,12 +2179,6 @@ public:
             *m_flat3d_opentrack_port,
             *m_flat3d_opentrack_pos_scale,
             *m_flat3d_opentrack_rot_scale,
-            *m_keybind_flat3d_depth_dec,
-            *m_keybind_flat3d_depth_inc,
-            *m_keybind_flat3d_conv_dec,
-            *m_keybind_flat3d_conv_inc,
-            *m_keybind_flat3d_screenshot,
-            *m_keybind_flat3d_recenter,
             *m_rendering_method,
             *m_synced_afr_method,
             *m_extreme_compat_mode,
