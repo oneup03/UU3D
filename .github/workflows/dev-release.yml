@@ -56,6 +56,22 @@ jobs:
           Copy-Item -Force ${{github.workspace}}/revision.txt ${{github.workspace}}/UU3D/
         shell: powershell
 
+      - name: Bundle PDAFWPlugin from PureDark AFW release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $afwDir = "${{github.workspace}}/afw-plugin"
+          New-Item -ItemType Directory -Force -Path $afwDir | Out-Null
+          gh release download --repo PureDark/UEVR --pattern "*joeyhodge*" --dir $afwDir
+          $zip = Get-ChildItem $afwDir -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "No 'joeyhodge' zip asset found in the latest PureDark/UEVR release" }
+          Expand-Archive -Path $zip.FullName -DestinationPath "$afwDir/extracted" -Force
+          $dll = Get-ChildItem "$afwDir/extracted" -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1
+          if (-not $dll) { throw "PDAFWPlugin.dll not found inside $($zip.Name)" }
+          Copy-Item -Force $dll.FullName ${{github.workspace}}/UU3D/
+          Write-Host "Bundled PDAFWPlugin.dll from $($zip.Name)"
+        shell: powershell
+
       - name: Upload artifacts
         uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8
         with:
