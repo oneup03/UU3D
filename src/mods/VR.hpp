@@ -704,6 +704,25 @@ public:
         return v < s_flat3d_render_scale_values.size() ? s_flat3d_render_scale_values[v] : 0.0f;
     }
 
+    // Raw Flat3D output mode (vrmod::flat3d::Flat3DOutputMode). Returned as int
+    // to avoid pulling the compositor header into VR.hpp; callers classify it.
+    int32_t flat3d_output_mode_value() const {
+        return (int32_t)m_flat3d_output_mode->value();
+    }
+
+    // The 3D output always holds on the PRIMARY display (3D users keep the 3D
+    // panel primary); this makes the native-output hold deterministic.
+    bool flat3d_output_on_primary() const {
+        return true;
+    }
+
+    // True when we detected a real full-SbS double-wide panel (drives Native
+    // Render + Upscale automatically).
+    bool flat3d_is_full_sbs() const {
+        return m_flat3d_full_sbs.load(std::memory_order_acquire);
+    }
+
+
     // The DSV-observer depth source is D3D12-only. It installs no engine hook
     // (unlike the pool path) and sees depth allocated at any time (unlike the
     // per-draw path).
@@ -1825,6 +1844,21 @@ private:
         "Geometry (Under Cursor)",
     };
 
+    // Full-SbS UI aspect handling. Only engages when the game's UI target is a
+    // different aspect than the per-eye slice (the double-wide 32:9 case); on a
+    // normal 16:9 / half-SbS output every mode is a no-op.
+    //   Crop    - cover: sample the central per-eye-aspect slice, fill the eye
+    //             (correct for games that CONSTRAIN their HUD centrally, e.g. SMT5V)
+    //   Fit     - contain: scale the whole UI to fit, letterboxed (shows the FULL
+    //             menu at correct aspect for games that SPREAD it full-width)
+    //   Stretch - no crop: sample 1:1, accept the squish (full coverage)
+    static const inline std::vector<std::string> s_flat3d_ui_aspect_names{
+        "Crop to Center",
+        "Fit (Letterbox)",
+        "Stretch to Fill",
+    };
+
+
     // Per-eye 3D render resolution as a fraction of the native output size.
     // Auto preserves the game's own requested resolution (pre-rewrite) — but a
     // game that boots already at native (or persists native after our
@@ -1844,6 +1878,11 @@ private:
 
     const ModCombo::Ptr m_flat3d_output_mode{ ModCombo::create(generate_name("Flat3D_OutputMode"), s_flat3d_output_mode_names) };
     const ModCombo::Ptr m_flat3d_render_scale{ ModCombo::create(generate_name("Flat3D_RenderResolution"), s_flat3d_render_scale_names, 0) };
+    // Auto-detected each frame in the native-output block: true when the output
+    // is a real full-SbS double-wide panel (SbS mode on a ~32:9 display). Drives
+    // Native Render + Upscale automatically (spoof the engine to render native
+    // per-eye + top-left UI crop); no user toggle. False on 16:9 / half-SbS.
+    std::atomic<bool> m_flat3d_full_sbs{ false };
     const ModToggle::Ptr m_flat3d_eye_swap{ ModToggle::create(generate_name("Flat3D_EyeSwap"), false) };
     // Present-interval override. The 2x mode disables vsync AND caps the game
     // at twice the display refresh so AFR/Synced Sequential update each eye

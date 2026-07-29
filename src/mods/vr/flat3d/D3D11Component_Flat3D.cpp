@@ -3,8 +3,10 @@
 // and lets the game present it normally. Lives in its own TU to keep the
 // upstream D3D11Component.cpp diff to a single branch line.
 
+#include <cmath>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 #include <utility/Logging.hpp>
 #include <utility/String.hpp>
@@ -178,6 +180,56 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
         m_engine_ui_ref.reset();
     }
 
+    // --- UI aspect / top-left crop -----------------------------------------
+    // Each output mode gives each EYE a slice of the backbuffer. The UI overlay
+    // is reconciled to that eye so it isn't squished, and under Native Render +
+    // Upscale it's sampled from the top-left perceived region (see below).
+    {
+        const auto m = (flat3d::Flat3DOutputMode)params.mode;
+        const bool sbs_like = m == flat3d::Flat3DOutputMode::SBS ||
+                              m == flat3d::Flat3DOutputMode::LEIA_SR ||
+                              m == flat3d::Flat3DOutputMode::DUAL_DISPLAY ||
+                              m == flat3d::Flat3DOutputMode::DUAL_DISPLAY_FLIP;
+        const bool tab_like = m == flat3d::Flat3DOutputMode::TAB ||
+                              m == flat3d::Flat3DOutputMode::FRAMEPACKED_720P60 ||
+                              m == flat3d::Flat3DOutputMode::FRAMEPACKED_1080P24 ||
+                              m == flat3d::Flat3DOutputMode::FRAMEPACKED_1080P60;
+        const float eye_slice_w = sbs_like ? (float)bb_desc.Width * 0.5f : (float)bb_desc.Width;
+        const float eye_slice_h = tab_like ? (float)bb_desc.Height * 0.5f : (float)bb_desc.Height;
+
+        const float scene_aspect = dw_desc.Height > 0 ? (float)src_eye_w / (float)dw_desc.Height : 0.0f;
+
+        uint32_t ui_w = 0, ui_h = 0; float ui_aspect = 0.0f;
+        if (auto* ui_native = (ID3D11Texture2D*)(vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target()
+                              ? vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target()->get_native_resource()
+                              : nullptr)) {
+            D3D11_TEXTURE2D_DESC d{};
+            ui_native->GetDesc(&d);
+            ui_w = d.Width; ui_h = d.Height;
+            ui_aspect = ui_h > 0 ? (float)ui_w / (float)ui_h : 0.0f;
+        }
+
+        // Reconcile the UI-target aspect to the EYE-TEXTURE aspect (scene_aspect =
+        // eye_w/eye_h), NOT the output slice — the overlay is drawn into the eye
+        // texture, so that's the right reference. Using the slice would wrongly
+        // crop packed modes (half-SbS/half-TaB) where the slice is squished and
+        // the display stretches it back. No-op when ui_aspect==eye_aspect.
+        if (params.ui_topleft_crop && ui_w > 0 && ui_h > 0) {
+            // Native Render + Upscale: sample the PERCEIVED-client-sized top-left
+            // region of the UI target (eye_slice = spoof's half-panel width x
+            // full height), NOT the eye RENDER size — a game rendering its scene
+            // below native (DLSS/dynamic-res) still draws UI at full perceived size.
+            const float cx = eye_slice_w / (float)ui_w;
+            const float cy = eye_slice_h / (float)ui_h;
+            params.ui_crop_x = cx < 1.0f ? cx : 1.0f;
+            params.ui_crop_y = cy < 1.0f ? cy : 1.0f;
+        } else {
+            // Non-full-SbS: ui_aspect ~= eye aspect => no-op central crop.
+            vrmod::flat3d::compute_ui_aspect_crop(
+                0, ui_aspect, scene_aspect, params.ui_crop_x, params.ui_crop_y);
+        }
+    }
+
     // SceneDepthZ: readback for the adaptive crosshair + auto-convergence,
     // and/or sampled directly by the depth-adaptive HUD mode.
     ComPtr<ID3D11Texture2D> scene_depth{};
@@ -301,6 +353,9 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
 
         if (m_flat3d_compositor.save_screenshot(context.Get(), params, parallel_path, crossview_path)) {
             spdlog::info("[Flat3D] Saved 3D screenshot: {}", utility::narrow(parallel_path));
+            // Success chime (mirrors VRto3D's BeepSuccess). Detached: Beep()
+            // blocks for its full duration and this runs on the present thread.
+            std::thread([] { Beep(400, 400); }).detach();
         } else {
             SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Screenshot save failed");
         }

@@ -45,6 +45,52 @@ enum class Flat3DOutputMode : int32_t {
     COUNT,
 };
 
+// Full-SbS UI aspect handling. Keep in sync with VR::s_flat3d_ui_aspect_names.
+enum class Flat3DUIAspect : int32_t {
+    CROP = 0,   // cover: central slice fills the eye (crop factor < 1)
+    FIT,        // contain: whole UI letterboxed at correct aspect (crop factor > 1)
+    STRETCH,    // no reconcile: sample 1:1, accept the squish
+};
+
+// Reconcile a UI-target aspect to the per-eye reference aspect, producing the
+// x/y crop factors the overlay pass consumes (ui = 0.5 + crop*(eye-0.5)):
+//   factor < 1 => COVER (sample a central slice, fill the eye) — loses edges
+//   factor > 1 => CONTAIN (letterbox: whole UI in a centred band) — shows all
+//   factor = 1 => pass-through
+// When ui_aspect == ref_aspect every mode yields 1,1 (no-op), so a normal
+// 16:9 / half-SbS output is never touched regardless of the selected mode.
+inline void compute_ui_aspect_crop(int32_t mode, float ui_aspect, float ref_aspect,
+                                   float& crop_x, float& crop_y) {
+    crop_x = 1.0f;
+    crop_y = 1.0f;
+    if (ui_aspect <= 0.0f || ref_aspect <= 0.0f) {
+        return;
+    }
+
+    switch ((Flat3DUIAspect)mode) {
+    case Flat3DUIAspect::STRETCH:
+        break; // 1,1 — sample the whole UI 1:1 into the eye (squish)
+    case Flat3DUIAspect::FIT:
+        // Contain: the letterboxed axis gets a >1 factor so the eye samples
+        // BEYOND the UI on the short axis (shader discards -> empty band).
+        if (ui_aspect > ref_aspect) {
+            crop_y = ui_aspect / ref_aspect; // wider UI -> vertical letterbox
+        } else if (ui_aspect < ref_aspect) {
+            crop_x = ref_aspect / ui_aspect; // taller UI -> horizontal letterbox
+        }
+        break;
+    case Flat3DUIAspect::CROP:
+    default:
+        // Cover: the cropped axis gets a <1 factor (central slice fills eye).
+        if (ui_aspect > ref_aspect) {
+            crop_x = ref_aspect / ui_aspect; // wider UI -> central horizontal crop
+        } else if (ui_aspect < ref_aspect) {
+            crop_y = ui_aspect / ref_aspect; // taller UI -> central vertical crop
+        }
+        break;
+    }
+}
+
 // Output color space of the game's swapchain (for the HDR-aware passes).
 enum class Flat3DColorSpace : int32_t {
     SDR = 0,    // 8-bit UNORM sRGB-encoded — byte pass-through
@@ -87,6 +133,18 @@ struct Flat3DFrameParams {
     bool ui_enabled{false};
     float ui_shift_px{0.0f};    // horizontal shift in EYE pixels
     float ui_scale{1.0f};       // auto-scale so the UI fills the eye after the shift
+    // Aspect crop for the game-UI layers (0/1). The game draws its HUD into a
+    // target sized to its (32:9-ish) window, but constrains the HUD to a central
+    // slice matching the per-eye display aspect (dead space on the far sides).
+    // Sampling the whole target into the 16:9 eye squishes it; instead sample
+    // only that central crop. <1 crops that axis toward center; 1 = no crop.
+    // Computed CPU-side from the UI-texture aspect vs the per-eye slice aspect.
+    float ui_crop_x{1.0f};
+    float ui_crop_y{1.0f};
+    // Native Render + Upscale: game/menu draw their UI at the perceived HALF
+    // width into the TOP-LEFT of the full-width target, so the UI layers (and
+    // the menu) sample a top-left-anchored crop (about 0) instead of central.
+    bool ui_topleft_crop{false};
     float ui_invert_alpha{0.0f}; // UI_InvertAlpha (0=off..1=full); flips the game UI alpha in the overlay shader
     // Color-gated UI alpha: zero the UI's alpha where it has ~no color (max rgb
     // below this threshold). Rescues the "invert alpha 0.5" workaround (which
@@ -304,9 +362,16 @@ struct HudDepthConstants {
     float hud_depth_uscale{1.0f};  // 0.5 when scene depth is double-wide
     float hud_nearz_uu{0.0f};      // reversed-Z: z_uu = nearz / device_depth
     float aspect_xy{0.5625f};      // eye_h/eye_w, for circular search rings
-    float pad_{0.0f};
+    // The overlay reads the game UI from a central CROP of its target (the game
+    // constrains its HUD to a slice matching the eye aspect). The mask/tiledepth
+    // live in the UI target's uv, so un-crop by these to reach scene/eye uv when
+    // sampling scene depth — else a marker reads the depth of geometry offset to
+    // the side. 1 = no crop (UI already at eye aspect).
+    float ui_crop_x{1.0f};
+    float ui_crop_y{1.0f};
+    float pad_[3]{};               // keep 16-byte aligned (3 rows of 4 dwords)
 };
-static_assert(sizeof(HudDepthConstants) == 8 * sizeof(uint32_t), "hud depth constant size");
+static_assert(sizeof(HudDepthConstants) == 12 * sizeof(uint32_t), "hud depth constant size");
 
 // Min-z diffusion iterations: floods the nearest depth across a contiguous
 // marker up to ~this many tiles of radius (8-neighbourhood per pass).
@@ -723,7 +788,11 @@ Texture2D hud_mask    : register(t3); // world/static classification (mode 1)
 SamplerState samp     : register(s0);
 
 int HudMode() { return hud_mode & 15; }
-int HudTiles() { return max(hud_mode >> 4, 1); }
+// Dilation half-extents in MASK TILES, packed x=[bits 4..7], y=[bits 8..11].
+// They already carry the UI-crop factor (baked CPU-side) so the neighbourhood
+// stays a fixed SHAPE on screen regardless of the central UI crop.
+int HudTiles()  { return max((hud_mode >> 4) & 15, 1); }
+int HudTilesY() { return max((hud_mode >> 8) & 15, 1); }
 
 // Per-pixel HUD shift (eye-U units) for the depth modes. For depth-adaptive
 // the depth is sampled in a short strip BELOW the pixel — world markers
@@ -743,7 +812,7 @@ float ComputeHudShiftUV(float2 uv) {
         // while a moving marker's new tiles accumulate evidence — without
         // it the icon tears/flickers at tile boundaries.
         int tiles_x = HudTiles();
-        int tiles_y = max(1, (tiles_x * 9 + 8) / 16); // 36/64 aspect
+        int tiles_y = HudTilesY(); // packed with the 36/64 grid + UI-crop baked in
 
         // Vertical stem reach. A marker's leader line is a thin stem hanging off
         // the icon (usually straight down); thin lines are the least stable case
@@ -1269,7 +1338,9 @@ cbuffer DepthParams : register(b0) {
     float  hud_depth_uscale;
     float  hud_nearz_uu;
     float  aspect_xy;
-    float  pad_;
+    float  ui_crop_x;   // un-crop UI-tile uv -> scene/eye uv (central crop inverse)
+    float  ui_crop_y;
+    float3 pad_;
 };
 
 Texture2D hud_mask      : register(t0); // classification mask (world = high)
@@ -1291,10 +1362,15 @@ VSOut vs_main(uint id : SV_VertexID) {
 }
 
 // Nearest non-sky scene inv-z (1/z_uu) under a tile; 0 = no surface / sky only.
+// uv is in UI-TARGET space (mask/tiledepth grid); un-crop it into scene/eye uv
+// so the depth is read from where this tile actually appears on screen.
 float resolve_invz(float2 uv) {
     float best = 0.0; // larger inv-z = nearer
 
-    float dev = scene_depth.SampleLevel(samp, float2(uv.x * hud_depth_uscale, uv.y), 0).r;
+    // Inverse of the overlay's central UI crop: eye = 0.5 + (ui - 0.5)/crop.
+    float2 sc = saturate(0.5 + (uv - 0.5) / float2(ui_crop_x, ui_crop_y));
+
+    float dev = scene_depth.SampleLevel(samp, float2(sc.x * hud_depth_uscale, sc.y), 0).r;
     if (dev > 1e-9) {
         float z = hud_nearz_uu / dev;
         if (z < 1.0e6) best = 1.0 / z;
@@ -1306,7 +1382,7 @@ float resolve_invz(float2 uv) {
         [unroll]
         for (int a = 0; a < 8; ++a) {
             float ang = (float)a * 0.785398163; // 2*pi/8
-            float2 duv = saturate(uv + float2(cos(ang) * r * aspect_xy, sin(ang) * r));
+            float2 duv = saturate(sc + float2(cos(ang) * r * aspect_xy, sin(ang) * r));
             float d = scene_depth.SampleLevel(samp, float2(duv.x * hud_depth_uscale, duv.y), 0).r;
             if (d > 1e-9) {
                 float z = hud_nearz_uu / d;

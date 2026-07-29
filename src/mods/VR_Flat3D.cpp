@@ -45,6 +45,11 @@
 #define WM_DPICHANGED 0x02E0
 #endif
 
+// Set when the client-rect spoof installs — lets UEVR's OWN modules (e.g. the
+// ImGui Win32 backend) read the REAL window size, bypassing the half-width lie
+// we tell the game engine. Null until the spoof engages.
+bool (*g_flat3d_real_client_rect_fn)(HWND, LPRECT) = nullptr;
+
 namespace {
 // --- DPI spoof (Native Output) ----------------------------------------------
 // Main.cpp makes the PROCESS per-monitor-DPI-aware at inject time — pixel-exact
@@ -160,6 +165,80 @@ void flat3d_flush_engine_dpi_cache(HWND wnd, int x, int y, LONG w, LONG h) {
     });
 }
 
+// --- Client-rect spoof (Half-SbS + Stretch / "Native Render + Upscale") -----
+// The engine sizes its scene render from the game WINDOW's client rect. To keep
+// a game rendering at its native per-eye width (where it fills the eye) while the
+// real window/swapchain covers the full-SbS panel, we report a HALVED client
+// width to the engine (GetClientRect/GetWindowRect) while the actual window stays
+// full. The compositor then composes the full-width eyes into the full panel —
+// full-SbS sharpness. Our OWN code reads the real rect through the hook original.
+std::atomic<bool> g_flat3d_clientspoof_active{false};
+std::atomic<HWND> g_flat3d_clientspoof_hwnd{nullptr};
+SafetyHookInline g_clientrect_hook{};
+SafetyHookInline g_windowrect_hook{};
+
+// Halve the width of a rect in place (keep the left/top origin).
+static void flat3d_halve_rect_width(LPRECT r) {
+    if (r != nullptr) {
+        r->right = r->left + (r->right - r->left) / 2;
+    }
+}
+
+static bool flat3d_should_spoof(HWND wnd) {
+    return g_flat3d_clientspoof_active.load(std::memory_order_relaxed) &&
+           wnd != nullptr && wnd == g_flat3d_clientspoof_hwnd.load(std::memory_order_relaxed);
+}
+
+BOOL WINAPI flat3d_spoofed_get_client_rect(HWND wnd, LPRECT rect) {
+    const BOOL ok = g_clientrect_hook.unsafe_call<BOOL>(wnd, rect);
+    if (ok && flat3d_should_spoof(wnd)) {
+        flat3d_halve_rect_width(rect);
+    }
+    return ok;
+}
+
+BOOL WINAPI flat3d_spoofed_get_window_rect(HWND wnd, LPRECT rect) {
+    const BOOL ok = g_windowrect_hook.unsafe_call<BOOL>(wnd, rect);
+    if (ok && flat3d_should_spoof(wnd)) {
+        flat3d_halve_rect_width(rect);
+    }
+    return ok;
+}
+
+// Real (unspoofed) client rect for our own window-management logic.
+bool flat3d_real_client_rect(HWND wnd, LPRECT rect) {
+    if (g_clientrect_hook) {
+        return g_clientrect_hook.unsafe_call<BOOL>(wnd, rect) != FALSE;
+    }
+    return GetClientRect(wnd, rect) != FALSE;
+}
+
+bool flat3d_install_clientrect_spoof() {
+    static bool attempted = false;
+    static bool installed = false;
+    if (attempted) {
+        return installed;
+    }
+    attempted = true;
+
+    if (auto* user32 = GetModuleHandleW(L"user32.dll")) {
+        if (auto p = GetProcAddress(user32, "GetClientRect")) {
+            g_clientrect_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_spoofed_get_client_rect);
+        }
+        if (auto p = GetProcAddress(user32, "GetWindowRect")) {
+            g_windowrect_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_spoofed_get_window_rect);
+        }
+    }
+
+    installed = (bool)g_clientrect_hook;
+    if (installed) {
+        g_flat3d_real_client_rect_fn = &flat3d_real_client_rect; // UEVR-side bypass
+    }
+    spdlog::info("[Flat3D] Client-rect spoof hooks: GetClientRect={} GetWindowRect={}",
+                 (bool)g_clientrect_hook, (bool)g_windowrect_hook);
+    return installed;
+}
+
 // Current + native (max) resolution of the monitor hosting hwnd. Native is
 // cached per display device (EnumDisplaySettings walk).
 struct Flat3DDisplayInfo {
@@ -173,7 +252,14 @@ struct Flat3DDisplayInfo {
 };
 
 std::optional<Flat3DDisplayInfo> query_display_info(HWND hwnd) {
-    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    // 3D users keep the 3D panel as primary; targeting the primary monitor
+    // rather than the window's current monitor makes the native-output hold
+    // deterministic and nullifies the origin/resolution a wrong-monitor launch
+    // would otherwise inherit (P3R: a 2160-monitor launch latched a 3840-wide
+    // per-eye render that never re-derived after the move to the SbS display).
+    HMONITOR mon = VR::get()->flat3d_output_on_primary()
+                       ? MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY)
+                       : MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     MONITORINFOEXA mi{};
     mi.cbSize = sizeof(mi);
 
@@ -1145,11 +1231,66 @@ void VR::update_flat3d_params() {
             target_y = di->origin_y;
         }
 
+        // Auto-detect FULL-SbS: SbS output on a genuine double-wide panel (~32:9,
+        // each eye a 16:9 half). Only there do we run Native Render + Upscale —
+        // spoof the engine to render each eye at its native (half-panel) width
+        // and upscale into the full-width output, so nothing squishes and games
+        // that collapse to half-an-eye at 32:9 (P3R) render full. On a normal or
+        // half-SbS panel (16:9) the game already renders 16:9, so this stays off.
+        const bool full_sbs = (mode == vrmod::flat3d::Flat3DOutputMode::SBS) &&
+                              swap_h != 0 && ((float)swap_w / (float)swap_h) >= 2.5f;
+        m_flat3d_full_sbs.store(full_sbs, std::memory_order_release);
+        const bool half_stretch = full_sbs;
+
+        // The swapchain/window stay at FULL native even in half_stretch — the
+        // panel must be fully driven for real full-SbS output. What half_stretch
+        // changes is that the ENGINE reads a HALVED client rect (spoof, below),
+        // so it renders each eye at native width while the output is full.
         if (auto& h12 = g_framework->get_d3d12_hook(); h12 != nullptr) {
             h12->set_forced_resize(swap_w, swap_h);
         }
         if (auto& h11 = g_framework->get_d3d11_hook(); h11 != nullptr) {
             h11->set_forced_resize(swap_w, swap_h);
+        }
+
+        // Engage the client-rect spoof: report half the panel width to the
+        // engine so it keeps rendering at its native per-eye resolution.
+        if (half_stretch) {
+            if (const auto wnd = g_framework->get_window(); wnd != nullptr) {
+                if (!g_flat3d_clientspoof_active.load(std::memory_order_acquire)) {
+                    flat3d_install_clientrect_spoof();
+                    g_flat3d_clientspoof_hwnd.store(wnd, std::memory_order_release);
+                    g_flat3d_clientspoof_active.store(true, std::memory_order_release);
+                    spdlog::info("[Flat3D] Native Render + Upscale: client-rect spoof engaged "
+                                 "(engine sees half width, output stays full)");
+
+                    // Startup fix — ONLY for a game that BOOTED at the full 32:9
+                    // (its scene targets baked at full width; the spoof can't
+                    // retroactively shrink them). Re-apply the resolution at HALF
+                    // (windowed) once so the engine re-bakes at native per-eye
+                    // width. If the game is ALREADY at ~half (booted windowed —
+                    // the path that works), we do NOTHING: some titles (P3R)
+                    // fight r.SetRes, so touching them when they're already
+                    // correct breaks them.
+                    const uint32_t rebake_w = swap_w / 2u;
+                    const auto rt = g_framework->get_rt_size();
+                    const bool booted_full = (uint32_t)rt.x > rebake_w; // wider than half-native
+                    if (booted_full) {
+                        const uint32_t rebake_h = swap_h;
+                        GameThreadWorker::get().enqueue([rebake_w, rebake_h]() {
+                            if (auto* engine = sdk::UEngine::get(); engine != nullptr) {
+                                const std::wstring cmd = L"r.SetRes " + std::to_wstring(rebake_w) +
+                                                         L"x" + std::to_wstring(rebake_h) + L"w";
+                                engine->exec(cmd.c_str());
+                            }
+                        });
+                        spdlog::info("[Flat3D] Native Render + Upscale: booted at {}x{} — re-baking "
+                                     "engine at {}x{} windowed", (uint32_t)rt.x, (uint32_t)rt.y, rebake_w, swap_h);
+                    }
+                }
+            }
+        } else if (g_flat3d_clientspoof_active.load(std::memory_order_acquire)) {
+            g_flat3d_clientspoof_active.store(false, std::memory_order_release);
         }
 
         // Engage the DPI lie before any resolution nudging: with every
@@ -1190,7 +1331,7 @@ void VR::update_flat3d_params() {
             static std::chrono::steady_clock::time_point last_nudge{};
             static int nudge_attempts = 0;
 
-            if (bb_w != 0 && (bb_w != swap_w || bb_h != swap_h)) {
+            if (!half_stretch && bb_w != 0 && (bb_w != swap_w || bb_h != swap_h)) {
                 const auto now = std::chrono::steady_clock::now();
 
                 // r.SetRes resizes within a frame or two on the games we target,
@@ -1290,7 +1431,7 @@ void VR::update_flat3d_params() {
 
                 const auto near_eq = [](uint32_t a, uint32_t b) { return (a > b ? a - b : b - a) <= 2; };
 
-                if (scale > 1.01f && compensate_attempts < 2 &&
+                if (!half_stretch && scale > 1.01f && compensate_attempts < 2 &&
                     bb_w == swap_w && bb_h == swap_h && believed_w != 0 &&
                     near_eq(believed_w, (uint32_t)std::lround(swap_w * scale)) &&
                     near_eq(believed_h, (uint32_t)std::lround(swap_h * scale)))
@@ -1355,7 +1496,9 @@ void VR::update_flat3d_params() {
             const auto wnd = g_framework->get_window();
             RECT client{};
 
-            if (wnd != nullptr && GetClientRect(wnd, &client)) {
+            // Use the REAL client rect (bypass the half-width spoof) so our own
+            // window management still sees the true full-panel size.
+            if (wnd != nullptr && flat3d_real_client_rect(wnd, &client)) {
                 const auto client_w = (uint32_t)(client.right - client.left);
                 const auto client_h = (uint32_t)(client.bottom - client.top);
 
@@ -1586,6 +1729,9 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     // rendered half + the warped discrete texture) instead of reusing the stale eye.
     p.warp_frame = is_using_afw();
     p.afr_frame = is_using_afr() && !p.warp_frame;
+    // Native Render + Upscale (auto full-SbS): UI is drawn at the perceived
+    // half-width, top-left, so the compositor samples that region.
+    p.ui_topleft_crop = m_flat3d_full_sbs.load(std::memory_order_acquire);
     // afr_left_eye stays meaningful under warp_frame: which eye the engine rendered.
     p.afr_left_eye = (is_using_afr() || p.warp_frame) && (m_render_frame_count % 2 == m_left_eye_interval);
     // Synced Sequential renders matched same-game-state eye pairs; the pair
@@ -1881,6 +2027,14 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
         RECT client{};
         const auto wnd = g_framework->get_window();
 
+        // Divide by the SPOOFED (perceived) client width so the cursor maps over
+        // the same logical space the game lays its UI / hit-testing in. Under
+        // Native Render + Upscale the engine perceives a half-width client, so
+        // its clickable UI lives in the physical left half; mapping pt.x over
+        // that perceived width makes the drawn cursor span the full eye and line
+        // up with where clicks register (a real 3840 divisor only reached the
+        // left half of the eye). Plain GetClientRect == real width when the spoof
+        // is off (16:9), so this is a no-op there.
         if (wnd != nullptr && GetCursorPos(&pt) && ScreenToClient(wnd, &pt) &&
             GetClientRect(wnd, &client) && client.right > 0 && client.bottom > 0) {
             const float cu = (float)pt.x / (float)client.right;

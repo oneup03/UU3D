@@ -7,10 +7,62 @@
 #include <hooks/D3D12Hook.hpp>
 
 #include "../../VR.hpp"
+#include "../flat3d/Flat3DShaders.hpp"
 
 #include "Flat3D.hpp"
 
 namespace runtimes {
+namespace {
+// Each output mode gives each EYE a slice of the composited output. When the
+// game renders a DOUBLE-WIDE frame (full-SbS: a 3840x1080 = 32:9 render that
+// gets split into two 16:9 halves) the per-eye render must carry the half's
+// aspect, or the composite squishes it 2x. SbS splits width, TaB splits height.
+//
+// But we must NOT split a HALF-packed target: half-SbS renders a normal 16:9
+// frame, packs each eye into a 960x1080 half, and the 3D display's own hardware
+// STRETCHES each half back to full width — there the eye is correctly the full
+// backbuffer width and the composite squish is undone by the display. Splitting
+// it would shrink the eye to 8:9 and halve its horizontal resolution.
+//
+// The two cases are told apart by the RESULT: splitting a double-wide frame
+// yields a normal landscape per-eye aspect (~16:9); "splitting" a half-packed
+// frame yields an implausible portrait/ultrawide aspect. Only split when the
+// result stays in a plausible single-eye landscape band. Interlaced /
+// checkerboard / anaglyph / Katanga carry a full-frame eye, so never split.
+void apply_eye_split(uint32_t& w, uint32_t& h) {
+    if (w == 0 || h == 0) {
+        return;
+    }
+
+    using Mode = vrmod::flat3d::Flat3DOutputMode;
+    const auto m = (Mode)VR::get()->flat3d_output_mode_value();
+
+    const bool sbs_like = m == Mode::SBS || m == Mode::LEIA_SR ||
+                          m == Mode::DUAL_DISPLAY || m == Mode::DUAL_DISPLAY_FLIP;
+    const bool tab_like = m == Mode::TAB || m == Mode::FRAMEPACKED_720P60 ||
+                          m == Mode::FRAMEPACKED_1080P24 || m == Mode::FRAMEPACKED_1080P60;
+
+    // Plausible per-eye aspect band for a real display. Outside it, the "split"
+    // result is nonsense => the frame is half-packed, leave it (display stretch
+    // handles the un-squish). Keep dimensions even so the double-wide and
+    // interlaced/checkerboard patterns still divide cleanly.
+    constexpr float kMinAspect = 1.2f; // narrower (portrait-ish) => half-SbS
+    constexpr float kMaxAspect = 2.5f; // wider (ultrawide-ish)   => half-TaB
+
+    if (sbs_like) {
+        const float split_aspect = ((float)w * 0.5f) / (float)h;
+        if (split_aspect >= kMinAspect && split_aspect <= kMaxAspect) {
+            w = std::max<uint32_t>(128, (w / 2) & ~1u);
+        }
+    } else if (tab_like) {
+        const float split_aspect = (float)w / ((float)h * 0.5f);
+        if (split_aspect >= kMinAspect && split_aspect <= kMaxAspect) {
+            h = std::max<uint32_t>(128, (h / 2) & ~1u);
+        }
+    }
+}
+} // namespace
+
 VRRuntime::Error Flat3D::update_render_target_size() {
     // The output is the game's own swapchain, held at the display's native
     // size (VR_Flat3D.cpp native-output block); the game's REQUESTED
@@ -60,6 +112,9 @@ VRRuntime::Error Flat3D::update_render_target_size() {
         this->w = std::max<uint32_t>(128, ((uint32_t)std::lround(native_w * scale)) & ~1u);
         this->h = std::max<uint32_t>(128, ((uint32_t)std::lround(native_h * scale)) & ~1u);
 
+        // The scale fraction is of the FULL native output; give each eye its
+        // per-mode slice so the composite doesn't stretch it.
+        apply_eye_split(this->w, this->h);
         return VRRuntime::Error::SUCCESS;
     }
 
@@ -77,6 +132,11 @@ VRRuntime::Error Flat3D::update_render_target_size() {
         this->w = 1920;
         this->h = 1080;
     }
+
+    // The game requests a resolution that fills the (forced) output window, so
+    // its aspect is the WHOLE output's — split it down to the per-eye slice
+    // (e.g. a 3840x1080 SbS window renders each eye at 1920x1080, not 3840).
+    apply_eye_split(this->w, this->h);
 
     return VRRuntime::Error::SUCCESS;
 }

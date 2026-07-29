@@ -2,7 +2,9 @@
 // submit (see D3D11Component_Flat3D.cpp for the D3D11 counterpart). Own TU
 // to keep the upstream D3D12Component.cpp diff to a single branch line.
 
+#include <cmath>
 #include <filesystem>
+#include <thread>
 
 #include <utility/Logging.hpp>
 #include <utility/String.hpp>
@@ -343,6 +345,62 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
         }
     }
 
+    // --- UI aspect / top-left crop -----------------------------------------
+    // Each output mode gives each EYE a slice of the backbuffer. The UI overlay
+    // is reconciled to that eye so it isn't squished, and under Native Render +
+    // Upscale it's sampled from the top-left perceived region (see below).
+    {
+        const auto m = (flat3d::Flat3DOutputMode)params.mode;
+        const bool sbs_like = m == flat3d::Flat3DOutputMode::SBS ||
+                              m == flat3d::Flat3DOutputMode::LEIA_SR ||
+                              m == flat3d::Flat3DOutputMode::DUAL_DISPLAY ||
+                              m == flat3d::Flat3DOutputMode::DUAL_DISPLAY_FLIP;
+        const bool tab_like = m == flat3d::Flat3DOutputMode::TAB ||
+                              m == flat3d::Flat3DOutputMode::FRAMEPACKED_720P60 ||
+                              m == flat3d::Flat3DOutputMode::FRAMEPACKED_1080P24 ||
+                              m == flat3d::Flat3DOutputMode::FRAMEPACKED_1080P60;
+        const float eye_slice_w = sbs_like ? (float)bb_desc.Width * 0.5f : (float)bb_desc.Width;
+        const float eye_slice_h = tab_like ? (float)bb_desc.Height * 0.5f : (float)bb_desc.Height;
+
+        const float scene_aspect = eye_h > 0 ? (float)eye_w / (float)eye_h : 0.0f;
+
+        uint64_t ui_w = 0; uint32_t ui_h = 0; float ui_aspect = 0.0f;
+        if (auto* ui_native = (ID3D12Resource*)(vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target()
+                                    ? vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target()->get_native_resource()
+                                    : nullptr)) {
+            const auto d = ui_native->GetDesc();
+            ui_w = d.Width; ui_h = d.Height;
+            ui_aspect = ui_h > 0 ? (float)ui_w / (float)ui_h : 0.0f;
+        }
+
+        // Reconcile the UI-target aspect to the EYE-TEXTURE aspect (scene_aspect =
+        // eye_w/eye_h) — NOT the output slice. The overlay is drawn into the eye
+        // texture (the same surface the scene fills), so the eye aspect is the
+        // right reference. Using the slice would wrongly crop packed modes
+        // (half-SbS/half-TaB) where the slice is squished and the display
+        // stretches it back. crop<1 = cover (central crop), crop>1 = contain
+        // (letterbox); when ui_aspect==eye_aspect all modes are a no-op.
+        if (params.ui_topleft_crop && ui_w > 0 && ui_h > 0) {
+            // Native Render + Upscale: the game/menu draw their UI at the
+            // PERCEIVED client size (the client-rect spoof's half-panel width x
+            // full height = eye_slice_w x eye_slice_h) into the TOP-LEFT of a
+            // full-width target — sample exactly that region from the origin
+            // (draw_layer anchors it at 0). NOTE: use the perceived size, NOT the
+            // eye RENDER size — a game that renders its scene below native
+            // (DLSS/dynamic-res, e.g. Jedi Survivor at 960x540) still draws its
+            // UI at the full perceived 1920x1080, so eye_w would crop it too tight.
+            const float cx = eye_slice_w / (float)ui_w;
+            const float cy = eye_slice_h / (float)ui_h;
+            params.ui_crop_x = cx < 1.0f ? cx : 1.0f;
+            params.ui_crop_y = cy < 1.0f ? cy : 1.0f;
+        } else {
+            // Non-full-SbS: ui_aspect ~= eye aspect, so this is a no-op central
+            // crop (full-SbS goes through the top-left branch above).
+            vrmod::flat3d::compute_ui_aspect_crop(
+                0, ui_aspect, scene_aspect, params.ui_crop_x, params.ui_crop_y);
+        }
+    }
+
     // SceneDepthZ for the adaptive crosshair / auto-convergence and/or the
     // depth-adaptive HUD mode.
     ComPtr<ID3D12Resource> scene_depth{};
@@ -524,6 +582,9 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
 
         if (m_flat3d_compositor.save_screenshot(hook->get_command_queue(), params, parallel_path, crossview_path)) {
             spdlog::info("[Flat3D] Saved 3D screenshot: {}", utility::narrow(parallel_path));
+            // Success chime (mirrors VRto3D's BeepSuccess). Detached: Beep()
+            // blocks for its full duration and this runs on the present thread.
+            std::thread([] { Beep(400, 400); }).detach();
         } else {
             SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Screenshot save failed");
         }

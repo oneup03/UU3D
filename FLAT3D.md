@@ -70,6 +70,22 @@ passthrough.
 > turn down the **in-game** resolution (or resolution scale) — that path is
 > upscaled correctly and won't break interlaced/checkerboard modes.
 
+### Full-width side-by-side panels (32:9)
+
+Some 3D displays are a single ultra-wide panel — e.g. 3840×1080 (32:9), where
+each eye is a full 16:9 half. When **Side by Side** is selected on a panel wider
+than ~2.5:1, UU3D detects this automatically and switches to **Native Render +
+Upscale**: the game is told its window is one eye wide (via a client-rect
+spoof), so it renders each eye at native 16:9 instead of being squeezed to 32:9,
+and the two eyes are composited back across the full panel. The result is full
+per-eye sharpness with no configuration. It's a no-op on ordinary half-width SbS
+displays (1920×1080), where the display itself stretches each half.
+
+Because the engine believes its window is one eye wide, the game's UI, the UU3D
+menu and the mouse cursor are all authored at that perceived per-eye size and
+composited into each eye — see the limitation in *Compatibility notes* for the
+rare title that ignores this.
+
 ## 3D Calibration
 
 Three settings form one calibrated set, saved together per game:
@@ -259,6 +275,13 @@ channel **Lift / Gamma / Gain** sliders. SDR output only (ignored under HDR).
 - Games that need **AHUD UI compatibility** (UI drawn via the viewport
   render target, e.g. P3R) can look overly transparent — see **UI Invert
   Alpha** and **UI Color Gate** on the main Compatibility page.
+- On a **full-width (32:9) SbS panel** (see *Full-width side-by-side panels*
+  above), a title that draws its UI across the *entire physical panel* rather
+  than the per-eye area — e.g. *FF7 Rebirth*, whose menu composites full-width —
+  can't be cropped down to a single eye, so that UI is stretched across the
+  pair. The in-game HUD, which respects the perceived per-eye size, is
+  unaffected, and standard 16:9 displays are never affected. There is no
+  per-game fix for this today.
 - Both UE4 (float) and UE5 (double-precision) projection paths are supported.
 - Quick sanity check: Side by Side with Depth 0 gives two identical halves;
   raise Depth and nearer-than-convergence objects show crossed disparity (use

@@ -467,13 +467,29 @@ void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool
 
         auto draw_layer = [&](int32_t layer, float shift_uv, float scale, float center_x, float center_y) {
             OverlayConstants oc{};
-            oc.uv_scale[0] = 1.0f / scale;
-            // Vertical: only the symmetric-mode crop-map compensation — the
-            // depth shift is horizontal, so a vertical fit-shrink would just
-            // letterbox the overlay (black bars on fullscreen UIs).
-            oc.uv_scale[1] = params.scene_scale;
-            oc.uv_offset[0] = 0.5f - (0.5f + shift_uv) / scale;
-            oc.uv_offset[1] = 0.5f * (1.0f - params.scene_scale);
+            // Central aspect crop of the GAME-UI texture only (layers 0/1): the
+            // game constrains its HUD to a central slice matching the eye aspect,
+            // so sample that slice instead of the whole (wider/taller) target.
+            // Other layers (menu, cursor) are authored at eye aspect => no crop.
+            // Native Render + Upscale: the game HUD (0/1) AND the UEVR menu (3)
+            // draw at the perceived half width into the TOP-LEFT of a full-width
+            // target — sample that top-left region (anchor 0), not the centre.
+            const bool topleft = params.ui_topleft_crop && (layer == 0 || layer == 1 || layer == 3);
+            const bool crop_layer = (layer == 0 || layer == 1) || topleft;
+            const float crop_x = crop_layer ? params.ui_crop_x : 1.0f;
+            const float crop_y = crop_layer ? params.ui_crop_y : 1.0f;
+            // The UI's center within the target: central (0.5) normally, or the
+            // centre of the TOP-LEFT crop region (crop/2) under Native Render +
+            // Upscale. Everything else — the fit-squish `scale`, the vertical
+            // scene_scale, and the per-eye depth shift — is applied about that
+            // centre, so the GUI still stays on-screen and squishes at depth.
+            // (For central, crop*0.5 collapses to 0.5 => identical to before.)
+            const float ui_cx = topleft ? crop_x * 0.5f : 0.5f;
+            const float ui_cy = topleft ? crop_y * 0.5f : 0.5f;
+            oc.uv_scale[0] = crop_x / scale;
+            oc.uv_scale[1] = crop_y * params.scene_scale;
+            oc.uv_offset[0] = ui_cx - crop_x * (0.5f + shift_uv) / scale;
+            oc.uv_offset[1] = ui_cy - 0.5f * crop_y * params.scene_scale;
             oc.color[0] = laser[0];
             oc.color[1] = laser[1];
             oc.color[2] = laser[2];
@@ -490,10 +506,16 @@ void Flat3DCompositorD3D12::record_overlays(ID3D12GraphicsCommandList* cmd, bool
             oc.dot_radius_px = (layer == 4) ? params.cursor_size_px : params.crosshair_size_px;
             oc.eye_width_px = (float)m_eye_w;
             oc.eye_height_px = (float)m_eye_h;
-            // Low 4 bits = mode; high bits = dilation radius in tiles.
+            // Low 4 bits = mode; bits 4..7 = x-dilation tiles, bits 8..11 = y.
+            // Fraction-of-screen-WIDTH radius -> MASK TILES per axis (grid 64x36),
+            // with the central UI crop folded in so the neighbourhood keeps a
+            // fixed on-screen shape: x needs *crop_x, y needs *crop_y.
             const int32_t base_mode = (layer == 0) ? ((hud_mode == 1 && params.hud_debug) ? 3 : hud_mode) : 0;
-            const int32_t dilate_tiles = std::clamp((int32_t)std::lround(params.hud_icon_radius * 64.0f), 1, 8);
-            oc.hud_mode = base_mode | (dilate_tiles << 4);
+            const int32_t tiles_x = std::clamp(
+                (int32_t)std::lround(params.hud_icon_radius * 64.0f * params.ui_crop_x), 1, 8);
+            const int32_t tiles_y = std::clamp(
+                (int32_t)std::lround(params.hud_icon_radius * 36.0f * params.ui_crop_y), 1, 15);
+            oc.hud_mode = base_mode | (tiles_x << 4) | (tiles_y << 8);
             // Vertical stem reach (depth-adaptive only): signed extra dilation
             // tiles (>0 down, <0 up), capped so the loop stays bounded.
             oc.hud_stem_reach = (layer == 0 && hud_mode == 1)
@@ -1010,9 +1032,16 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
 
             cmd->SetPipelineState(m_classify_pso.Get());
 
+            // The classify pass runs in UI-TARGET uv, but flow and the user's
+            // region settings are authored in SCREEN (eye) uv. The overlay reads
+            // a central crop of the UI, so map screen->UI: extent *= crop; an
+            // off-centre position re-centres about 0.5.
+            const float cropx = params.ui_crop_x;
+            const float cropy = params.ui_crop_y;
+
             HudClassifyConstants cc{};
-            cc.flow_uv[0] = params.hud_flow_du;
-            cc.flow_uv[1] = params.hud_flow_dv;
+            cc.flow_uv[0] = params.hud_flow_du * cropx;
+            cc.flow_uv[1] = params.hud_flow_dv * cropy;
             cc.blend_alpha = 0.15f;
             cc.flow_valid = (params.hud_flow_valid && m_hud_prev_valid) ? 1 : 0;
             cc.translating = (params.hud_translating && m_hud_prev_valid) ? 1 : 0;
@@ -1022,16 +1051,16 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
             cc.rot_move_gate = params.hud_rot_gate;
             cc.occ_gate = params.hud_occ_gate;
             cc.halo_tiles = (float)params.hud_halo_tiles;
-            cc.occ_safe_hw = params.hud_occ_safe_hw;
-            cc.occ_safe_hh = params.hud_occ_safe_hh;
+            cc.occ_safe_hw = params.hud_occ_safe_hw * cropx;
+            cc.occ_safe_hh = params.hud_occ_safe_hh * cropy;
             cc.fill_radius = params.hud_fill_radius;
             cc.fill_gate = params.hud_fill_gate;
             cc.excl_count = params.hud_excl_count;
             for (int e = 0; e < 4; ++e) {
-                cc.excl[e][0] = params.hud_excl[e][0];
-                cc.excl[e][1] = params.hud_excl[e][1];
-                cc.excl[e][2] = params.hud_excl[e][2];
-                cc.excl[e][3] = params.hud_excl[e][3];
+                cc.excl[e][0] = 0.5f + (params.hud_excl[e][0] - 0.5f) * cropx;
+                cc.excl[e][1] = 0.5f + (params.hud_excl[e][1] - 0.5f) * cropy;
+                cc.excl[e][2] = params.hud_excl[e][2] * cropx;
+                cc.excl[e][3] = params.hud_excl[e][3] * cropy;
             }
 
             cc.ui_invert_alpha = params.ui_invert_alpha;
@@ -1194,7 +1223,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
             dc.hud_depth_uscale = m_hud_depth_uscale;
             dc.hud_nearz_uu = params.hud_nearz_uu;
             dc.aspect_xy = (float)m_eye_h / (float)m_eye_w; // eye_h/eye_w
-            dc.pad_ = 0.0f;
+            dc.ui_crop_x = params.ui_crop_x;
+            dc.ui_crop_y = params.ui_crop_y;
 
             const auto gpu_start = m_srv_heap->GetGPUDescriptorHandleForHeapStart();
 
@@ -1205,7 +1235,7 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
                 const size_t base_slot = (read_src == 0) ? 7 : 10;      // block A / block B
 
                 dc.pass_idx = (int32_t)k;
-                cmd->SetGraphicsRoot32BitConstants(0, 8, &dc, 0);
+                cmd->SetGraphicsRoot32BitConstants(0, 9, &dc, 0); // through ui_crop_y (dword 8)
 
                 barrier(cmd, m_huddepth_tex[write_idx].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_RENDER_TARGET);
