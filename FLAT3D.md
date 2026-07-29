@@ -103,7 +103,7 @@ overridden — only the stereo shear is injected into its own projection.
 Hotkeys (hold to repeat): **Ctrl+F3 / F4** depth −/+, **Ctrl+F5 / F6**
 convergence −/+. **Ctrl+F12** (or the **Take 3D Screenshot** button at the
 top of the menu) saves the composited stereo pair — the game, its own HUD, the
-crosshair and the stereo cursor at the current convergence, with only the UEVR
+crosshair and the stereo cursor at the current convergence, with only the UU3D
 menu hidden for the capture and both eyes valid even under AFR — as two PNGs
 under `<persistent>/flat3d_screenshots/`, regardless of the on-screen output
 mode: a canonical parallel-view (`sbs_<timestamp>.png`, left|right) and a
@@ -275,6 +275,12 @@ channel **Lift / Gamma / Gain** sliders. SDR output only (ignored under HDR).
 - Games that need **AHUD UI compatibility** (UI drawn via the viewport
   render target, e.g. P3R) can look overly transparent — see **UI Invert
   Alpha** and **UI Color Gate** on the main Compatibility page.
+- **Recommended: add `-nohmd` to the game's launch arguments.** Titles with
+  their own **native HMD/OpenXR stereo path** can misbehave when UU3D drives
+  stereo — either the game HUD/UI disappears (e.g. *Stellar Blade*), or the
+  game tries to start up SteamVR/an HMD on launch (e.g. *Storybook*). `-nohmd`
+  forces the game to mono so UU3D drives stereo cleanly — add **`-noxr`** as
+  well if needed.
 - On a **full-width (32:9) SbS panel** (see *Full-width side-by-side panels*
   above), a title that draws its UI across the *entire physical panel* rather
   than the per-eye area — e.g. *FF7 Rebirth*, whose menu composites full-width —
