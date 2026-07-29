@@ -2404,7 +2404,19 @@ void VR::on_draw_sidebar_flat3d() {
     if (ImGui::TreeNode("Auto-Convergence")) {
         m_flat3d_autoconv_enabled->draw("Enable");
         m_flat3d_autoconv_target_disparity->draw("Target Disparity");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Pop-out budget: the max screen disparity the nearest object is\n"
+                              "allowed (fraction of eye width). Lower = flatter/safer (pulls the\n"
+                              "screen plane in sooner to cap pop-out); higher = lets near objects\n"
+                              "pop further before convergence reacts.");
+        }
         m_flat3d_autoconv_smoothing->draw("Smoothing");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How fast convergence chases its target (per-frame lerp). Higher =\n"
+                              "snappier, lower = gentler/slower. Smoothed in 1/convergence space\n"
+                              "so the pull-in stays even instead of lunging as the plane gets\n"
+                              "close.");
+        }
         m_flat3d_autoconv_min_conv->draw("Min Convergence");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Auto-convergence never pulls the screen plane closer than this.\n"
@@ -2520,9 +2532,14 @@ void VR::on_draw_sidebar_flat3d() {
             }
             m_flat3d_hud_debug->draw("Show Classification (debug)");
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Tints the HUD by its classification: red = world-anchored\n"
-                                  "(gets scene depth), green = static (stays flat). Look around\n"
-                                  "to train it.");
+                ImGui::SetTooltip("Tints the HUD by its classification. Look around to train it.\n"
+                                  "  red     = world-anchored (gets scene depth)\n"
+                                  "  green   = plain static HUD (stays flat)\n"
+                                  "  blue    = suppressed: permanent panel (occupancy/halo)\n"
+                                  "  yellow  = suppressed: large-UI-fill reject\n"
+                                  "  magenta = inside an exclusion zone\n"
+                                  "Use the blue/yellow/magenta tints to see WHICH rejection rule\n"
+                                  "flattened a tile while tuning the options below.");
             }
 
             if (ImGui::TreeNode("False-Positive Rejection")) {
@@ -2538,6 +2555,14 @@ void VR::on_draw_sidebar_flat3d() {
                 if (m_flat3d_hud_occlude_panels->value()) {
                     ImGui::Indent();
                     m_flat3d_hud_occ_gate->draw("Panel Occupancy");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("How consistently a tile must be covered to be called a\n"
+                                          "permanent panel and forced flat. Occupancy rises slowly and\n"
+                                          "decays fast, so only tiles covered nearly every frame reach\n"
+                                          "it. Lower = flatten panels sooner/more eagerly (risks\n"
+                                          "grabbing a lingering marker); higher = only rock-solid\n"
+                                          "fixtures flatten. Shown blue in the debug view.");
+                    }
                     m_flat3d_hud_panel_halo->draw("Panel Halo (tiles)");
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Grows the flat region a few tiles past a panel edge so\n"
@@ -2579,12 +2604,24 @@ void VR::on_draw_sidebar_flat3d() {
                 }
 
                 m_flat3d_hud_trans_gate->draw("Translation Gate");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Evidence a tile must show WHILE YOU STRAFE to be called\n"
+                                      "world-anchored (the weak \"UI changed while walking\" proxy).\n"
+                                      "Higher = stronger motion demanded (fewer false positives, may\n"
+                                      "miss subtle markers); lower = more sensitive.");
+                }
                 m_flat3d_hud_rot_gate->draw("Rotation Gate");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How well a tile must track the predicted LOOK-ROTATION flow to\n"
+                                      "be called world-anchored (the strong, direction-verified\n"
+                                      "signal). Higher = stricter; lower = more sensitive.");
+                }
                 m_flat3d_hud_trans_floor->draw("Translation Floor");
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Raise the gates to demand stronger motion evidence before a\n"
-                                      "tile is called world (fewer false positives, may miss subtle\n"
-                                      "markers). Floor ignores tiny camera drift.");
+                    ImGui::SetTooltip("Dead-band on CAMERA lateral motion: below this you're treated\n"
+                                      "as not translating, so no translation evidence is gathered.\n"
+                                      "Higher = ignores more camera drift/jitter; lower = even tiny\n"
+                                      "movement feeds the Translation Gate.");
                 }
 
                 if (ImGui::TreeNode("Exclusion Zones")) {

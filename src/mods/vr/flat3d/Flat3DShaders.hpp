@@ -314,7 +314,10 @@ struct HudAnchorConstants {
 // Constants for the HUD world/static classification pass (32 dwords; laid out
 // on 16-byte cbuffer rows so the C++ struct matches HLSL packing exactly).
 // Persistent per-tile state lives in the RGBA8 mask: r = world/static class,
-// g = self-animation score, b = occupancy (long-term presence).
+// g = suppression-reason code (debug view only: 0 = none, ~0.35 = permanent
+// panel, ~0.6 = large-fill reject, ~0.9 = exclusion zone), b = occupancy
+// (long-term presence). Only r and b drive depth; g is purely for the Show
+// Classification overlay and never read by the depth/shift passes.
 struct HudClassifyConstants {
     // row 0
     float   flow_uv[2]{0.0f, 0.0f}; // predicted world-content flow (cur ~= prev shifted by this)
@@ -1071,12 +1074,24 @@ float4 ps_main(VSOut input) : SV_Target {
         c.a *= smoothstep(0.0, ui_color_gate, maxc);
     }
 
-    // Classification debug view (hud_mode 3): red = world-anchored, green =
-    // static, tinted over the UI plus a faint full-screen wash so empty
-    // tiles are visible too.
+    // Classification debug view (hud_mode 3), tinted over the UI plus a faint
+    // full-screen wash so empty tiles are visible too. Base call from mask.r
+    // (red = world-anchored, green = static); mask.g carries a suppression-reason
+    // code so you can see WHY a tile is flat:
+    //   red     = world-anchored (gets scene depth)
+    //   green   = plain static HUD
+    //   blue    = suppressed: permanent panel (occupancy/halo)
+    //   yellow  = suppressed: large-UI-fill reject
+    //   magenta = inside an exclusion zone
     if (layer == 0 && HudMode() == 3) {
-        float m = hud_mask.SampleLevel(samp, src_uv, 0).r;
-        float3 cls_color = float3(m, 1.0 - m, 0.0);
+        float4 mm = hud_mask.SampleLevel(samp, src_uv, 0);
+        float m = mm.r;
+        float reason = mm.g;
+        float3 cls_color;
+        if (reason >= 0.75)      cls_color = float3(1.0, 0.0, 1.0);  // exclusion zone
+        else if (reason >= 0.5)  cls_color = float3(1.0, 0.85, 0.0); // large-fill reject
+        else if (reason >= 0.2)  cls_color = float3(0.1, 0.4, 1.0);  // permanent panel
+        else                     cls_color = float3(m, 1.0 - m, 0.0); // world / static
         c.rgb = c.rgb * 0.35 + cls_color * (0.5 * max(c.a, 0.2));
         c.a = max(c.a, 0.2);
     }
@@ -1177,7 +1192,7 @@ float4 ps_main(VSOut input) : SV_Target {
     for (int e = 0; e < excl_count; ++e) {
         float2 d = abs(input.uv - excl[e].xy);
         if (d.x <= excl[e].z && d.y <= excl[e].w) {
-            return float4(0.0, 0.0, occ, 0.0);
+            return float4(0.0, 0.9, occ, 0.0); // g=0.9: exclusion zone (debug)
         }
     }
 
@@ -1252,7 +1267,7 @@ float4 ps_main(VSOut input) : SV_Target {
             }
         }
         if (n > 0.0 && cov / n >= fill_gate) {
-            return float4(lerp(old, 0.0, blend_alpha), 0.0, occ, 0.0);
+            return float4(lerp(old, 0.0, blend_alpha), 0.6, occ, 0.0); // g=0.6: large-fill reject (debug)
         }
     }
 
@@ -1271,7 +1286,7 @@ float4 ps_main(VSOut input) : SV_Target {
     // static evidence; hold the classification so a stationary marker keeps its
     // depth while the camera is still (occupancy still updated above).
     if (flow_valid == 0 && translating == 0) {
-        return float4(old, 0.0, occ, 0.0);
+        return float4(old, om.g, occ, 0.0); // hold class + reason (still camera)
     }
 
     // #2 Permanent-panel halo: dilate saturated occupancy by halo_tiles so a
@@ -1307,10 +1322,12 @@ float4 ps_main(VSOut input) : SV_Target {
     // decay slowly; the static call has to be decisive to pull a tile down.
     float target = old;
     float a = blend_alpha;
+    float reason = 0.0; // debug: 0 = plain world/static, 0.35 = permanent panel
 
     if (permanent) {
         target = 0.0; // #2 permanent fixture / halo -> ease to flat
         a = blend_alpha;
+        reason = 0.35; // g=0.35: permanent panel (debug)
     } else if (rot_world || trans_world) {
         target = 1.0; // world-anchored -> gets scene depth
         a = min(blend_alpha * 3.0, 1.0);
@@ -1319,7 +1336,7 @@ float4 ps_main(VSOut input) : SV_Target {
         a = blend_alpha * 0.4;
     }
 
-    return float4(lerp(old, target, a), 0.0, occ, 0.0);
+    return float4(lerp(old, target, a), reason, occ, 0.0);
 }
 )";
 
