@@ -138,6 +138,27 @@ DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) {
         return fmt;
     }
 }
+
+bool is_srgb_format(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The 8-bit BGRA render-target format the 3D screenshot uses: mirrors the
+// backbuffer's sRGB-ness (so the repack applies the same encode the display
+// does) but is always 8-bit. Rendering into the raw backbuffer format instead
+// would force ScreenGrab through a >8-bit WIC conversion (e.g. R10G10B10A2 ->
+// 32bppBGRA), which washes the gamma out.
+DXGI_FORMAT screenshot_8bit_format(DXGI_FORMAT backbuffer_format) {
+    return is_srgb_format(backbuffer_format) ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                                             : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
 } // namespace
 
 bool Flat3DCompositorD3D11::setup(ID3D11Device* device, uint32_t eye_w, uint32_t eye_h, DXGI_FORMAT eye_format,
@@ -1764,12 +1785,17 @@ bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3D
         m_sbs_w = out_w;
         m_sbs_h = out_h;
 
+        // Concrete (non-typeless) format: a typeless resource can't create the
+        // SRV below, nor be read back by ScreenGrab for the screenshot (fails
+        // with ERROR_NOT_SUPPORTED).
+        const DXGI_FORMAT sbs_format = view_format_for(m_eye_format);
+
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = out_w * 2;
         desc.Height = out_h;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = m_eye_format;
+        desc.Format = sbs_format;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -1780,7 +1806,7 @@ bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3D
         }
 
         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-        srv_desc.Format = m_eye_format;
+        srv_desc.Format = sbs_format;
         srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srv_desc.Texture2D.MipLevels = 1;
 
@@ -1876,25 +1902,129 @@ bool Flat3DCompositorD3D11::save_screenshot(ID3D11DeviceContext* context, const 
         return false;
     }
 
-    // Restore the game's pipeline state on return — the SbS build clobbers it.
+    ComPtr<ID3D11Device> device{};
+    context->GetDevice(&device);
+
+    // The SbS is rendered with the DISPLAY repack config (same colorspace /
+    // src_srgb / correction the screen uses) into an 8-bit RTV that mirrors the
+    // backbuffer's sRGB-ness. Rendering into the raw backbuffer format instead
+    // washes 10-bit (R10G10B10A2) titles out in ScreenGrab's >8-bit WIC
+    // conversion, while _SRGB backbuffers still get their sRGB encode here.
+    const uint32_t ss_w = m_eye_w * 2;
+    const uint32_t ss_h = m_eye_h;
+    const DXGI_FORMAT ss_fmt = screenshot_8bit_format(m_backbuffer_format);
+
+    if (m_screenshot_tex == nullptr || m_screenshot_w != ss_w || m_screenshot_h != ss_h ||
+        m_screenshot_fmt != ss_fmt) {
+        m_screenshot_tex.Reset();
+        m_screenshot_rtv.Reset();
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = ss_w;
+        desc.Height = ss_h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = ss_fmt;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_screenshot_tex))) {
+            spdlog::error("[Flat3D][D3D11] Failed to create screenshot texture");
+            return false;
+        }
+        if (FAILED(device->CreateRenderTargetView(m_screenshot_tex.Get(), nullptr, &m_screenshot_rtv))) {
+            spdlog::error("[Flat3D][D3D11] Failed to create screenshot RTV");
+            m_screenshot_tex.Reset();
+            return false;
+        }
+        m_screenshot_w = ss_w;
+        m_screenshot_h = ss_h;
+        m_screenshot_fmt = ss_fmt;
+    }
+
+    // Restore the game's pipeline state on return — the repack render clobbers it.
     ScopedD3D11State _state{context};
 
-    // Renders the composited pair into m_sbs_tex at native per-eye resolution and
-    // encodes it. Forced to 8-bit BGRA so HDR eye formats normalize (the SbS
-    // build already emits SDR sRGB values). cross=false gives the geometric
-    // left|right pair; cross=true swaps the halves for cross-eyed viewing.
+    // cross=false gives the geometric left|right pair; cross=true swaps the
+    // halves for cross-eyed viewing. Mirrors the display repack (same shaders,
+    // colorspace, src_srgb, correction) with only the mode forced to SbS.
     const auto build_and_save = [&](bool cross, const std::wstring& path) -> bool {
         if (path.empty()) {
             return true;
         }
-        Flat3DFrameParams p = params;
-        p.eye_swap = cross; // eye0 is always the left eye: parallel = no swap
-        if (!build_sbs(context, p, m_eye_w, m_eye_h)) {
-            return false;
+
+        RepackConstants constants{};
+        constants.out_size[0] = (int32_t)m_screenshot_w;
+        constants.out_size[1] = (int32_t)m_screenshot_h;
+        constants.mode = (int32_t)Flat3DOutputMode::SBS;
+        constants.eye_swap = cross ? 1 : 0; // eye0 is always the left eye
+        constants.colorspace = (int32_t)m_colorspace;
+        constants.paper_white = params.paper_white_nits;
+        constants.src_srgb = m_src_srgb ? 1 : 0;
+        constants.correction_enabled = params.correction_enabled ? 1 : 0;
+        for (int i = 0; i < 3; ++i) {
+            constants.lift[i] = params.lift[i];
+            constants.gamma[i] = params.gamma[i];
+            constants.gain[i] = params.gain[i];
         }
+        constants.curve = params.curve;
+        constants.off_low = params.off_low;
+        constants.off_high = params.off_high;
+        constants.off_both = params.off_both;
+        constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
+        constants.scene_scale = params.scene_scale;
+        context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
+
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(m_vs.Get(), nullptr, 0);
+        context->PSSetShader(m_ps.Get(), nullptr, 0);
+        context->GSSetShader(nullptr, nullptr, 0);
+        context->HSSetShader(nullptr, nullptr, 0);
+        context->DSSetShader(nullptr, nullptr, 0);
+
+        ID3D11Buffer* cbs[] = {m_cb.Get()};
+        context->PSSetConstantBuffers(0, 1, cbs);
+
+        ID3D11ShaderResourceView* eye_srvs[] = {m_eye_srv[0].Get(), m_eye_srv[1].Get()};
+        context->PSSetShaderResources(0, 2, eye_srvs);
+
+        ID3D11SamplerState* samplers[] = {m_sampler.Get()};
+        context->PSSetSamplers(0, 1, samplers);
+
+        context->RSSetState(m_rasterizer.Get());
+
+        D3D11_VIEWPORT vp{};
+        vp.Width = (float)m_screenshot_w;
+        vp.Height = (float)m_screenshot_h;
+        vp.MaxDepth = 1.0f;
+        context->RSSetViewports(1, &vp);
+
+        D3D11_RECT sc{0, 0, (LONG)m_screenshot_w, (LONG)m_screenshot_h};
+        context->RSSetScissorRects(1, &sc);
+
+        context->OMSetBlendState(m_blend.Get(), nullptr, 0xFFFFFFFF);
+        context->OMSetDepthStencilState(m_depth.Get(), 0);
+
+        ID3D11RenderTargetView* rtvs[] = {m_screenshot_rtv.Get()};
+        context->OMSetRenderTargets(1, rtvs, nullptr);
+
+        context->Draw(3, 0);
+
+        // Unbind before ScreenGrab copies m_screenshot_tex.
+        ID3D11RenderTargetView* null_rtv[] = {nullptr};
+        context->OMSetRenderTargets(1, null_rtv, nullptr);
+
+        // 24bpp BGR (no alpha): the eye textures carry the game's backbuffer
+        // alpha, which is meaningless and often ~0 (FF7 Rebirth's UI-alpha path
+        // leaves it fully transparent) — an RGBA PNG then reads as all-black in
+        // alpha-respecting viewers. forceSRGB=true tags the PNG sRGB WITHOUT
+        // touching pixels; the 8-bit UNORM target otherwise gets a gAMA=1.0
+        // (linear) stamp that makes color-managed viewers wash the shot out.
         const HRESULT hr = DirectX::SaveWICTextureToFile(
-            context, m_sbs_tex.Get(), GUID_ContainerFormatPng, path.c_str(),
-            &GUID_WICPixelFormat32bppBGRA);
+            context, m_screenshot_tex.Get(), GUID_ContainerFormatPng, path.c_str(),
+            &GUID_WICPixelFormat24bppBGR, nullptr, /*forceSRGB=*/true);
         if (FAILED(hr)) {
             spdlog::error("[Flat3D][D3D11] Screenshot encode failed (hr=0x{:x})", (uint32_t)hr);
             return false;
@@ -1963,7 +2093,7 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
     }
 
     if (m_sr_weaver != nullptr && !m_sr_input_bound) {
-        m_sr_weaver->setInputViewTexture(m_sbs_srv.Get(), (int)m_sbs_w, (int)m_sbs_h, m_eye_format);
+        m_sr_weaver->setInputViewTexture(m_sbs_srv.Get(), (int)m_sbs_w, (int)m_sbs_h, view_format_for(m_eye_format));
         m_sr_input_bound = true;
     }
 
@@ -2095,6 +2225,12 @@ void Flat3DCompositorD3D11::reset() {
     m_coverage_ema = 0.0f;
 
     destroy_leiasr();
+
+    m_screenshot_tex.Reset();
+    m_screenshot_rtv.Reset();
+    m_screenshot_w = 0;
+    m_screenshot_h = 0;
+    m_screenshot_fmt = DXGI_FORMAT_UNKNOWN;
 
     m_eye_w = 0;
     m_eye_h = 0;

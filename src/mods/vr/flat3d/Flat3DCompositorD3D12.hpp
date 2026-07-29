@@ -146,6 +146,7 @@ private:
     ComPtr<ID3D12RootSignature> m_root_sig{};
     ComPtr<ID3D12PipelineState> m_repack_pso{};
     ComPtr<ID3D12PipelineState> m_sbs_pso{}; // repack shader targeting the eye format (LeiaSR input)
+    ComPtr<ID3D12PipelineState> m_screenshot_pso{}; // repack shader targeting an 8-bit RTV (3D screenshot)
     ComPtr<ID3D12PipelineState> m_overlay_pso{};
 
     // Command ring: slot = frame % kRing. Waiting on a slot's fence before
@@ -157,6 +158,17 @@ private:
     // screenshot SbS build — kept off the frame ring so it can't disturb the
     // depth/coverage readback slot bookkeeping.
     d3d12::CommandContext m_screenshot_ctx{};
+
+    // Screenshot SbS target rendered by m_screenshot_pso: an 8-bit RTV mirroring
+    // the backbuffer's sRGB-ness (see screenshot_8bit_format) — the display's
+    // color pipeline, but always 8-bit so ScreenGrab doesn't wash 10-bit titles
+    // out in a WIC conversion. Separate from the LeiaSR eye-format m_sbs_tex;
+    // kept in RENDER_TARGET at rest.
+    ComPtr<ID3D12Resource> m_screenshot_tex{};
+    ComPtr<ID3D12DescriptorHeap> m_screenshot_rtv_heap{};
+    uint32_t m_screenshot_w{0};
+    uint32_t m_screenshot_h{0};
+    DXGI_FORMAT m_screenshot_fmt{DXGI_FORMAT_UNKNOWN};
 
     // 3D screenshot capture state (see begin_screenshot). While active, composite
     // hides the UEVR menu and accumulates which eyes have been refreshed that

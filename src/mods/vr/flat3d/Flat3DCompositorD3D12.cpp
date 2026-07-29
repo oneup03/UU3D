@@ -57,6 +57,27 @@ DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) {
         return fmt;
     }
 }
+
+bool is_srgb_format(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The 8-bit BGRA render-target format the 3D screenshot uses: mirrors the
+// backbuffer's sRGB-ness (so the repack applies the same encode the display
+// does) but is always 8-bit. Rendering into the raw backbuffer format instead
+// would force ScreenGrab through a >8-bit WIC conversion (e.g. R10G10B10A2 ->
+// 32bppBGRA), which washes the gamma out.
+DXGI_FORMAT screenshot_8bit_format(DXGI_FORMAT backbuffer_format) {
+    return is_srgb_format(backbuffer_format) ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                                             : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
 } // namespace
 
 bool Flat3DCompositorD3D12::setup(ID3D12Device* device, uint32_t eye_w, uint32_t eye_h, DXGI_FORMAT eye_format,
@@ -368,6 +389,14 @@ bool Flat3DCompositorD3D12::create_pipelines(ID3D12Device* device) {
     // SbS-build PSO (LeiaSR weaver input): the repack shader targeting the
     // eye format — applies eye swap + SDR color correction to the weave.
     if (!make_pso(repack_vs.Get(), repack_ps.Get(), m_eye_format, false, m_sbs_pso)) {
+        return false;
+    }
+
+    // Screenshot PSO: repack shader into an 8-bit RTV mirroring the backbuffer's
+    // sRGB-ness (see screenshot_8bit_format) — the display's exact color, but
+    // 8-bit so ScreenGrab doesn't wash it through a >8-bit WIC conversion.
+    if (!make_pso(repack_vs.Get(), repack_ps.Get(), screenshot_8bit_format(m_backbuffer_format), false,
+                  m_screenshot_pso)) {
         return false;
     }
 
@@ -1786,7 +1815,10 @@ void Flat3DCompositorD3D12::build_sbs(ID3D12GraphicsCommandList* cmd, const Flat
         desc.Height = out_h;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
-        desc.Format = m_eye_format;
+        // Concrete (non-typeless) format: the weaver already binds this via
+        // view_format_for, and a typeless resource can't be read back by
+        // ScreenGrab for the screenshot (fails with ERROR_NOT_SUPPORTED).
+        desc.Format = view_format_for(m_eye_format);
         desc.SampleDesc.Count = 1;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
@@ -1875,7 +1907,7 @@ void Flat3DCompositorD3D12::build_sbs(ID3D12GraphicsCommandList* cmd, const Flat
 
 bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Flat3DFrameParams& params,
                                             const std::wstring& parallel_path, const std::wstring& crossview_path) {
-    if (!m_ready || queue == nullptr || m_sbs_pso == nullptr ||
+    if (!m_ready || queue == nullptr || m_screenshot_pso == nullptr ||
         m_eye_tex[0] == nullptr || m_eye_tex[1] == nullptr || m_eye_w == 0 || m_eye_h == 0) {
         return false;
     }
@@ -1885,10 +1917,64 @@ bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Fla
         return false;
     }
 
-    // Renders the composited pair into m_sbs_tex (leaving it in PSR) with the
-    // repack shader — cross=false yields the geometric left|right pair, cross=
-    // true swaps the halves — then encodes it. Forced to 8-bit BGRA so HDR eye
-    // formats are normalized (the SbS build already emits SDR sRGB values).
+    // The SbS is rendered with the DISPLAY repack shader (same colorspace /
+    // src_srgb / correction the screen uses) into an 8-bit RTV that mirrors the
+    // backbuffer's sRGB-ness. Rendering into the raw backbuffer format instead
+    // washes 10-bit (R10G10B10A2) titles out in ScreenGrab's >8-bit WIC
+    // conversion, while _SRGB backbuffers still get their sRGB encode here.
+    const uint32_t ss_w = m_eye_w * 2;
+    const uint32_t ss_h = m_eye_h;
+    const DXGI_FORMAT ss_fmt = screenshot_8bit_format(m_backbuffer_format);
+
+    if (m_screenshot_tex == nullptr || m_screenshot_w != ss_w || m_screenshot_h != ss_h ||
+        m_screenshot_fmt != ss_fmt) {
+        m_screenshot_tex.Reset();
+
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = ss_w;
+        desc.Height = ss_h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = ss_fmt;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                     IID_PPV_ARGS(&m_screenshot_tex)))) {
+            spdlog::error("[Flat3D][D3D12] Failed to create screenshot texture");
+            m_screenshot_tex.Reset();
+            return false;
+        }
+
+        if (m_screenshot_rtv_heap == nullptr) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            hd.NumDescriptors = 1;
+            if (FAILED(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_screenshot_rtv_heap)))) {
+                spdlog::error("[Flat3D][D3D12] Failed to create screenshot RTV heap");
+                m_screenshot_tex.Reset();
+                return false;
+            }
+        }
+
+        D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
+        rtv_desc.Format = ss_fmt;
+        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        m_device->CreateRenderTargetView(m_screenshot_tex.Get(), &rtv_desc,
+                                         m_screenshot_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+        m_screenshot_w = ss_w;
+        m_screenshot_h = ss_h;
+        m_screenshot_fmt = ss_fmt;
+    }
+
+    // cross=false is the geometric left|right pair; cross=true swaps the halves
+    // for cross-eyed viewing. Kept in RENDER_TARGET throughout (ScreenGrab
+    // transitions to COPY_SOURCE and back).
     const auto build_and_save = [&](bool cross, const std::wstring& path) -> bool {
         if (path.empty()) {
             return true;
@@ -1902,20 +1988,61 @@ bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Fla
         cmd->SetGraphicsRootSignature(m_root_sig.Get());
         cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-        // Canonical pair independent of the display eye-swap: eye0 is always the
-        // left eye, so parallel = no swap and cross = swap.
-        Flat3DFrameParams p = params;
-        p.eye_swap = cross;
-        build_sbs(cmd, p, m_eye_w, m_eye_h);
+        cmd->SetPipelineState(m_screenshot_pso.Get());
+        auto rtv = m_screenshot_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+        D3D12_VIEWPORT vp{};
+        vp.Width = (float)m_screenshot_w;
+        vp.Height = (float)m_screenshot_h;
+        vp.MaxDepth = 1.0f;
+        cmd->RSSetViewports(1, &vp);
+        D3D12_RECT sc{0, 0, (LONG)m_screenshot_w, (LONG)m_screenshot_h};
+        cmd->RSSetScissorRects(1, &sc);
+
+        // Mirror the display repack exactly (same PSO, colorspace, src_srgb,
+        // correction) — only the mode is forced to SbS and eye_swap, taken
+        // geometrically (eye0 = left), selects parallel/cross.
+        RepackConstants constants{};
+        constants.out_size[0] = (int32_t)m_screenshot_w;
+        constants.out_size[1] = (int32_t)m_screenshot_h;
+        constants.mode = (int32_t)Flat3DOutputMode::SBS;
+        constants.eye_swap = cross ? 1 : 0;
+        constants.colorspace = (int32_t)m_colorspace;
+        constants.paper_white = params.paper_white_nits;
+        constants.src_srgb = m_src_srgb ? 1 : 0;
+        constants.correction_enabled = params.correction_enabled ? 1 : 0;
+        for (int i = 0; i < 3; ++i) {
+            constants.lift[i] = params.lift[i];
+            constants.gamma[i] = params.gamma[i];
+            constants.gain[i] = params.gain[i];
+        }
+        constants.curve = params.curve;
+        constants.off_low = params.off_low;
+        constants.off_high = params.off_high;
+        constants.off_both = params.off_both;
+        constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
+        constants.scene_scale = params.scene_scale;
+
+        cmd->SetGraphicsRoot32BitConstants(0, 24, &constants, 0);
+        cmd->SetGraphicsRootDescriptorTable(1, m_srv_heap->GetGPUDescriptorHandleForHeapStart()); // t0/t1 = eyes
+
+        cmd->DrawInstanced(3, 1, 0, 0);
 
         m_screenshot_ctx.has_commands = true;
         m_screenshot_ctx.execute();
-        m_screenshot_ctx.wait(INFINITE); // block until the SbS build is on the GPU
+        m_screenshot_ctx.wait(INFINITE); // block until the render is on the GPU
 
+        // 24bpp BGR (no alpha): the eye textures carry the game's backbuffer
+        // alpha, which is meaningless and often ~0 (FF7 Rebirth's UI-alpha path
+        // leaves it fully transparent) — an RGBA PNG then reads as all-black in
+        // alpha-respecting viewers. forceSRGB=true tags the PNG sRGB WITHOUT
+        // touching pixels; the 8-bit UNORM target otherwise gets a gAMA=1.0
+        // (linear) stamp that makes color-managed viewers wash the shot out.
         const HRESULT hr = DirectX::SaveWICTextureToFile(
-            queue, m_sbs_tex.Get(), GUID_ContainerFormatPng, path.c_str(),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            &GUID_WICPixelFormat32bppBGRA);
+            queue, m_screenshot_tex.Get(), GUID_ContainerFormatPng, path.c_str(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            &GUID_WICPixelFormat24bppBGR, nullptr, /*forceSRGB=*/true);
         if (FAILED(hr)) {
             spdlog::error("[Flat3D][D3D12] Screenshot encode failed (hr=0x{:x})", (uint32_t)hr);
             return false;
@@ -2148,6 +2275,14 @@ void Flat3DCompositorD3D12::reset() {
     m_huddepth_srv_made = false;
 
     destroy_leiasr();
+
+    m_screenshot_ctx.reset();
+    m_screenshot_tex.Reset();
+    m_screenshot_rtv_heap.Reset();
+    m_screenshot_pso.Reset();
+    m_screenshot_w = 0;
+    m_screenshot_h = 0;
+    m_screenshot_fmt = DXGI_FORMAT_UNKNOWN;
 
     m_srv_heap.Reset();
     m_rtv_heap.Reset();

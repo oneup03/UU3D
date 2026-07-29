@@ -231,6 +231,16 @@ private:
     uint64_t m_coverage_frame{0};
     float m_coverage_ema{0.0f};
 
+    // Screenshot SbS target: an 8-bit RTV mirroring the backbuffer's sRGB-ness
+    // (see screenshot_8bit_format), rendered with the display repack config so
+    // the saved pair matches on-screen color but stays 8-bit for a clean PNG —
+    // separate from the LeiaSR eye-format m_sbs_tex.
+    ComPtr<ID3D11Texture2D> m_screenshot_tex{};
+    ComPtr<ID3D11RenderTargetView> m_screenshot_rtv{};
+    uint32_t m_screenshot_w{0};
+    uint32_t m_screenshot_h{0};
+    DXGI_FORMAT m_screenshot_fmt{DXGI_FORMAT_UNKNOWN};
+
     // LeiaSR weaver (optional). Own SbS texture because the weaver takes one
     // side-by-side input.
     ComPtr<ID3D11Texture2D> m_sbs_tex{};
