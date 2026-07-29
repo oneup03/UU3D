@@ -1231,13 +1231,19 @@ void VR::update_flat3d_params() {
             target_y = di->origin_y;
         }
 
-        // Auto-detect FULL-SbS: SbS output on a genuine double-wide panel (~32:9,
-        // each eye a 16:9 half). Only there do we run Native Render + Upscale —
-        // spoof the engine to render each eye at its native (half-panel) width
-        // and upscale into the full-width output, so nothing squishes and games
-        // that collapse to half-an-eye at 32:9 (P3R) render full. On a normal or
-        // half-SbS panel (16:9) the game already renders 16:9, so this stays off.
-        const bool full_sbs = (mode == vrmod::flat3d::Flat3DOutputMode::SBS) &&
+        // Auto-detect FULL-SbS: a double-wide (~32:9) side-by-side surface where
+        // each eye is a native 16:9 half with NO display un-squish. Two arrange-
+        // ments qualify: a genuine full-SbS panel, and Dual Display (a two-monitor
+        // side-by-side span — geometrically the same double-wide SbS). Only there
+        // do we run Native Render + Upscale — spoof the engine to render each eye
+        // at its native (half-span) width and upscale into the full-width output,
+        // so nothing squishes and games that collapse to half-an-eye at 32:9 (P3R)
+        // render full. On a normal or half-SbS panel (16:9) the game already
+        // renders 16:9, so this stays off.
+        const bool sbs_family = mode == vrmod::flat3d::Flat3DOutputMode::SBS ||
+                                mode == vrmod::flat3d::Flat3DOutputMode::DUAL_DISPLAY ||
+                                mode == vrmod::flat3d::Flat3DOutputMode::DUAL_DISPLAY_FLIP;
+        const bool full_sbs = sbs_family &&
                               swap_h != 0 && ((float)swap_w / (float)swap_h) >= 2.5f;
         m_flat3d_full_sbs.store(full_sbs, std::memory_order_release);
         const bool half_stretch = full_sbs;
