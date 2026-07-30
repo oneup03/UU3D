@@ -1333,13 +1333,13 @@ std::filesystem::path Framework::get_persistent_dir() {
 
         const auto exe_name = [&]() {
             const auto result = std::filesystem::path(*utility::get_module_pathw(utility::get_executable())).stem().string();
-            const auto dir = std::filesystem::path(app_data_path) / "UnrealVRMod" / result;
+            const auto dir = std::filesystem::path(app_data_path) / "UU3D" / result;
             std::filesystem::create_directories(dir);
 
             return result;
         }();
 
-        return std::filesystem::path(app_data_path) / "UnrealVRMod" / exe_name;
+        return std::filesystem::path(app_data_path) / "UU3D" / exe_name;
     };
 
     static const auto result = return_appdata_dir();
