@@ -775,6 +775,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/RenderInspector.cpp"
 	"src/mods/UObjectHook.cpp"
 	"src/mods/VR.cpp"
+	"src/mods/VR_Flat3D.cpp"
 	"src/mods/bindings/FS.cpp"
 	"src/mods/bindings/ImGui.cpp"
 	"src/mods/bindings/Json.cpp"
@@ -789,13 +790,24 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/D3D11Component.cpp"
 	"src/mods/vr/D3D12Component.cpp"
 	"src/mods/vr/FFakeStereoRenderingHook.cpp"
+	"src/mods/vr/GameDepthCapture.cpp"
 	"src/mods/vr/IXRTrackingSystemHook.cpp"
 	"src/mods/vr/OverlayComponent.cpp"
 	"src/mods/vr/RenderTargetPoolHook.cpp"
 	"src/mods/vr/UE57SlateSymbols.cpp"
 	"src/mods/vr/d3d12/CommandContext.cpp"
+	"src/mods/vr/d3d12/DepthStencilObserver.cpp"
 	"src/mods/vr/d3d12/DirectXTK.cpp"
 	"src/mods/vr/d3d12/TextureContext.cpp"
+	"src/mods/vr/flat3d/D3D11Component_Flat3D.cpp"
+	"src/mods/vr/flat3d/D3D12Component_Flat3D.cpp"
+	"src/mods/vr/flat3d/Flat3DAutoConvergence.cpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D11.cpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D12.cpp"
+	"src/mods/vr/flat3d/Flat3DDisplayTiming.cpp"
+	"src/mods/vr/flat3d/Flat3DKatanga.cpp"
+	"src/mods/vr/flat3d/Flat3DKatangaD3D12.cpp"
+	"src/mods/vr/runtimes/Flat3D.cpp"
 	"src/mods/vr/runtimes/OpenVR.cpp"
 	"src/mods/vr/runtimes/OpenXR.cpp"
 	"src/render/D3D12Diagnostics.cpp"
@@ -843,6 +855,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/D3D11Component.hpp"
 	"src/mods/vr/D3D12Component.hpp"
 	"src/mods/vr/FFakeStereoRenderingHook.hpp"
+	"src/mods/vr/GameDepthCapture.hpp"
 	"src/mods/vr/IXRTrackingSystemHook.hpp"
 	"src/mods/vr/OverlayComponent.hpp"
 	"src/mods/vr/RenderTargetPoolHook.hpp"
@@ -850,8 +863,17 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/UpscaleHelper.hpp"
 	"src/mods/vr/d3d12/ComPtr.hpp"
 	"src/mods/vr/d3d12/CommandContext.hpp"
+	"src/mods/vr/d3d12/DepthStencilObserver.hpp"
 	"src/mods/vr/d3d12/DirectXTK.hpp"
 	"src/mods/vr/d3d12/TextureContext.hpp"
+	"src/mods/vr/flat3d/Flat3DAutoConvergence.hpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D11.hpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D12.hpp"
+	"src/mods/vr/flat3d/Flat3DDisplayTiming.hpp"
+	"src/mods/vr/flat3d/Flat3DKatanga.hpp"
+	"src/mods/vr/flat3d/Flat3DKatangaD3D12.hpp"
+	"src/mods/vr/flat3d/Flat3DShaders.hpp"
+	"src/mods/vr/runtimes/Flat3D.hpp"
 	"src/mods/vr/runtimes/OpenVR.hpp"
 	"src/mods/vr/runtimes/OpenXR.hpp"
 	"src/mods/vr/runtimes/VRRuntime.hpp"
@@ -869,6 +891,7 @@ list(APPEND uevr_SOURCES
 	"src/uevr-imgui/uevr_imconfig.hpp"
 	"src/utility/ImGui.hpp"
 	"src/utility/Logging.hpp"
+	"src/mods/vr/flat3d/Flat3DDisplayUtils.h"
 	"src/uevr-imgui/imgui_impl_dx11.h"
 	"src/uevr-imgui/imgui_impl_dx12.h"
 	"src/uevr-imgui/imgui_impl_win32.h"
@@ -903,6 +926,10 @@ target_include_directories(uevr PUBLIC
 	"include/"
 	"${OPENXR_SOURCE_DIR}/src"
 	"dependencies/vendor/renderdoc"
+	"dependencies/submodules/nvapi"
+	"dependencies/submodules/adl_sdk/include"
+	"dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/include"
+	"dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/third_party/OpenCV/include"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -925,6 +952,13 @@ target_link_libraries(uevr PUBLIC
 	asmjit
 	luavrlib
 	pdafwmod
+	delayimp
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/nvapi/amd64/nvapi64.lib"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/simulatedreality.lib"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/SimulatedRealityCore.lib"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/SimulatedRealityDirectX.lib"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/DimencoWeaving.lib"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/third_party/OpenCV/lib/x64/opencv_core343.lib"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -936,7 +970,7 @@ set_target_properties(uevr PROPERTIES
 	OUTPUT_NAME
 		UEVRBackend
 	LINK_FLAGS
-		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll"
+		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:nvapi64.dll /DELAYLOAD:simulatedreality.dll /DELAYLOAD:SimulatedRealityCore.dll /DELAYLOAD:SimulatedRealityDirectX.dll /DELAYLOAD:DimencoWeaving.dll /DELAYLOAD:opencv_core343.dll /DELAYLOAD:opencv_world343.dll"
 	RUNTIME_OUTPUT_DIRECTORY_RELEASE
 		"${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 	RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO

@@ -252,7 +252,11 @@ include-directories = [
     "src/",
     "include/",
     "${OPENXR_SOURCE_DIR}/src",
-    "dependencies/vendor/renderdoc"
+    "dependencies/vendor/renderdoc",
+    "dependencies/submodules/nvapi",
+    "dependencies/submodules/adl_sdk/include",
+    "dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/include",
+    "dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/third_party/OpenCV/include"
 ]
 compile-options = ["/GS-", "/bigobj", "/EHa", "/MP"]
 compile-features = ["cxx_std_23"]
@@ -276,12 +280,19 @@ link-libraries = [
     "sdkgenny",
     "asmjit",
     "luavrlib",
-	"pdafwmod"
+    "pdafwmod",
+    "delayimp",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/nvapi/amd64/nvapi64.lib",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/simulatedreality.lib",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/SimulatedRealityCore.lib",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/SimulatedRealityDirectX.lib",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/DimencoWeaving.lib",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/third_party/OpenCV/lib/x64/opencv_core343.lib"
 ]
 
 [template.ue4template.properties]
 OUTPUT_NAME = "UEVRBackend"
-LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll"
+LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:nvapi64.dll /DELAYLOAD:simulatedreality.dll /DELAYLOAD:SimulatedRealityCore.dll /DELAYLOAD:SimulatedRealityDirectX.dll /DELAYLOAD:DimencoWeaving.dll /DELAYLOAD:opencv_core343.dll /DELAYLOAD:opencv_world343.dll"
 RUNTIME_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 LIBRARY_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/lib/${CMKR_TARGET}"

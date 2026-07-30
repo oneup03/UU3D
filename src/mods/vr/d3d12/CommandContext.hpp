@@ -58,6 +58,7 @@ struct CommandContext {
 
     bool waiting_for_fence{false};
     bool has_commands{false};
+    bool last_close_failed{false}; // set by execute(); lets callers correlate failures
 
     std::wstring internal_name{L"CommandContext object"};
 };

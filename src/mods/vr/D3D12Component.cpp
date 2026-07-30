@@ -725,6 +725,60 @@ bool D3D12Component::ensure_halo_electra_quad_source_texture(ID3D12Device* devic
     return true;
 }
 
+bool D3D12Component::ensure_ui_invert_tex(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc) {
+    if (device == nullptr || base_desc.Width == 0 || base_desc.Height == 0) {
+        return false;
+    }
+
+    auto desc = base_desc;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Alignment = 0;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // Match how the UI is VIEWED (m_game_ui_tex is set up as B8G8R8A8_UNORM)
+    // and how the alpha-invert PSO is built. The underlying native UI resource
+    // may be a different/typeless format; using its raw format here would both
+    // break RTV creation and mismatch the PSO's render-target format (which is
+    // what removed the device on FF7 Rebirth's 10-bit backbuffer).
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+
+    if (m_ui_invert_tex.texture.Get() != nullptr) {
+        const auto existing = m_ui_invert_tex.texture->GetDesc();
+        if (existing.Width == desc.Width && existing.Height == desc.Height && existing.Format == desc.Format) {
+            return true; // already matches
+        }
+        m_ui_invert_tex.reset();
+    }
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    ComPtr<ID3D12Resource> tex{};
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+            ENGINE_SRC_COLOR, nullptr, IID_PPV_ARGS(&tex)))) {
+        spdlog::error("[VR] Failed to create UI alpha-invert texture.");
+        return false;
+    }
+
+    tex->SetName(L"UI Alpha Invert Texture");
+
+    if (!m_ui_invert_tex.setup(device, tex.Get(), desc.Format, desc.Format, L"UI Alpha Invert")) {
+        spdlog::error("[VR] Failed to setup UI alpha-invert context.");
+        m_ui_invert_tex.reset();
+        return false;
+    }
+
+    SPDLOG_INFO("[VR] Created D3D12 UI alpha-invert texture [{}x{} fmt={}]", (uint32_t)desc.Width, desc.Height, (uint32_t)desc.Format);
+    return true;
+}
+
 bool D3D12Component::ensure_ue58_spectator_texture(ID3D12Device* device, ID3D12Resource* source) {
     if (device == nullptr || source == nullptr) {
         return false;
@@ -1475,6 +1529,10 @@ d3d12::TextureContext* D3D12Component::render_dune_hmd_mono_scene_texture(
 }
 
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
+    if (vr != nullptr && vr->get_runtime()->is_flat3d()) {
+        return on_frame_flat3d(vr); // flat 3D monitor mode: composite to the real backbuffer, no VR submit
+    }
+
     const bool collect_frame_timing = vr != nullptr && vr->is_hitch_diagnostics_enabled();
     d3d12::set_fence_profiler_enabled(collect_frame_timing);
 
@@ -1616,7 +1674,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const wchar_t* stable_external_copy_name =
         is_dune_external_backbuffer ? L"Dune Stable Scene Copy" :
         is_stalker2_ue51_external_backbuffer ? L"Stalker2 UE5.1 Stable Scene Copy" : L"SHf Stable Scene Copy";
-    const auto skip_in_place_ui_invert = false;
     m_skip_spectator_view_for_volatile_external_rt = is_shf_external_backbuffer || is_dune_external_backbuffer;
     auto scene_source_state = use_stable_external_backbuffer_copy ? ENGINE_SRC_COLOR : D3D12_RESOURCE_STATE_RENDER_TARGET;
 
@@ -2455,18 +2512,30 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         const auto view_game_tex_clear_state =
             (is_shf_external_backbuffer || shf_using_mono_expansion) ? ENGINE_SRC_COLOR : D3D12_RESOURCE_STATE_RENDER_TARGET;
 
-        if (ui_invert_alpha > 0.0f && !skip_in_place_ui_invert && active_ui_tex != nullptr && active_ui_tex->texture.Get() != nullptr && active_ui_tex->srv_heap != nullptr) {
-            const std::array<float, 4> blend_factor{ 1.0f, 1.0f, 1.0f, ui_invert_alpha };
-            const DirectX::XMFLOAT4 invert_alpha_tint{ 1.0f, 1.0f, 1.0f, ui_invert_alpha };
-            d3d12::render_srv_to_rtv(
-                m_ui_batch_alpha_invert.get(),
-                commands.cmd_list.Get(),
-                *active_ui_tex,
-                *active_ui_tex,
-                ENGINE_SRC_COLOR,
-                ENGINE_SRC_COLOR,
-                blend_factor,
-                invert_alpha_tint);
+        if (ui_invert_alpha > 0.0f && active_ui_tex != nullptr && active_ui_tex->texture.Get() != nullptr && active_ui_tex->srv_heap != nullptr) {
+            // Invert into a SEPARATE off-screen texture, not the UI texture
+            // itself: binding one resource as both SRV (source) and RTV
+            // (destination) in a single draw is illegal in D3D12 and removed
+            // the device on some titles (FF7 Rebirth). The alpha-invert PSO
+            // now uses an overwrite blend, so the shader's computed alpha
+            // (lerp(a, 1-a, invertAmount)) is written directly with no
+            // dependence on the destination's prior contents.
+            const auto ui_desc = active_ui_tex->texture->GetDesc();
+            if (ensure_ui_invert_tex(device, ui_desc) && m_ui_invert_tex.srv_heap != nullptr) {
+                const std::array<float, 4> blend_factor{ 1.0f, 1.0f, 1.0f, ui_invert_alpha };
+                const DirectX::XMFLOAT4 invert_alpha_tint{ 1.0f, 1.0f, 1.0f, ui_invert_alpha };
+                d3d12::render_srv_to_rtv(
+                    m_ui_batch_alpha_invert.get(),
+                    commands.cmd_list.Get(),
+                    *active_ui_tex,
+                    m_ui_invert_tex,
+                    ENGINE_SRC_COLOR,
+                    ENGINE_SRC_COLOR,
+                    blend_factor,
+                    invert_alpha_tint);
+
+                active_ui_tex = &m_ui_invert_tex; // route the UI through the inverted copy
+            }
         }
 
         draw_spectator_view(commands.cmd_list.Get(), is_right_eye_frame, &view_game_tex, std::nullopt, false, false, active_ui_tex);
@@ -4278,7 +4347,8 @@ void D3D12Component::on_post_present(VR* vr) {
     }
 
     // Clear the (real) backbuffer if VR is enabled. Otherwise it will flicker and all sorts of nasty things.
-    if (vr->is_hmd_active()) {
+    // Flat 3D monitor mode: the backbuffer IS the output — never clear it.
+    if (vr->is_hmd_active() && !vr->get_runtime()->is_flat3d()) {
         clear_backbuffer();
     }
 }
@@ -4316,6 +4386,7 @@ void D3D12Component::on_reset(VR* vr) {
 
     m_openvr.ui_tex.reset();
     m_game_ui_tex.reset();
+    m_ui_invert_tex.reset();
     reset_ue58_converted_ui_textures();
     m_game_tex.reset();
     m_ue58_spectator_tex.reset();
@@ -4333,6 +4404,8 @@ void D3D12Component::on_reset(VR* vr) {
     m_dune_hmd_mono_scene_format = DXGI_FORMAT_UNKNOWN;
     m_skip_spectator_view_for_volatile_external_rt = false;
     m_shf_scene_mode = ShfSceneMode::Unknown;
+    m_flat3d_compositor.reset();
+    m_flat3d_katanga12.shutdown();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
     m_ui_batch_alpha_invert.reset();
@@ -4572,9 +4645,20 @@ bool D3D12Component::setup() {
     m_backbuffer_batch = setup_sprite_batch_pso(real_backbuffer_desc.Format);
     m_game_batch = setup_sprite_batch_pso(backbuffer_desc.Format);
 
-    // Custom blend state to flip the alpha in-place of the UI texture without an intermediate render target
+    // Alpha-invert PSO. Renders the UI texture into a SEPARATE off-screen
+    // target (m_ui_invert_tex) — never in-place — so an overwrite blend is
+    // correct: the pixel shader already outputs the final alpha
+    // (lerp(a, 1-a, invertAmount)), and there is no valid destination alpha to
+    // blend against. (The old in-place path used a BLEND_FACTOR alpha blend
+    // that read the destination — i.e. the source itself — and required the
+    // illegal SRV==RTV self-bind that crashed FF7 Rebirth.)
     {
-        DirectX::SpriteBatchPipelineStateDescription invert_alpha_in_place_pd{DirectX::RenderTargetState{backbuffer_desc.Format, DXGI_FORMAT_UNKNOWN}};
+        // The UI is viewed/composited as B8G8R8A8_UNORM (see m_game_ui_tex and
+        // m_ui_invert_tex), NOT the backbuffer format — building this PSO for
+        // the backbuffer format mismatched the render target on titles whose
+        // backbuffer isn't B8G8R8A8 (FF7 Rebirth = R10G10B10A2) and removed the
+        // device.
+        DirectX::SpriteBatchPipelineStateDescription invert_alpha_in_place_pd{DirectX::RenderTargetState{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN}};
 
         auto& bd = invert_alpha_in_place_pd.blendDesc;
         auto& bdrt = bd.RenderTarget[0];
@@ -4584,15 +4668,15 @@ bool D3D12Component::setup() {
         bdrt.DestBlend = D3D12_BLEND_ZERO;
         bdrt.BlendOp = D3D12_BLEND_OP_ADD;
 
-        bdrt.SrcBlendAlpha = D3D12_BLEND_BLEND_FACTOR;
-        bdrt.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
+        bdrt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        bdrt.DestBlendAlpha = D3D12_BLEND_ZERO;
         bdrt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
         bdrt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
         m_ui_batch_alpha_invert = setup_sprite_batch_pso(
-            backbuffer_desc.Format, 
-            alpha_luminance_sprite_ps_SpritePixelShader, 
-            alpha_luminance_sprite_ps_SpriteVertexShader, 
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            alpha_luminance_sprite_ps_SpritePixelShader,
+            alpha_luminance_sprite_ps_SpriteVertexShader,
             invert_alpha_in_place_pd
         );
     }

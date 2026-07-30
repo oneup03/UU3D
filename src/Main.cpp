@@ -58,8 +58,32 @@ void startup_thread(HMODULE poc_module) {
     signal_renderdoc_launcher_ready();
 }
 
+// Pixel-exact 3D output (LeiaSR, interlaced, checkerboard) needs the whole
+// process working in PHYSICAL pixels. On a scaled display a game that isn't
+// per-monitor-DPI-aware maps its window — and therefore the SR weave — into a
+// DPI-virtualized sub-region of the native panel (symptom: the weave only fills
+// part of the screen). Every SR SDK sample sets per-monitor awareness at
+// process start; do the same, as early as we possibly can.
+//
+// This must run BEFORE the game creates its window/swapchain — after that
+// Windows has locked the process awareness and the call no-ops harmlessly. It
+// is done here in DllMain (not the spawned startup_thread) because the thread
+// would race window creation and usually lose. Calling into an already-loaded
+// user32 with no library loads is safe under loader lock; the game owns a
+// window, so user32 is loaded before us. Win10 1703+.
+static void try_set_per_monitor_dpi_awareness() {
+    if (auto* user32 = GetModuleHandleW(L"user32.dll")) {
+        using SetProcCtxFn = BOOL(WINAPI*)(HANDLE);
+        if (auto set_proc_ctx = (SetProcCtxFn)GetProcAddress(user32, "SetProcessDpiAwarenessContext")) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+            set_proc_ctx((HANDLE)-4);
+        }
+    }
+}
+
 BOOL APIENTRY DllMain(HANDLE handle, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
+        try_set_per_monitor_dpi_awareness();
         CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)startup_thread, handle, 0, nullptr);
     }
 

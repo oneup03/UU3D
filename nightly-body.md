@@ -1,22 +1,21 @@
 ## Installation and quick usage
 
-Extract the UEVR.zip to a folder of your choice, then:
+Extract the UU3D.zip to a folder of your choice, then:
 
-1. Launch the frontend GUI (UEVRInjector.exe)
+1. Launch the frontend GUI (UU3DInjector.exe)
 2. Launch the target game
 3. Locate the game in the process dropdown list
-4. Select your desired runtime (OpenVR/OpenXR)
-5. Toggle existing VR plugin nullification (if necessary)
-6. Configure pre-injection settings
-7. Inject
+4. Toggle existing VR plugin nullification (if necessary)
+5. Configure pre-injection settings
+6. Inject
 
 More information and troubleshooting can be found on the [Documentation](https://praydog.github.io/uevr-docs/) page.
 
 ## Additional notes
 
-You may need to whitelist the UEVR folder or executable within your antivirus software for the time being.
+You may need to whitelist the UU3D folder or executable within your antivirus software for the time being.
 
-If nothing happens, try moving UEVR to a different folder.
+If nothing happens, try moving UU3D to a different folder.
 
 # Links
 [Main repository](https://github.com/praydog/UEVR)

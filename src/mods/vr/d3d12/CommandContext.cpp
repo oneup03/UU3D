@@ -588,8 +588,49 @@ void CommandContext::execute() {
     std::scoped_lock _{this->mtx};
     
     if (this->has_commands) {
-        if (FAILED(this->cmd_list->Close())) {
-            spdlog::error("[VR] Failed to close command list. ({})", utility::narrow(this->internal_name));
+        const auto pre_close_hr = this->cmd_list->Close();
+        this->last_close_failed = FAILED(pre_close_hr);
+
+        if (const auto close_hr = pre_close_hr; FAILED(close_hr)) {
+            Microsoft::WRL::ComPtr<ID3D12Device> device{};
+            HRESULT removed_reason = S_OK;
+            if (SUCCEEDED(this->cmd_list->GetDevice(IID_PPV_ARGS(&device)))) {
+                removed_reason = device->GetDeviceRemovedReason();
+            }
+            spdlog::error("[VR] Failed to close command list. ({}) hr=0x{:08x} removed_reason=0x{:08x}",
+                          utility::narrow(this->internal_name), (uint32_t)close_hr, (uint32_t)removed_reason);
+
+            // Recover the slot. A command list whose Close() has returned a
+            // failure HRESULT is PERMANENTLY poisoned in D3D12 — Reset() does
+            // NOT clear the error, so every subsequent Close() keeps failing and
+            // this context never produces a clean frame again (observed as a
+            // compositor that flickers forever after a single bad frame during a
+            // level load). The only real recovery is to destroy and recreate the
+            // list. Reset the allocator (this frame's commands were never
+            // executed, and the previous frame was already waited on at the top
+            // of the next composite) and build a fresh list on it.
+            bool recovered = false;
+            if (device != nullptr && SUCCEEDED(this->cmd_allocator->Reset())) {
+                this->cmd_list.Reset();
+                if (SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        this->cmd_allocator.Get(), nullptr, IID_PPV_ARGS(&this->cmd_list)))) {
+                    this->cmd_list->SetName(this->internal_name.c_str());
+                    recovered = true;
+                }
+            }
+
+            if (!recovered) {
+                spdlog::error("[VR] Failed to recreate command list after close failure for {}",
+                              utility::narrow(this->internal_name));
+            }
+
+            // The freshly created list is already in the recording state, so the
+            // next frame records straight onto it. Nothing was executed, so no
+            // fence is pending — clear the flags to keep wait()/try_wait()
+            // consistent (a stale waiting_for_fence would make them Reset an
+            // open list and re-poison it).
+            this->waiting_for_fence = false;
+            this->has_commands = false;
             return;
         }
         

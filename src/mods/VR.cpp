@@ -123,16 +123,32 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         }
         RHIThreadID = std::this_thread::get_id();
         auto render_frame_count = vr->get_render_frame_count();
-        EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
-        EyeIndex nEyeOther = (render_frame_count % 2 == 0) ? EyeRight : EyeLeft;
+        // Same eye-parity expression as run_flat3d_framewarp / update_camera_data /
+        // the compositors — a hardcoded ==0 here swaps the harvest's eye slots
+        // whenever m_left_eye_interval is 1.
+        EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
+        EyeIndex nEyeOther = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeRight : EyeLeft;
         vr->last_dlss_frame_count = render_frame_count;
         static int lastPausedFrame = render_frame_count;
+
+        // Flat3D "DLSS Depth" source: snapshot the DLSS input depth into our OWN
+        // per-eye copy on the game's command list. Plugin-free (uses the game device
+        // + CopyResource), and independent of the rendering method — so it works in
+        // Native / Synced / AFR, not just AFW.
+        if (vr->flat3d_wants_dlss_depth() && depth) {
+            vr->capture_dlss_depth_copy(InCmdList, depth, (int)nEye);
+        }
+
+        // --- AFW (plugin) depth + motion-vector harvest -----------------------
+        // depthDesc/motionVectorsDesc are allocated by the AFW warp block and copied
+        // here via the plugin's D3D12 renderer; requires the real PDAFWPlugin.
         bool bufferValid = vr->is_hmd_active() && motionVectors && vr->motionVectorsDesc[nEye].pTexture && vr->depthDesc[nEye].pTexture;
         if (!bufferValid)
             lastPausedFrame = render_frame_count;
         if (lastPausedFrame > render_frame_count)
             lastPausedFrame = render_frame_count;
-        if (vr->is_using_afw() && vr->afw_resolution_change_skip_frames <= 0 && (render_frame_count - lastPausedFrame > 30) && bufferValid) {
+        if (vr->is_using_afw() && vr->d3d12Renderer != nullptr && vr->afw_resolution_change_skip_frames <= 0 &&
+            (render_frame_count - lastPausedFrame > 30) && bufferValid) {
             TextureDesc src;
             src.pTexture = depth;
             src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -142,7 +158,7 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
                 vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
             }
-            if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() && 
+            if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
                 vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
                 if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
                     vr->update_camera_data(render_frame_count);
@@ -169,7 +185,7 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
                 vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
             }
         }
-        if (vr->is_renderdoc) {
+        if (vr->is_renderdoc && vr->d3d12Renderer != nullptr) {
             static TextureDesc colorDesc[2];
             static TextureDesc outputDesc[2];
             if (color && colorDesc[nEye].pTexture != color) {
@@ -193,9 +209,12 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     return result;
 }
 
-decltype(&ID3D12GraphicsCommandList::ResourceBarrier) ptrResourceBarrier; // 26
+// AFW/NeverDLSS raw harvest. Invoked as callbacks from D3D12Hook's own vtable
+// hooks (post-original) — NOT as a second vtable patch on the same slots: the
+// old hookVtable layer and D3D12Hook's PointerHooks each captured the other as
+// "original" after a re-hook, recursing every ResourceBarrier to a stack
+// overflow (P3R crash).
 void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
-    (This->*ptrResourceBarrier)(NumBarriers, pBarriers);
     const auto& vr = VR::get();
 
     // Only track barriers submitted in RHISubmissionThread
@@ -211,7 +230,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
     ID3D12Resource* velocityCandidate = nullptr;
     ID3D12Resource* motionVectorsCandidate = nullptr;
     auto render_frame_count = vr->get_render_frame_count();
-    EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
+    EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
     bool isNeverDLSS = vr->is_never_dlss();
     for (int i = 0; i < NumBarriers; i++) {
         auto& barrier = pBarriers[i];
@@ -291,18 +310,13 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
 }
 
 static std::map<SIZE_T, ID3D12Resource*> DSVMap = {};
-decltype(&ID3D12Device::CreateDepthStencilView) ptrCreateDepthStencilView; // 21
 void WINAPI hk_ID3D12Device_CreateDepthStencilView(
     ID3D12Device* This, ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    (This->*ptrCreateDepthStencilView)(pResource, pDesc, DestDescriptor);
     DSVMap[DestDescriptor.ptr] = pResource;
 }
 
-decltype(&ID3D12GraphicsCommandList::ClearDepthStencilView) ptrClearDepthStencilView; // 47
-void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This, 
+void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This,
     D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView, D3D12_CLEAR_FLAGS ClearFlags, FLOAT Depth, UINT8 Stencil, UINT NumRects, const D3D12_RECT* pRects) {
-
-    (This->*ptrClearDepthStencilView)(DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
 
     const auto& vr = VR::get();
 
@@ -311,7 +325,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
 
     auto render_frame_count = vr->get_render_frame_count();
     bool isNeverDLSS = vr->is_never_dlss();
-    EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
+    EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
     if (isNeverDLSS && DSVMap.contains(DepthStencilView.ptr)) {
         auto depth = DSVMap[DepthStencilView.ptr];
         auto desc = depth->GetDesc();
@@ -340,15 +354,6 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
             }
         }
     }
-}
-
-uintptr_t hookVtable(void* target, int index, void* detours) {
-    uintptr_t* pVTable = *(uintptr_t**)target;
-    DWORD dwOldProct = 0;
-    BOOL bRet = ::VirtualProtect(pVTable, 4, PAGE_READWRITE, &dwOldProct);
-    auto origFunc = pVTable[index];
-    pVTable[index] = (uintptr_t)detours;
-    return origFunc;
 }
 
 std::shared_ptr<VR>& VR::get() {
@@ -2813,8 +2818,228 @@ bool VR::is_controller_camera_conflict_guard_active() const {
 }
 
 // Called when the mod is initialized
+void VR::init_framewarp_module() {
+    if (!g_framework->is_dx12()) {
+        return;
+    }
+    if (m_framewarp_device_initialized && m_ngx_hooks_installed) {
+        return; // fully initialized
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr || hook->get_device() == nullptr || hook->get_command_queue() == nullptr) {
+        return; // D3D12 not ready yet; retried next frame
+    }
+
+    // --- Plugin device + raw D3D12 harvest hooks (once) --------------------
+    if (!m_framewarp_device_initialized) {
+        if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
+            const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
+            if (current_path) {
+                auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
+                if (LoadLibraryW(fspath.c_str()) == nullptr) {
+                    spdlog::info("[VR][AFW] Could not load PDAFWPlugin.dll (AFW will be unavailable)");
+                }
+            }
+        }
+
+        is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
+
+        pd::DeviceParams params{};
+        params.d3d12Device = hook->get_device();
+        params.d3d12Queue = hook->get_command_queue();
+        d3d12Renderer = InitDevice(params);
+
+        if (d3d12Renderer == nullptr) {
+            // No real plugin (the shipped no-op dummy returns null, or the DLL is
+            // absent). AFW itself and the NeverDLSS raw hooks (which record on the
+            // plugin's command list) stay disabled — but the DLSS/NGX depth harvest
+            // does NOT need the plugin, so we still fall through and install it so
+            // the Flat3D "DLSS Depth" source works via our own copy.
+            spdlog::warn("[VR][AFW] PDAFWPlugin InitDevice returned null; AFW disabled "
+                         "(drop the real PDAFWPlugin.dll beside UEVRBackend.dll for AFW). "
+                         "DLSS Depth capture still works via our own copy.");
+        } else {
+            // Raw harvest via D3D12Hook's own vtable hooks (post-original
+            // callbacks). Never patch these slots directly: D3D12Hook already
+            // owns them, and a second untracked patch (the old hookVtable) went
+            // mutually recursive with it on re-hook (stack overflow in P3R).
+            D3D12Hook::s_on_raw_create_depth_stencil_view.store(&hk_ID3D12Device_CreateDepthStencilView, std::memory_order_release);
+            D3D12Hook::s_on_raw_resource_barrier.store(&hk_ID3D12GraphicsCommandList_ResourceBarrier, std::memory_order_release);
+            D3D12Hook::s_on_raw_clear_depth_stencil_view.store(&hk_ID3D12GraphicsCommandList_ClearDepthStencilView, std::memory_order_release);
+
+            spdlog::info("[VR][AFW] Frame Warp device initialized");
+        }
+
+        m_framewarp_device_initialized = true;
+    }
+
+    // --- DLSS / NGX harvest hooks (retry until nvngx.dll is loaded) --------
+    // nvngx loads lazily when the game first initializes DLSS, which can be well
+    // after this mod initializes — so this is retried each frame from
+    // on_pre_engine_tick until it succeeds.
+    if (!m_ngx_hooks_installed) {
+        auto dllNGX = GetModuleHandle("_nvngx.dll");
+        if (!dllNGX) {
+            dllNGX = GetModuleHandle("nvngx.dll");
+        }
+        // OptiScaler ships as a local dxgi.dll or winmm.dll exporting the NGX
+        // entry points; prefer it over nvngx.dll when present (upstream parity).
+        for (const char* opti_name : {"dxgi.dll", "winmm.dll"}) {
+            const auto dllOpti = GetModuleHandle(opti_name);
+            if (dllOpti != nullptr && GetProcAddress(dllOpti, "NVSDK_NGX_D3D12_CreateFeature") != nullptr) {
+                dllNGX = dllOpti;
+                spdlog::info("[VR][AFW] OptiScaler detected ({}), hooking it instead of nvngx.dll", opti_name);
+                break;
+            }
+        }
+        if (!dllNGX) {
+            return; // DLSS not initialized by the game yet
+        }
+
+        auto result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_CreateFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
+
+        result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_ReleaseFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
+
+        result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_EvaluateFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
+
+        m_ngx_hooks_installed = true;
+        spdlog::info("[VR][AFW] DLSS/NGX harvest hooks installed (nvngx.dll found)");
+    }
+}
+
+void VR::capture_dlss_depth_copy(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* depth, int eye) {
+    if (cmd_list == nullptr || depth == nullptr || eye < 0 || eye > 1) {
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr) {
+        return;
+    }
+    auto* device = hook->get_device();
+    if (device == nullptr) {
+        return;
+    }
+
+    const auto src_desc = depth->GetDesc();
+    // The DLSS input depth is always a plain 2D, single-sample, shader-readable
+    // texture. Bail on anything unexpected rather than issue a bad copy/barrier.
+    if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || src_desc.SampleDesc.Count != 1 ||
+        src_desc.Width == 0 || src_desc.Height == 0 ||
+        (src_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
+        return;
+    }
+
+    std::scoped_lock lock(m_dlss_depth_mutex);
+
+    // (Re)allocate the owned copy to match the source (a plain shader-readable copy
+    // — strip DSV/RTV/UAV/deny flags but keep the format/extent so CopyResource is
+    // an exact whole-resource copy).
+    bool need_alloc = m_dlss_depth[eye] == nullptr;
+    if (!need_alloc) {
+        const auto cur = m_dlss_depth[eye]->GetDesc();
+        need_alloc = cur.Width != src_desc.Width || cur.Height != src_desc.Height ||
+                     cur.Format != src_desc.Format || cur.DepthOrArraySize != src_desc.DepthOrArraySize ||
+                     cur.MipLevels != src_desc.MipLevels;
+    }
+    if (need_alloc) {
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        auto dst_desc = src_desc;
+        dst_desc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        dst_desc.Alignment = 0;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource> tex{};
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &dst_desc,
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex)))) {
+            spdlog::warn("[VR][DLSS depth] Could not allocate the owned depth copy");
+            return;
+        }
+        tex->SetName(L"Flat3D DLSS Depth Copy");
+        m_dlss_depth[eye] = std::move(tex);
+    }
+
+    // The DLSS input depth is passed in NON_PIXEL_SHADER_RESOURCE (DLSS samples it).
+    // Round-trip through COPY_SOURCE and restore it before the copy list is closed,
+    // leaving our owned copy shader-readable for the Flat3D compositor.
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    for (auto& b : barriers) {
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    barriers[0].Transition.pResource = depth;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.pResource = m_dlss_depth[eye].Get();
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cmd_list->ResourceBarrier(2, barriers);
+
+    cmd_list->CopyResource(m_dlss_depth[eye].Get(), depth);
+
+    std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+    std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+    cmd_list->ResourceBarrier(2, barriers);
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> VR::get_dlss_depth_copy(int eye) {
+    if (eye < 0 || eye > 1) {
+        return nullptr;
+    }
+    std::scoped_lock lock(m_dlss_depth_mutex);
+    return m_dlss_depth[eye];
+}
+
 std::optional<std::string> VR::clean_initialize() try {
     ZoneScopedN(__FUNCTION__);
+
+    // Flat 3D display mode takes priority over the HMD runtimes when the
+    // frontend requests it. No VR API/DLL is required for it.
+    if (m_requested_runtime_name->value() == "flat3d") {
+        auto flat3d_error = initialize_flat3d();
+
+        if (!flat3d_error && m_flat3d->loaded) {
+            m_openvr->is_hmd_active = false;
+            m_openvr->was_hmd_active = false;
+            m_openvr->needs_pose_update = false;
+            m_openxr->needs_pose_update = false;
+
+            // AFW works under Flat3D too: install the plugin device + DLSS/NGX +
+            // raw D3D12 harvest hooks here, since this path returns before the
+            // normal Frame Warp init below. Retryable, so a late-loading nvngx.dll
+            // (DLSS) still gets hooked from the per-frame retry in on_present.
+            init_framewarp_module();
+
+            m_init_finished = true;
+            return Mod::on_initialize();
+        }
+
+        if (flat3d_error) {
+            spdlog::error("Flat3D failed to initialize: {}", *flat3d_error);
+        }
+        // fall through to the HMD runtimes
+    }
 
     auto openvr_error = initialize_openvr();
 
@@ -2856,87 +3081,10 @@ std::optional<std::string> VR::clean_initialize() try {
 
     m_init_finished = true;
 
-    // #############################
-    // #Frame Warp Module Start
-    // #############################
-    if (!g_framework->is_dx12())
-        return Mod::on_initialize();
-
-    if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
-        const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
-        if (current_path) {
-            auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
-            if (LoadLibraryW(fspath.c_str()) == nullptr) {
-                spdlog::info("[VR] Could not load PDAFWPlugin.dll");
-            }
-        }
-    }
-
-    is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
-
-    auto& hook = g_framework->get_d3d12_hook();
-    hook->get_command_queue();
-    pd::DeviceParams params{};
-    params.d3d12Device = hook->get_device();
-    params.d3d12Queue = hook->get_command_queue();
-    d3d12Renderer = InitDevice(params);
-
-    *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
-
-    auto cmdList = d3d12Renderer->BeginCommandList(0);
-    *(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
-    *(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
-    d3d12Renderer->EndCommandList(0);
-
-    auto dllNGX = LoadLibrary("_nvngx.dll");
-    if (!dllNGX)
-        dllNGX = LoadLibrary("nvngx.dll");
-    auto dllOptiScaler = LoadLibrary("dxgi.dll");
-    if (dllOptiScaler) {
-        if (GetProcAddress(dllOptiScaler, "NVSDK_NGX_D3D12_CreateFeature")) {
-            dllNGX = dllOptiScaler;
-            spdlog::info("OptiScaler detected, hooking it instead of nvngx.dll.");
-        } else {
-            dllOptiScaler = LoadLibrary("winmm.dll");
-            if (dllOptiScaler) {
-                if (GetProcAddress(dllOptiScaler, "NVSDK_NGX_D3D12_CreateFeature")) {
-                    dllNGX = dllOptiScaler;
-                    spdlog::info("OptiScaler detected, hooking it instead of nvngx.dll.");
-                }
-            } 
-        }
-    }
-    if (!dllNGX) {
-        spdlog::error("nvngx.dll not loaded!");
-    } else {
-        auto result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_CreateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_ReleaseFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_EvaluateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
-    }
-
-    // #############################
-    // #Frame Warp Module End
-    // #############################
+    // AFW (Async Frame Warp): plugin device + DLSS/NGX + raw D3D12 harvest hooks.
+    // Retryable and dummy-plugin-safe; also runs for Flat3D (see the flat3d branch
+    // above). Defined in init_framewarp_module().
+    init_framewarp_module();
 
     // all OK
     return Mod::on_initialize();
@@ -3545,6 +3693,14 @@ bool VR::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == WM_DEVICECHANGE && !m_spoofed_gamepad_connection) {
         spdlog::info("[VR] Received WM_DEVICECHANGE");
         m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
+    }
+
+    // 3D Display stereo cursor: keep the game from arming a hardware cursor —
+    // the OS composites it flat on top of the stereo output (one copy at
+    // screen depth). The compositor draws the per-eye cursor instead.
+    if (message == WM_SETCURSOR && is_using_flat3d() && m_flat3d_cursor_mode->value() != 0) {
+        SetCursor(nullptr);
+        return false;
     }
 
     return true;
@@ -4813,6 +4969,10 @@ bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
 
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
+
+    // AFW init retry: no-op once fully installed. Re-attempts the DLSS/NGX hooks
+    // until the game has loaded nvngx.dll (it loads lazily on first DLSS use).
+    init_framewarp_module();
 
     const auto now = std::chrono::steady_clock::now();
     const auto previous_engine_tick = m_last_engine_tick;
@@ -7431,6 +7591,41 @@ void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void
     }
 }
 
+float VR::flat3d_effective_nearz() {
+    // Custom Z Near is an explicit user override written into the SDK's cell by
+    // on_pre_viewport_client_draw — honor it exactly, whatever value they pick.
+    if (m_custom_z_near_enabled->value()) {
+        return sdk::globals::get_near_clipping_plane();
+    }
+
+    const float nz = sdk::globals::get_near_clipping_plane();
+    // A successful scan yields the game's real plane (UE default ~10 uu). The
+    // SDK returns a 1.0 dummy when the scan fails; treat <=1.0 as "no value".
+    if (std::isfinite(nz) && nz > 1.0f) {
+        return nz;
+    }
+
+    // Failed-scan fallback (kept out of the pristine UESDK submodule): use the
+    // game's r.SetNearClipPlane cvar if it set one, else UE's own default of 10
+    // (a far closer approximation than the SDK's 1.0 dummy). r.SetNearClipPlane
+    // is 0 until set, so only adopt a positive value.
+    try {
+        if (auto data = sdk::find_cvar_data_cached(L"Engine", L"r.SetNearClipPlane"); data) {
+            // Only adopt a PLAUSIBLE near plane (UE units; default is 10).
+            // FF7 Rebirth's cvar read produced a tiny-positive garbage value —
+            // it passed a bare >0 check and poisoned the depth->world
+            // conversion (game_nearz ~0 → every sample classified far).
+            if (auto* cv = data->get<float>(); cv != nullptr && cv->get() >= 1.0f && cv->get() <= 1000.0f) {
+                SPDLOG_INFO_ONCE("[Flat3D] near plane fallback via r.SetNearClipPlane cvar");
+                return cv->get();
+            }
+        }
+    } catch (...) {
+    }
+
+    return 10.0f;
+}
+
 void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     ZoneScopedN(__FUNCTION__);
 
@@ -7438,7 +7633,10 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
     auto runtime = get_runtime();
     if (m_uncap_framerate->value()) {
-        sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
+        // The 3D Display 2x-refresh cap owns t.MaxFPS while active.
+        if (!(is_using_flat3d() && m_flat3d_vsync->value() == 3)) {
+            sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
+        }
     }
 
     // Allows games running in HDR mode to not have a black UI overlay
@@ -7483,11 +7681,12 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
             const auto now_frame = frame_count % runtimes::OpenXR::QUEUE_SIZE;
             m_openxr->pipeline_states[now_frame] = m_openxr->pipeline_states[last_frame];
             m_openxr->pipeline_states[now_frame].frame_count = now_frame;
-        } else {
+        } else if (runtime->is_openvr()) {
             const auto last_frame = (frame_count - 1) % m_openvr->pose_queue.size();
             const auto now_frame = frame_count % m_openvr->pose_queue.size();
             m_openvr->pose_queue[now_frame] = m_openvr->pose_queue[last_frame];
         }
+        // Flat3D: no compositor pose queue to clone.
 
         // Forcefully disable motion blur because it freaks out with AFR
         sdk::set_cvar_data_int(L"Engine", L"r.DefaultFeature.MotionBlur", 0);
@@ -8233,6 +8432,10 @@ void VR::handle_keybinds() {
     if (m_keybind_toggle_gui->is_key_down_once()) {
         m_enable_gui->toggle();
     }
+
+    if (is_using_flat3d()) {
+        handle_flat3d_keybinds();
+    }
 }
 
 void VR::on_frame() {
@@ -8241,6 +8444,10 @@ void VR::on_frame() {
     m_last_mod_frame = std::chrono::steady_clock::now();
     m_cvar_manager->on_frame();
     handle_keybinds();
+
+    if (is_using_flat3d()) {
+        update_flat3d_params();
+    }
 
     if (!get_runtime()->ready()) {
         return;
@@ -8774,6 +8981,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         PAGE_INPUT,
         PAGE_CAMERA,
         PAGE_KEYBINDS,
+        PAGE_MONITOR3D,
         PAGE_CONSOLE,
         PAGE_COMPATIBILITY,
         PAGE_DEBUG,
@@ -8834,6 +9042,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
     case "Keybinds"_fnv:
         selected_page = PAGE_KEYBINDS;
         break;
+    case "3D Display"_fnv:
+        selected_page = PAGE_MONITOR3D;
+        break;
     case "Console/CVars"_fnv:
         selected_page = PAGE_CONSOLE;
         break;
@@ -8865,13 +9076,17 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         ImGui::Text((std::string{"Runtime Information ("} + get_runtime()->name().data() + ")").c_str());
 
-        m_desktop_fix->draw("Desktop Spectator View");
+        // No-ops under 3D Display mode: the flat3d compositor owns the real
+        // backbuffer (no desktop mirror) and 2D-screen is mutually exclusive.
+        if (!is_using_flat3d()) {
+            m_desktop_fix->draw("Desktop Spectator View");
 
-        if (m_desktop_fix->value()) {
-            m_desktop_mirror_mode->draw("Desktop Spectator View Mode");
+            if (m_desktop_fix->value()) {
+                m_desktop_mirror_mode->draw("Desktop Spectator View Mode");
+            }
+
+            m_2d_screen_mode->draw("2D Screen Mode");
         }
-
-        m_2d_screen_mode->draw("2D Screen Mode");
 
         ImGui::TextWrapped("Render Resolution (per-eye): %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
         ImGui::TextWrapped("Total Render Resolution: %d x %d", get_runtime()->get_width() * 2, get_runtime()->get_height());
@@ -8882,7 +9097,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         get_runtime()->on_draw_ui();
 
-        m_overlay_component.on_draw_ui();
+        if (!is_using_flat3d()) {
+            // VR-compositor overlay options — inert without a VR compositor.
+            m_overlay_component.on_draw_ui();
+        }
 
         ImGui::TreePop();
     }
@@ -8950,7 +9168,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_disable_blur_widgets->draw("Disable Blur Widgets");
         m_uncap_framerate->draw("Uncap Framerate");
         m_enable_gui->draw("Enable GUI");
-        m_enable_depth->draw("Enable Depth-based Latency Reduction");
+
+        if (!is_using_flat3d()) {
+            // Depth submission to the VR compositor — no compositor here.
+            m_enable_depth->draw("Enable Depth-based Latency Reduction");
+        }
         m_load_blueprint_code->draw("Load Blueprint Code");
 
         const auto draw_status_badge = [](const char* label, const char* status, const ImVec4& color) {
@@ -9086,7 +9308,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
     }
 
-    if (selected_page == PAGE_INPUT) {
+    if (selected_page == PAGE_INPUT && is_using_flat3d()) {
+        ImGui::TextWrapped("Motion-controller input options are not applicable in 3D Display mode\n"
+                           "(no VR controllers). Keyboard/mouse hotkeys are on the Keybinds and\n"
+                           "3D Display pages.");
+    } else if (selected_page == PAGE_INPUT) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Controller")) {
             m_joystick_deadzone->draw("VR Joystick Deadzone");
@@ -9576,6 +9802,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
     }
 
+    if (selected_page == PAGE_MONITOR3D) {
+        on_draw_sidebar_flat3d();
+    }
+
     if (selected_page == PAGE_CONSOLE) {
         m_cvar_manager->on_draw_ui();
     }
@@ -9584,6 +9814,21 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Compatibility Options")) {
             m_compatibility_ahud->draw("AHUD UI Compatibility");
+            m_overlay_component.draw_ui_invert_alpha("UI Invert Alpha");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Inverts/blends the game UI's alpha so it composites correctly\n"
+                                  "(0 = off). Needed by some titles for HUD/UI visibility.");
+            }
+            m_flat3d_ui_color_gate->draw("UI Color Gate");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Zeroes the game UI's alpha where it has (almost) no color. Fixes the\n"
+                                  "dark film over the whole scene when using UI Invert Alpha 0.5 (that\n"
+                                  "collapses every pixel's alpha to a flat 0.5, including the empty\n"
+                                  "screen): drawn UI has color, empty screen doesn't. Also keeps the\n"
+                                  "full-screen-menu detector and the adaptive-HUD classifier working\n"
+                                  "under a partial invert. Try 0.03-0.08; 0 = off. Side effect: pure-\n"
+                                  "black opaque UI (dark panels) turns transparent - keep the gate low.");
+            }
             m_compatibility_skip_uobjectarray_init->draw("Skip UObjectArray Init");
             m_compatibility_skip_pip->draw("Skip PostInitProperties");
             m_compatibility_direct_aim->draw("Direct Aim Fallback");
@@ -9783,30 +10028,34 @@ void VR::on_draw_ui() {
         return;
     }
 
-    if (ImGui::Button("Set Standing Height")) {
-        m_standing_origin.y = get_position(0).y;
-    }
+    // These are HMD-runtime controls (tracked standing origin / recenter /
+    // reinitialize) — meaningless in Flat3D (3D Display) mode, so hide the row.
+    if (!is_using_flat3d()) {
+        if (ImGui::Button("Set Standing Height")) {
+            m_standing_origin.y = get_position(0).y;
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Set Standing Origin")) {
-        m_standing_origin = get_position(0);
-    }
+        if (ImGui::Button("Set Standing Origin")) {
+            m_standing_origin = get_position(0);
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Recenter View")) {
-        recenter_view();
-    }
+        if (ImGui::Button("Recenter View")) {
+            recenter_view();
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-     if (ImGui::Button("Recenter Horizon")) {
-        recenter_horizon();
-    }
-	
-    if (ImGui::Button("Reinitialize Runtime")) {
-        get_runtime()->wants_reinitialize = true;
+        if (ImGui::Button("Recenter Horizon")) {
+            recenter_horizon();
+        }
+
+        if (ImGui::Button("Reinitialize Runtime")) {
+            get_runtime()->wants_reinitialize = true;
+        }
     }
 }
 
