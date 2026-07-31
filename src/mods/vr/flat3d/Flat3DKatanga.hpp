@@ -53,6 +53,14 @@ private:
     HANDLE m_setup_mutex{nullptr};
     bool m_ipc_ready{false};
 
+    // Additive extension to the Katanga contract: an auto-reset event
+    // (Local\KatangaFrameReady) signaled once per published frame, right after
+    // the GPU flush, so an extension-aware consumer (WWInjector) can publish
+    // frame-accurately instead of polling on a timer. Legacy consumers never
+    // open this name and are unaffected; the MMF slot and setup mutex are
+    // untouched. Optional — publishing works identically if creation fails.
+    HANDLE m_frame_event{nullptr};
+
     // Single stable shared SbS texture (recreated only on size change — the
     // consumer reads ONE handle from the MMF and samples it in place).
     ComPtr<ID3D11Texture2D> m_shared_tex{};

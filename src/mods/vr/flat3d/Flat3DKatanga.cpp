@@ -16,6 +16,11 @@ namespace {
 constexpr wchar_t kKatangaMmfName[] = L"Local\\KatangaMappedFile";
 constexpr wchar_t kKatangaMutexName[] = L"KatangaSetupMutex";
 
+// Additive frame-ready extension (see m_frame_event in the header). Consumer
+// side: WWInjector's WibbleWobbleKatanga waits on this with a timeout and
+// falls back to timer polling when no producer signals it.
+constexpr wchar_t kKatangaFrameReadyName[] = L"Local\\KatangaFrameReady";
+
 // View format for typeless (or already-typed) eye formats, so a typeless eye
 // texture can be sampled. Mirrors Flat3DCompositorD3D11.cpp's view_format_for.
 DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) {
@@ -88,11 +93,22 @@ bool Flat3DKatanga::setup_ipc() {
         return false;
     }
 
+    // Create-or-open the optional frame-ready event (auto-reset, so a single
+    // waiter wakes exactly once per signal). Non-fatal on failure — consumers
+    // that poll (legacy) or time out (extension-aware) work without it.
+    HANDLE frame_event = CreateEventW(nullptr, FALSE, FALSE, kKatangaFrameReadyName);
+    if (frame_event == nullptr) {
+        spdlog::warn("[Flat3D][Katanga] CreateEventW(KatangaFrameReady) failed (0x{:x}) — consumers will poll",
+                     GetLastError());
+    }
+
     m_mmf = mmf;
     m_mmf_view = view;
     m_setup_mutex = mutex;
+    m_frame_event = frame_event;
     m_ipc_ready = true;
-    spdlog::info("[Flat3D][Katanga] IPC ready (Local\\KatangaMappedFile + KatangaSetupMutex)");
+    spdlog::info("[Flat3D][Katanga] IPC ready (Local\\KatangaMappedFile + KatangaSetupMutex{})",
+                 frame_event != nullptr ? " + Local\\KatangaFrameReady" : "");
     return true;
 }
 
@@ -335,6 +351,14 @@ void Flat3DKatanga::present(ID3D11DeviceContext* context, ID3D11Texture2D* eye_l
     // path to flush the queue, so the consumer would otherwise see a stale
     // texture until the driver flushes on its own.
     context->Flush();
+
+    // Wake an extension-aware consumer for a frame-accurate publish. In the
+    // D3D11On12 path the wrapped-resource release flush lands just after this
+    // signal; the consumer's wake-to-copy path is far longer than that gap,
+    // and the contract is tearing-tolerant regardless.
+    if (m_frame_event != nullptr) {
+        SetEvent(m_frame_event);
+    }
 }
 
 void Flat3DKatanga::shutdown() {
@@ -357,6 +381,10 @@ void Flat3DKatanga::shutdown() {
     m_sampler.Reset();
     m_rasterizer.Reset();
 
+    if (m_frame_event != nullptr) {
+        CloseHandle(m_frame_event);
+        m_frame_event = nullptr;
+    }
     if (m_setup_mutex != nullptr) {
         CloseHandle(m_setup_mutex);
         m_setup_mutex = nullptr;
