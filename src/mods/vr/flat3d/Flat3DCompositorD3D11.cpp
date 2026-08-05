@@ -16,6 +16,8 @@
 #ifdef UEVR_FLAT3D_HAS_LEIASR
 #include <sr/management/srcontext.h>
 #include <sr/weaver/dx11weaver.h>
+
+#include "Flat3DLeiaSRRuntime.hpp"
 #endif
 
 namespace vrmod::flat3d {
@@ -1716,24 +1718,19 @@ bool Flat3DCompositorD3D11::leiasr_available() const {
 #ifdef UEVR_FLAT3D_HAS_LEIASR
     // True while the weaver exists OR creation hasn't been attempted yet —
     // weave_leiasr() creates it lazily on the first call, so gating on the
-    // weaver alone would mean it never gets created.
-    return m_sr_weaver != nullptr || !m_sr_attempted;
+    // weaver alone would mean it never gets created. The runtime probe keeps
+    // us out of the SDK entirely on machines without the SR Platform.
+    return m_sr_weaver != nullptr || (!m_sr_attempted && leiasr::sr_runtime_available());
 #else
     return false;
 #endif
 }
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR
-#ifndef _DPI_AWARENESS_CONTEXTS_
-DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
-#endif
-#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
-#endif
-
 namespace {
-// SEH-guarded SRContext::create — a missing/har-crashing SR runtime must not
-// take the game down (VRto3D leiasr_presenter pattern).
+// SEH-guarded SRContext::create — a missing/hard-crashing SR runtime must not
+// take the game down (VRto3D leiasr_presenter pattern). Lives in its own
+// function because __try cannot share a function with C++ try/catch.
 SR::SRContext* try_create_sr_context() {
     __try {
         return SR::SRContext::create();
@@ -1742,34 +1739,16 @@ SR::SRContext* try_create_sr_context() {
     }
 }
 
-// Per-monitor DPI awareness for the weaver's create + weave calls, so the SR
-// runtime's window/monitor queries resolve to physical pixels and the weave
-// maps to the full native panel instead of a DPI-virtualized sub-region under
-// a non-per-monitor-aware host game. Process-wide awareness (DllMain) is the
-// primary fix; this backs it up per-thread for when that couldn't take (e.g.
-// injected after window creation). No-op when the API is unavailable or the
-// thread is already aware.
-struct ScopedPerMonitorDpi {
-    using SetCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
-    SetCtxFn set_ctx{nullptr};
-    DPI_AWARENESS_CONTEXT prev{nullptr};
-
-    ScopedPerMonitorDpi() {
-        if (auto* user32 = GetModuleHandleW(L"user32.dll")) {
-            set_ctx = (SetCtxFn)GetProcAddress(user32, "SetThreadDpiAwarenessContext");
-        }
-        if (set_ctx != nullptr) {
-            prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        }
+// SRContext::create() allocates inside the SR DLL, so it is paired with
+// deleteSRContext() — not with `delete`, which would free it on our heap.
+// Guarded for the same reason as creation: teardown can run after the SR
+// service has already gone away.
+void try_delete_sr_context(SR::SRContext* context) {
+    __try {
+        SR::SRContext::deleteSRContext(context);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
-    ~ScopedPerMonitorDpi() {
-        if (set_ctx != nullptr && prev != nullptr) {
-            set_ctx(prev);
-        }
-    }
-    ScopedPerMonitorDpi(const ScopedPerMonitorDpi&) = delete;
-    ScopedPerMonitorDpi& operator=(const ScopedPerMonitorDpi&) = delete;
-};
+}
 } // namespace
 #endif
 
@@ -2043,11 +2022,19 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
     // Resolve SR's window/monitor queries to physical pixels for the whole
     // create+weave interaction (maps the weave to the full native panel rather
     // than a DPI-virtualized sub-region under a non-per-monitor-aware host).
-    ScopedPerMonitorDpi dpi_guard{};
+    leiasr::ScopedPerMonitorDpi dpi_guard{};
 
     // Lazy one-shot weaver creation (SRService may block briefly).
     if (m_sr_weaver == nullptr && !m_sr_attempted) {
         m_sr_attempted = true;
+
+        // The SR DLLs are delay-loaded, so the first SDK call on a machine
+        // without the SR Platform raises an SEH from the delay-load helper
+        // instead of failing. Probe with LoadLibraryW first.
+        if (!leiasr::sr_runtime_available()) {
+            spdlog::warn("[Flat3D] LeiaSR: SR runtime DLLs not present — falling back to SbS");
+            return false;
+        }
 
         m_sr_context = try_create_sr_context();
 
@@ -2062,6 +2049,8 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
             if (wec != WeaverErrorCode::WeaverSuccess || m_sr_weaver == nullptr) {
                 spdlog::warn("[Flat3D] LeiaSR: CreateDX11Weaver failed (code {}) — falling back to SbS", (int)wec);
                 m_sr_weaver = nullptr;
+                try_delete_sr_context(m_sr_context);
+                m_sr_context = nullptr;
                 return false;
             }
 
@@ -2079,6 +2068,8 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
                 m_sr_weaver->destroy();
                 m_sr_weaver = nullptr;
             }
+            try_delete_sr_context(m_sr_context);
+            m_sr_context = nullptr;
             return false;
         }
 
@@ -2118,6 +2109,8 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
         spdlog::warn("[Flat3D] LeiaSR: weave threw — disabling weaver");
         m_sr_weaver->destroy();
         m_sr_weaver = nullptr;
+        try_delete_sr_context(m_sr_context);
+        m_sr_context = nullptr;
         return false;
     }
 
@@ -2137,8 +2130,14 @@ void Flat3DCompositorD3D11::destroy_leiasr() {
         m_sr_weaver->destroy();
         m_sr_weaver = nullptr;
     }
-    // SRContext is service-owned; do not delete (VRto3D pattern).
-    m_sr_context = nullptr;
+    // The context outlives the weaver, so it goes second. create() allocates it
+    // inside the SR DLL and deleteSRContext() is its matching free — leaking it
+    // instead (as earlier revisions did) leaves the SR service holding a session
+    // that can degrade across game restarts.
+    if (m_sr_context != nullptr) {
+        try_delete_sr_context(m_sr_context);
+        m_sr_context = nullptr;
+    }
     m_sr_attempted = false;
     m_sr_input_bound = false;
 #endif

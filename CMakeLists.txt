@@ -76,6 +76,19 @@ set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
 message(STATUS "Using vendored safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b + UEVR patches)...")
 add_subdirectory(dependencies/vendor/safetyhook)
 
+# LeiaSR (Simulated Reality) SDK. The SR-lib submodule's own CMake package owns
+# the SDK layout, the import-library set and the /DELAYLOAD list, so none of it
+# is hardcoded here: an SDK version bump or a new SR DLL is picked up without
+# touching this file. Consumed by [target.uevr] via SRLib::SDK +
+# srlib_apply_delayload(). Requires the api_expansion branch (see .gitmodules);
+# on master the submodule has no CMakeLists.txt and we silently build without
+# LeiaSR, exactly as with the submodule missing entirely.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/CMakeLists.txt")
+    add_subdirectory(dependencies/submodules/SR-lib)
+else()
+    message(STATUS "SR-lib: submodule not checked out (or on a branch without the CMake package); LeiaSR disabled.")
+endif()
+
 include(FetchContent)
 
 message(STATUS "Fetching bddisasm (70db095765ab2066dd88dfb7bbcc42259ed167c5)...")
@@ -872,6 +885,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/flat3d/Flat3DDisplayTiming.hpp"
 	"src/mods/vr/flat3d/Flat3DKatanga.hpp"
 	"src/mods/vr/flat3d/Flat3DKatangaD3D12.hpp"
+	"src/mods/vr/flat3d/Flat3DLeiaSRRuntime.hpp"
 	"src/mods/vr/flat3d/Flat3DShaders.hpp"
 	"src/mods/vr/runtimes/Flat3D.hpp"
 	"src/mods/vr/runtimes/OpenVR.hpp"
@@ -928,8 +942,6 @@ target_include_directories(uevr PUBLIC
 	"dependencies/vendor/renderdoc"
 	"dependencies/submodules/nvapi"
 	"dependencies/submodules/adl_sdk/include"
-	"dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/include"
-	"dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/third_party/OpenCV/include"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -954,11 +966,6 @@ target_link_libraries(uevr PUBLIC
 	pdafwmod
 	delayimp
 	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/nvapi/amd64/nvapi64.lib"
-	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/simulatedreality.lib"
-	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/SimulatedRealityCore.lib"
-	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/SimulatedRealityDirectX.lib"
-	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/lib/DimencoWeaving.lib"
-	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/SR-SDK-1.34.10/x64/third_party/OpenCV/lib/x64/opencv_core343.lib"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -970,7 +977,7 @@ set_target_properties(uevr PROPERTIES
 	OUTPUT_NAME
 		UEVRBackend
 	LINK_FLAGS
-		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:nvapi64.dll /DELAYLOAD:simulatedreality.dll /DELAYLOAD:SimulatedRealityCore.dll /DELAYLOAD:SimulatedRealityDirectX.dll /DELAYLOAD:DimencoWeaving.dll /DELAYLOAD:opencv_core343.dll /DELAYLOAD:opencv_world343.dll"
+		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:nvapi64.dll"
 	RUNTIME_OUTPUT_DIRECTORY_RELEASE
 		"${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 	RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO
@@ -1003,6 +1010,26 @@ add_custom_command(
 # Build the RenderDoc launcher + smoke tools and stage renderdoc.dll beside
 # UEVRBackend.dll. No-op if RenderDoc isn't available on this machine.
 uevr_attach_full_renderdoc(uevr)
+
+# LeiaSR. SRLib::SDK brings the SR + third_party include dirs (which is what the
+# compositors' __has_include("sr/weaver/dx11weaver.h") probe keys off, so this
+# is also the switch that compiles the LeiaSR paths in at all) and every import
+# library. srlib_apply_delayload() applies the full /DELAYLOAD set so
+# UEVRBackend.dll still loads on machines that have never had the SR Platform
+# installed — the loader would otherwise refuse it with a popup naming
+# opencv_world343.dll before any of our code runs.
+#
+# We deliberately link SRLib::SDK and not SRLib::SR: the wrapper's
+# SRInterfaceDX11 hands the weaver the full texture width, while this project's
+# hardware-verified DX11 convention is per-eye width (see weave_leiasr in
+# Flat3DCompositorD3D11.cpp). Revisit if that divergence is ever resolved
+# upstream.
+if(SRLIB_FOUND)
+    target_link_libraries(uevr PRIVATE SRLib::SDK)
+    srlib_apply_delayload(uevr)
+else()
+    message(STATUS "uevr: building without LeiaSR support (SR-lib SDK not found).")
+endif()
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)

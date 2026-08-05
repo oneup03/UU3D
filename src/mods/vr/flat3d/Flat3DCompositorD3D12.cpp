@@ -16,6 +16,8 @@
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
 #include <sr/management/srcontext.h>
 #include <sr/weaver/dx12weaver.h>
+
+#include "Flat3DLeiaSRRuntime.hpp"
 #endif
 
 namespace vrmod::flat3d {
@@ -2056,13 +2058,6 @@ bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Fla
 }
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
-#ifndef _DPI_AWARENESS_CONTEXTS_
-DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
-#endif
-#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
-#endif
-
 namespace {
 // SEH-guarded SRContext::create — a missing/hard-crashing SR runtime (or a
 // failing delay-load) must not take the game down. Lives in its own function
@@ -2075,37 +2070,16 @@ SR::SRContext* try_create_sr_context_dx12() {
     }
 }
 
-// The SR runtime maps the lenticular weave onto PHYSICAL panel pixels via the
-// window handle — every SR SDK sample sets PROCESS_PER_MONITOR_DPI_AWARE at
-// startup for exactly this reason. When the host game is NOT per-monitor-aware
-// (most UE titles), the runtime's window/monitor queries return DPI-virtualized
-// coordinates, so on a scaled display the weave is confined to a sub-region of
-// the panel (symptom: only the top-left corner weaves). We can't change the
-// process's (or window's) awareness after the fact, but making THIS thread
-// per-monitor-aware around the weaver's create + weave calls makes those
-// queries resolve to real pixels that match the native backbuffer. No-op when
-// the API is unavailable (pre-Win10 1607) or the thread is already aware.
-struct ScopedPerMonitorDpi {
-    using SetCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
-    SetCtxFn set_ctx{nullptr};
-    DPI_AWARENESS_CONTEXT prev{nullptr};
-
-    ScopedPerMonitorDpi() {
-        if (auto* user32 = GetModuleHandleW(L"user32.dll")) {
-            set_ctx = (SetCtxFn)GetProcAddress(user32, "SetThreadDpiAwarenessContext");
-        }
-        if (set_ctx != nullptr) {
-            prev = set_ctx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        }
+// SRContext::create() allocates inside the SR DLL, so it is paired with
+// deleteSRContext() — not with `delete`, which would free it on our heap.
+// Guarded for the same reason as creation: teardown can run after the SR
+// service has already gone away.
+void try_delete_sr_context_dx12(SR::SRContext* context) {
+    __try {
+        SR::SRContext::deleteSRContext(context);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
-    ~ScopedPerMonitorDpi() {
-        if (set_ctx != nullptr && prev != nullptr) {
-            set_ctx(prev);
-        }
-    }
-    ScopedPerMonitorDpi(const ScopedPerMonitorDpi&) = delete;
-    ScopedPerMonitorDpi& operator=(const ScopedPerMonitorDpi&) = delete;
-};
+}
 } // namespace
 #endif
 
@@ -2120,10 +2094,18 @@ bool Flat3DCompositorD3D12::weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12R
     // create+weave interaction, so the weave maps to the full native panel
     // instead of a DPI-virtualized sub-region (top-left) under a non-per-
     // monitor-aware host game.
-    ScopedPerMonitorDpi dpi_guard{};
+    leiasr::ScopedPerMonitorDpi dpi_guard{};
 
     if (m_sr_weaver == nullptr && !m_sr_attempted) {
         m_sr_attempted = true;
+
+        // The SR DLLs are delay-loaded, so the first SDK call on a machine
+        // without the SR Platform raises an SEH from the delay-load helper
+        // instead of failing. Probe with LoadLibraryW first.
+        if (!leiasr::sr_runtime_available()) {
+            spdlog::warn("[Flat3D][D3D12] LeiaSR: SR runtime DLLs not present — falling back to SbS");
+            return false;
+        }
 
         m_sr_context = try_create_sr_context_dx12();
 
@@ -2137,6 +2119,8 @@ bool Flat3DCompositorD3D12::weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12R
             if (wec != WeaverErrorCode::WeaverSuccess || m_sr_weaver == nullptr) {
                 spdlog::warn("[Flat3D][D3D12] LeiaSR: CreateDX12Weaver failed (code {}) — SbS fallback", (int)wec);
                 m_sr_weaver = nullptr;
+                try_delete_sr_context_dx12(m_sr_context);
+                m_sr_context = nullptr;
                 return false;
             }
 
@@ -2151,6 +2135,8 @@ bool Flat3DCompositorD3D12::weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12R
                 m_sr_weaver->destroy();
                 m_sr_weaver = nullptr;
             }
+            try_delete_sr_context_dx12(m_sr_context);
+            m_sr_context = nullptr;
             return false;
         }
 
@@ -2206,6 +2192,8 @@ bool Flat3DCompositorD3D12::weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12R
         spdlog::warn("[Flat3D][D3D12] LeiaSR: weave threw — disabling weaver");
         m_sr_weaver->destroy();
         m_sr_weaver = nullptr;
+        try_delete_sr_context_dx12(m_sr_context);
+        m_sr_context = nullptr;
         barrier(cmd, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         return false;
     }
@@ -2224,7 +2212,14 @@ void Flat3DCompositorD3D12::destroy_leiasr() {
         m_sr_weaver->destroy();
         m_sr_weaver = nullptr;
     }
-    m_sr_context = nullptr; // service-owned
+    // The context outlives the weaver, so it goes second. create() allocates it
+    // inside the SR DLL and deleteSRContext() is its matching free — leaking it
+    // instead (as earlier revisions did) leaves the SR service holding a session
+    // that can degrade across game restarts.
+    if (m_sr_context != nullptr) {
+        try_delete_sr_context_dx12(m_sr_context);
+        m_sr_context = nullptr;
+    }
     m_sr_attempted = false;
     m_sr_input_bound = false;
 #endif
