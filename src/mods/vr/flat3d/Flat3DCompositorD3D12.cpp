@@ -17,6 +17,16 @@
 #include <sr/management/srcontext.h>
 #include <sr/weaver/dx12weaver.h>
 
+// Switchable-lens control comes from SR-lib's facade rather than the SDK: it
+// owns the per-frame idempotence and the fixed-lens-panel latch, so every
+// consumer gets the same behavior. Present only when uevr links SRLib::SR.
+#if defined(__has_include)
+#if __has_include("SR.hpp")
+#define UEVR_FLAT3D_HAS_LEIASR_LENS 1
+#include <SR.hpp>
+#endif
+#endif
+
 #include "Flat3DLeiaSRRuntime.hpp"
 #endif
 
@@ -1397,6 +1407,11 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         leia_done = weave_leiasr(cmd, backbuffer, out_w, out_h, hwnd);
     }
 
+    // The lens preference tracks whether we actually wove, not the requested
+    // mode: a LeiaSR frame that fell back to SbS must not leave the panel
+    // lensed either. Idempotent, so this costs nothing on unchanged frames.
+    set_leiasr_lens(leia_done);
+
     // --- 3b. Repack into the real backbuffer --------------------------------
     if (!leia_done) {
         D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
@@ -2190,6 +2205,9 @@ bool Flat3DCompositorD3D12::weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12R
         // SR service crash / display unplug mid-session — disable and fall
         // back to SbS instead of taking the game down.
         spdlog::warn("[Flat3D][D3D12] LeiaSR: weave threw — disabling weaver");
+        // Hand the lens back BEFORE the context that owns the hint dies.
+        set_leiasr_lens(false);
+        forget_leiasr_lens();
         m_sr_weaver->destroy();
         m_sr_weaver = nullptr;
         try_delete_sr_context_dx12(m_sr_context);
@@ -2206,7 +2224,45 @@ bool Flat3DCompositorD3D12::weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12R
 #endif
 }
 
+void Flat3DCompositorD3D12::set_leiasr_lens(bool enabled) {
+#if defined(UEVR_FLAT3D_HAS_LEIASR_DX12) && defined(UEVR_FLAT3D_HAS_LEIASR_LENS)
+    if (m_sr_context == nullptr) {
+        return;
+    }
+
+    // We drive the SDK weaver ourselves, so SR-lib has no context of its own to
+    // hang the hint on — lend it ours. Re-adopting the same pointer is a no-op,
+    // and by here the context is necessarily initialize()d (a frame has woven).
+    SimulatedReality::SRAdoptContext(m_sr_context);
+
+    const HRESULT hr = enabled ? SimulatedReality::SREnableLensHint()
+                               : SimulatedReality::SRDisableLensHint();
+
+    // S_FALSE = already in that state (the common per-frame case). Only a real
+    // transition is worth a line; E_NOINTERFACE just means a fixed-lens panel.
+    if (hr == S_OK) {
+        spdlog::info("[Flat3D] LeiaSR: switchable lens {}", enabled ? "enabled" : "released");
+    }
+#else
+    (void)enabled;
+#endif
+}
+
+void Flat3DCompositorD3D12::forget_leiasr_lens() {
+#ifdef UEVR_FLAT3D_HAS_LEIASR_LENS
+    // The context we lent out is about to be deleted and it owns the hint, so
+    // SR-lib has to drop its pointer before that happens.
+    SimulatedReality::SRReleaseAdoptedContext();
+#endif
+}
+
 void Flat3DCompositorD3D12::destroy_leiasr() {
+    // Release the lens while the SRContext that owns the hint is still alive —
+    // a game exit or device reset must not leave the panel lensed for whatever
+    // runs next.
+    set_leiasr_lens(false);
+    forget_leiasr_lens();
+
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
     if (m_sr_weaver != nullptr) {
         m_sr_weaver->destroy();

@@ -885,6 +885,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/flat3d/Flat3DDisplayTiming.hpp"
 	"src/mods/vr/flat3d/Flat3DKatanga.hpp"
 	"src/mods/vr/flat3d/Flat3DKatangaD3D12.hpp"
+	"src/mods/vr/flat3d/Flat3DLeiaSRLens.hpp"
 	"src/mods/vr/flat3d/Flat3DLeiaSRRuntime.hpp"
 	"src/mods/vr/flat3d/Flat3DShaders.hpp"
 	"src/mods/vr/runtimes/Flat3D.hpp"
@@ -1019,13 +1020,14 @@ uevr_attach_full_renderdoc(uevr)
 # installed — the loader would otherwise refuse it with a popup naming
 # opencv_world343.dll before any of our code runs.
 #
-# We deliberately link SRLib::SDK and not SRLib::SR: the wrapper's
-# SRInterfaceDX11 hands the weaver the full texture width, while this project's
-# hardware-verified DX11 convention is per-eye width (see weave_leiasr in
-# Flat3DCompositorD3D11.cpp). Revisit if that divergence is ever resolved
-# upstream.
+# SRLib::SR (which PUBLIC-links SRLib::SDK, so the above still applies) adds
+# SR.cpp + SR.hpp. We use exactly one thing from the wrapper: the switchable
+# lens-hint API, via SRAdoptContext — see Flat3DLeiaSRLens.hpp. We do NOT use
+# its SRInterface* weavers, and must not start: SRInterfaceDX11 hands the weaver
+# the full texture width, while this project's hardware-verified DX11 convention
+# is per-eye width (see weave_leiasr in Flat3DCompositorD3D11.cpp).
 if(SRLIB_FOUND)
-    target_link_libraries(uevr PRIVATE SRLib::SDK)
+    target_link_libraries(uevr PRIVATE SRLib::SR)
     srlib_apply_delayload(uevr)
 else()
     message(STATUS "uevr: building without LeiaSR support (SR-lib SDK not found).")

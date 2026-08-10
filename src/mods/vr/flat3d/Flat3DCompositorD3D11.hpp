@@ -120,6 +120,14 @@ private:
                        uint32_t eye_refresh_mask);
     bool weave_leiasr(ID3D11DeviceContext* context, ID3D11RenderTargetView* backbuffer_rtv,
                       uint32_t out_w, uint32_t out_h, const Flat3DFrameParams& params);
+    // Take/release the display's switchable lens. Driven per-frame off whether
+    // a weave actually happened, so leaving LeiaSR — by mode switch or by
+    // weaver failure — hands the lens back instead of leaving the panel lensed
+    // under every other output mode. No-ops without a switchable lens.
+    void set_leiasr_lens(bool enabled);
+    // Drop the hint pointer because its owning SRContext is going away. Always
+    // preceded by set_leiasr_lens(false) while the context is still alive.
+    void forget_leiasr_lens();
     void destroy_leiasr();
 
     bool m_ready{false};
