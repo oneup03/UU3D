@@ -9,18 +9,19 @@
 
 #include "Flat3DShaders.hpp"
 
-// LeiaSR SR SDK is optional: present only when the SDK's include dir is on
-// the include path (add it + simulatedreality libs via cmake.toml to enable).
+// LeiaSR is optional, and reached through SR-lib's SR.hpp facade rather than
+// the SR SDK directly — SR-lib owns the context lifetime, the DLL preflight and
+// the initialize() ordering. Keying the probe on SR.hpp (not an SDK header) is
+// what makes this track whether uevr actually links SRLib::SR.
 #if defined(__has_include)
-#if __has_include("sr/weaver/dx11weaver.h")
+#if __has_include("SR.hpp")
 #define UEVR_FLAT3D_HAS_LEIASR 1
 #endif
 #endif
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR
-namespace SR {
-class SRContext;
-class IDX11Weaver1;
+namespace SimulatedReality {
+class SRInterfaceDX11;
 }
 #endif
 
@@ -123,11 +124,9 @@ private:
     // Take/release the display's switchable lens. Driven per-frame off whether
     // a weave actually happened, so leaving LeiaSR — by mode switch or by
     // weaver failure — hands the lens back instead of leaving the panel lensed
-    // under every other output mode. No-ops without a switchable lens.
+    // under every other output mode. Idempotent in SR-lib, and a no-op on a
+    // display with no switchable lens.
     void set_leiasr_lens(bool enabled);
-    // Drop the hint pointer because its owning SRContext is going away. Always
-    // preceded by set_leiasr_lens(false) while the context is still alive.
-    void forget_leiasr_lens();
     void destroy_leiasr();
 
     bool m_ready{false};
@@ -257,8 +256,10 @@ private:
     uint32_t m_sbs_w{0}; // display-res SbS (per-eye) dimensions
     uint32_t m_sbs_h{0};
 #ifdef UEVR_FLAT3D_HAS_LEIASR
-    SR::SRContext* m_sr_context{nullptr};
-    SR::IDX11Weaver1* m_sr_weaver{nullptr};
+    // SR-lib owns the SRContext and the IDX11Weaver1 behind this handle,
+    // including the create/deleteSRContext pairing and destroying the weaver
+    // before the context. Released with Delete(), not delete.
+    SimulatedReality::SRInterfaceDX11* m_sr{nullptr};
     bool m_sr_attempted{false};
     bool m_sr_input_bound{false};
 #endif

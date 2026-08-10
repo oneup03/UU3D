@@ -11,17 +11,19 @@
 
 #include "Flat3DShaders.hpp"
 
-// LeiaSR SR SDK is optional (same detection as the D3D11 side, DX12 weaver).
+// LeiaSR is optional, and reached through SR-lib's SR.hpp facade rather than
+// the SR SDK directly — SR-lib owns the context lifetime, the DLL preflight and
+// the initialize() ordering. Keying the probe on SR.hpp (not an SDK header) is
+// what makes this track whether uevr actually links SRLib::SR.
 #if defined(__has_include)
-#if __has_include("sr/weaver/dx12weaver.h")
+#if __has_include("SR.hpp")
 #define UEVR_FLAT3D_HAS_LEIASR_DX12 1
 #endif
 #endif
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
-namespace SR {
-class SRContext;
-class IDX12Weaver1;
+namespace SimulatedReality {
+class SRInterfaceDX12;
 }
 #endif
 
@@ -123,11 +125,9 @@ private:
     // Take/release the display's switchable lens. Driven per-frame off whether
     // a weave actually happened, so leaving LeiaSR — by mode switch or by
     // weaver failure — hands the lens back instead of leaving the panel lensed
-    // under every other output mode. No-ops without a switchable lens.
+    // under every other output mode. Idempotent in SR-lib, and a no-op on a
+    // display with no switchable lens.
     void set_leiasr_lens(bool enabled);
-    // Drop the hint pointer because its owning SRContext is going away. Always
-    // preceded by set_leiasr_lens(false) while the context is still alive.
-    void forget_leiasr_lens();
     void destroy_leiasr();
 
     bool m_ready{false};
@@ -253,8 +253,10 @@ private:
     uint32_t m_sbs_h{0};
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
-    SR::SRContext* m_sr_context{nullptr};
-    SR::IDX12Weaver1* m_sr_weaver{nullptr};
+    // SR-lib owns the SRContext and the IDX12Weaver1 behind this handle,
+    // including the create/deleteSRContext pairing and destroying the weaver
+    // before the context. Released with Delete(), not delete.
+    SimulatedReality::SRInterfaceDX12* m_sr{nullptr};
     bool m_sr_attempted{false};
     bool m_sr_input_bound{false};
 #endif

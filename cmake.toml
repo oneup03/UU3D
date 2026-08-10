@@ -335,20 +335,18 @@ add_custom_command(
 # UEVRBackend.dll. No-op if RenderDoc isn't available on this machine.
 uevr_attach_full_renderdoc(uevr)
 
-# LeiaSR. SRLib::SDK brings the SR + third_party include dirs (which is what the
-# compositors' __has_include("sr/weaver/dx11weaver.h") probe keys off, so this
-# is also the switch that compiles the LeiaSR paths in at all) and every import
+# LeiaSR. SRLib::SR is the whole integration: SR.cpp/SR.hpp wrap the SDK, and it
+# PUBLIC-links SRLib::SDK for the SR + third_party include dirs and every import
 # library. srlib_apply_delayload() applies the full /DELAYLOAD set so
 # UEVRBackend.dll still loads on machines that have never had the SR Platform
 # installed — the loader would otherwise refuse it with a popup naming
 # opencv_world343.dll before any of our code runs.
 #
-# SRLib::SR (which PUBLIC-links SRLib::SDK, so the above still applies) adds
-# SR.cpp + SR.hpp. We use exactly one thing from the wrapper: the switchable
-# lens-hint API, via SRAdoptContext — see Flat3DLeiaSRLens.hpp. We do NOT use
-# its SRInterface* weavers, and must not start: SRInterfaceDX11 hands the weaver
-# the full texture width, while this project's hardware-verified DX11 convention
-# is per-eye width (see weave_leiasr in Flat3DCompositorD3D11.cpp).
+# Both compositors go through SRInterfaceDX11 / SRInterfaceDX12 and never touch
+# the SDK directly, so SR-lib owns the SRContext lifetime, the DLL preflight and
+# the load-bearing "initialize() after weaver creation" ordering. Their
+# __has_include("SR.hpp") probe is what compiles the LeiaSR paths in at all, so
+# it keys off this link rather than off an SDK header being present.
 if(SRLIB_FOUND)
     target_link_libraries(uevr PRIVATE SRLib::SR)
     srlib_apply_delayload(uevr)

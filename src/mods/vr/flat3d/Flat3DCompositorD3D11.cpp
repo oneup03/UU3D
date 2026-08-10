@@ -1,3 +1,10 @@
+// Before any header that reaches windows.h: its min/max macros break the
+// std::min/std::max calls below. This used to come in by accident, via the SR
+// SDK's display.h; SR-lib's facade doesn't include it, so say it explicitly.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -14,18 +21,9 @@
 #include "Flat3DCompositorD3D11.hpp"
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR
-#include <sr/management/srcontext.h>
-#include <sr/weaver/dx11weaver.h>
-
-// Switchable-lens control comes from SR-lib's facade rather than the SDK: it
-// owns the per-frame idempotence and the fixed-lens-panel latch, so every
-// consumer gets the same behavior. Present only when uevr links SRLib::SR.
-#if defined(__has_include)
-#if __has_include("SR.hpp")
-#define UEVR_FLAT3D_HAS_LEIASR_LENS 1
+// No SR SDK headers here: everything goes through SR-lib's facade, which keeps
+// SRContext's transitive OpenCV includes out of this TU entirely.
 #include <SR.hpp>
-#endif
-#endif
 
 #include "Flat3DLeiaSRRuntime.hpp"
 #endif
@@ -1735,41 +1733,17 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
 
 bool Flat3DCompositorD3D11::leiasr_available() const {
 #ifdef UEVR_FLAT3D_HAS_LEIASR
-    // True while the weaver exists OR creation hasn't been attempted yet —
+    // True while the interface exists OR creation hasn't been attempted yet —
     // weave_leiasr() creates it lazily on the first call, so gating on the
-    // weaver alone would mean it never gets created. The runtime probe keeps
-    // us out of the SDK entirely on machines without the SR Platform.
-    return m_sr_weaver != nullptr || (!m_sr_attempted && leiasr::sr_runtime_available());
+    // interface alone would mean it never gets created. The runtime probe keeps
+    // us out of the SDK entirely on machines without the SR Platform (SR-lib
+    // probes again inside Create*, but this one runs before we commit to the
+    // LeiaSR branch at all).
+    return m_sr != nullptr || (!m_sr_attempted && leiasr::sr_runtime_available());
 #else
     return false;
 #endif
 }
-
-#ifdef UEVR_FLAT3D_HAS_LEIASR
-namespace {
-// SEH-guarded SRContext::create — a missing/hard-crashing SR runtime must not
-// take the game down (VRto3D leiasr_presenter pattern). Lives in its own
-// function because __try cannot share a function with C++ try/catch.
-SR::SRContext* try_create_sr_context() {
-    __try {
-        return SR::SRContext::create();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-// SRContext::create() allocates inside the SR DLL, so it is paired with
-// deleteSRContext() — not with `delete`, which would free it on our heap.
-// Guarded for the same reason as creation: teardown can run after the SR
-// service has already gone away.
-void try_delete_sr_context(SR::SRContext* context) {
-    __try {
-        SR::SRContext::deleteSRContext(context);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-} // namespace
-#endif
 
 bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3DFrameParams& params,
                                       uint32_t out_w, uint32_t out_h) {
@@ -2044,53 +2018,27 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
     leiasr::ScopedPerMonitorDpi dpi_guard{};
 
     // Lazy one-shot weaver creation (SRService may block briefly).
-    if (m_sr_weaver == nullptr && !m_sr_attempted) {
+    if (m_sr == nullptr && !m_sr_attempted) {
         m_sr_attempted = true;
 
-        // The SR DLLs are delay-loaded, so the first SDK call on a machine
-        // without the SR Platform raises an SEH from the delay-load helper
-        // instead of failing. Probe with LoadLibraryW first.
-        if (!leiasr::sr_runtime_available()) {
-            spdlog::warn("[Flat3D] LeiaSR: SR runtime DLLs not present — falling back to SbS");
+        // One call replaces context creation, weaver creation and initialize():
+        // SR-lib performs them in the required order (the initialize MUST
+        // follow weaver creation or eye tracking silently never starts), probes
+        // the delay-loaded SR DLLs before touching any SDK entry point, and
+        // converts the SDK's exceptions — notably ServerNotAvailableException
+        // when the service isn't running — into an HRESULT. It also applies the
+        // weaver defaults (latency 1 frame, late latching on).
+        const HRESULT hr = SimulatedReality::CreateSRInterfaceDX11(context, m_hwnd, &m_sr);
+
+        if (FAILED(hr) || m_sr == nullptr) {
+            spdlog::warn("[Flat3D] LeiaSR: CreateSRInterfaceDX11 failed (hr {:#x}) — falling back to SbS",
+                         (uint32_t)hr);
+            m_sr = nullptr;
             return false;
         }
 
-        m_sr_context = try_create_sr_context();
-
-        if (m_sr_context == nullptr) {
-            spdlog::warn("[Flat3D] LeiaSR: SRContext::create failed (SRService not running?) — falling back to SbS");
-            return false;
-        }
-
-        try {
-            const auto wec = SR::CreateDX11Weaver(m_sr_context, context, m_hwnd, &m_sr_weaver);
-
-            if (wec != WeaverErrorCode::WeaverSuccess || m_sr_weaver == nullptr) {
-                spdlog::warn("[Flat3D] LeiaSR: CreateDX11Weaver failed (code {}) — falling back to SbS", (int)wec);
-                m_sr_weaver = nullptr;
-                try_delete_sr_context(m_sr_context);
-                m_sr_context = nullptr;
-                return false;
-            }
-
-            // Input is sRGB 8-bit from the engine; weaver converts on read/write.
-            m_sr_weaver->setShaderSRGBConversion(true, true);
-            m_sr_weaver->setLatencyInFrames(1);
-            m_sr_weaver->setContext(context);
-
-            // MUST run AFTER weaver creation: starts eye tracking. Without it
-            // every call succeeds but the weave never responds to head movement.
-            m_sr_context->initialize();
-        } catch (...) {
-            spdlog::warn("[Flat3D] LeiaSR: weaver init threw — falling back to SbS");
-            if (m_sr_weaver != nullptr) {
-                m_sr_weaver->destroy();
-                m_sr_weaver = nullptr;
-            }
-            try_delete_sr_context(m_sr_context);
-            m_sr_context = nullptr;
-            return false;
-        }
+        // Input is sRGB 8-bit from the engine; weaver converts on read/write.
+        m_sr->SetShaderSRGBConversion(true, true);
 
         spdlog::info("[Flat3D] LeiaSR weaver ready");
     }
@@ -2102,13 +2050,19 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
         return false;
     }
 
-    if (m_sr_weaver != nullptr && !m_sr_input_bound) {
-        m_sr_weaver->setInputViewTexture(m_sbs_srv.Get(), (int)m_sbs_w, (int)m_sbs_h, view_format_for(m_eye_format));
-        m_sr_input_bound = true;
+    if (m_sr == nullptr) {
+        return false;
     }
 
-    if (m_sr_weaver == nullptr) {
-        return false;
+    if (!m_sr_input_bound) {
+        // SR-lib reads width/height/format off the resource behind the SRV, so
+        // the weaver gets the FULL combined-SbS width (2W) that m_sbs_tex
+        // actually has. This used to pass m_sbs_w — the PER-EYE width — for a
+        // 2W-wide texture, which under-reported it by half; every other use of
+        // m_sbs_w in build_sbs doubles it, and the SDK documents this parameter
+        // identically on all four backends as "width of the texture".
+        m_sr->SetInputTexture(m_sbs_srv.Get());
+        m_sr_input_bound = true;
     }
 
     D3D11_VIEWPORT viewport{};
@@ -2121,18 +2075,16 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
     context->RSSetViewports(1, &viewport);
 
     try {
-        m_sr_weaver->weave();
+        m_sr->Weave();
     } catch (...) {
         // SR service crash / display unplug mid-session — disable and fall
         // back to SbS instead of taking the game down.
         spdlog::warn("[Flat3D] LeiaSR: weave threw — disabling weaver");
-        // Hand the lens back BEFORE the context that owns the hint dies.
+        // Hand the lens back BEFORE Delete() destroys the context that owns it.
         set_leiasr_lens(false);
-        forget_leiasr_lens();
-        m_sr_weaver->destroy();
-        m_sr_weaver = nullptr;
-        try_delete_sr_context(m_sr_context);
-        m_sr_context = nullptr;
+        m_sr->Delete(); // weaver then context, in that order
+        m_sr = nullptr;
+        m_sr_input_bound = false;
         return false;
     }
 
@@ -2147,16 +2099,13 @@ bool Flat3DCompositorD3D11::weave_leiasr(ID3D11DeviceContext* context, ID3D11Ren
 }
 
 void Flat3DCompositorD3D11::set_leiasr_lens(bool enabled) {
-#if defined(UEVR_FLAT3D_HAS_LEIASR) && defined(UEVR_FLAT3D_HAS_LEIASR_LENS)
-    if (m_sr_context == nullptr) {
+#ifdef UEVR_FLAT3D_HAS_LEIASR
+    if (m_sr == nullptr) {
         return;
     }
 
-    // We drive the SDK weaver ourselves, so SR-lib has no context of its own to
-    // hang the hint on — lend it ours. Re-adopting the same pointer is a no-op,
-    // and by here the context is necessarily initialize()d (a frame has woven).
-    SimulatedReality::SRAdoptContext(m_sr_context);
-
+    // Context-scoped, so it works off the context SR-lib created for our
+    // interface — nothing to wire up beyond having an interface alive.
     const HRESULT hr = enabled ? SimulatedReality::SREnableLensHint()
                                : SimulatedReality::SRDisableLensHint();
 
@@ -2170,33 +2119,20 @@ void Flat3DCompositorD3D11::set_leiasr_lens(bool enabled) {
 #endif
 }
 
-void Flat3DCompositorD3D11::forget_leiasr_lens() {
-#ifdef UEVR_FLAT3D_HAS_LEIASR_LENS
-    // The context we lent out is about to be deleted and it owns the hint, so
-    // SR-lib has to drop its pointer before that happens.
-    SimulatedReality::SRReleaseAdoptedContext();
-#endif
-}
-
 void Flat3DCompositorD3D11::destroy_leiasr() {
-    // Release the lens while the SRContext that owns the hint is still alive —
-    // a game exit or device reset must not leave the panel lensed for whatever
-    // runs next.
+    // Release the lens while the interface — and so the SRContext that owns the
+    // hint — is still alive. A game exit or device reset must not leave the
+    // panel lensed for whatever runs next.
     set_leiasr_lens(false);
-    forget_leiasr_lens();
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR
-    if (m_sr_weaver != nullptr) {
-        m_sr_weaver->destroy();
-        m_sr_weaver = nullptr;
-    }
-    // The context outlives the weaver, so it goes second. create() allocates it
-    // inside the SR DLL and deleteSRContext() is its matching free — leaking it
-    // instead (as earlier revisions did) leaves the SR service holding a session
-    // that can degrade across game restarts.
-    if (m_sr_context != nullptr) {
-        try_delete_sr_context(m_sr_context);
-        m_sr_context = nullptr;
+    if (m_sr != nullptr) {
+        // Delete() tears down the weaver and then the context, in that order,
+        // and pairs SRContext::create with deleteSRContext (the SDK's matching
+        // free — plain delete would free it on the wrong heap, and leaking it
+        // leaves the SR service holding a session that degrades across restarts).
+        m_sr->Delete();
+        m_sr = nullptr;
     }
     m_sr_attempted = false;
     m_sr_input_bound = false;
