@@ -440,6 +440,221 @@ constexpr auto AVOWED_NATIVE_FIX_TRANSITION_HOLD = std::chrono::seconds(10);
 constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_HOLD = std::chrono::milliseconds(1500);
 constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_MAX_MISSING = std::chrono::seconds(60);
 
+// Engine version, resolved without depending on the executable's version
+// resource being the ENGINE's version. Games built from a private engine tree
+// ship neither of the two things the SDK looks at: Elliot (UE5.6.1) stamps
+// Square Enix's own 1.2.0.0 in the version resource and its BRANCH_NAME is just
+// "UE5", not "++UE5+Release-5.6", so every version gate below took its UE4
+// fallback. The engine's own "Unreal Engine <major>.<minor>.<patch>" display
+// string survives that, so use it as a last resort.
+// Returns "<major>.<minor>", or "0.00" when nothing could be established.
+std::string resolved_engine_version_string() {
+    static const std::string result = []() -> std::string {
+        if (const auto branch = sdk::search_for_version(utility::get_executable())) {
+            return utility::narrow(*branch);
+        }
+
+        const auto module = utility::get_executable();
+        const auto module_size = utility::get_module_size(module).value_or(0);
+        constexpr std::wstring_view needle{L"Unreal Engine "};
+        constexpr size_t version_headroom = 16; // major.minor.patch + terminator
+
+        const auto count = module_size / sizeof(wchar_t);
+        const auto start = (const wchar_t*)module;
+
+        auto parse_digits = [](const wchar_t* str, size_t& index, uint32_t& out) {
+            size_t digits = 0;
+            out = 0;
+
+            while (digits < 3 && str[index] >= L'0' && str[index] <= L'9') {
+                out = (out * 10) + (uint32_t)(str[index] - L'0');
+                ++index;
+                ++digits;
+            }
+
+            return digits > 0;
+        };
+
+        for (size_t i = 0; i + needle.size() + version_headroom < count; ++i) try {
+            const wchar_t* ptr = start + i;
+
+            if (ptr[0] != L'U' || ptr[1] != L'n' || std::wmemcmp(ptr, needle.data(), needle.size()) != 0) {
+                continue;
+            }
+
+            const wchar_t* version = ptr + needle.size();
+            size_t index = 0;
+            uint32_t major{};
+            uint32_t minor{};
+
+            if (!parse_digits(version, index, major) || version[index] != L'.') {
+                continue;
+            }
+
+            ++index;
+
+            if (!parse_digits(version, index, minor)) {
+                continue;
+            }
+
+            // Only trust it when it looks like an engine version rather than prose
+            if (major != 4 && major != 5) {
+                continue;
+            }
+
+            SPDLOG_INFO("[EngineVersion] Recovered {}.{} from the embedded \"Unreal Engine\" string", major, minor);
+            return std::to_string(major) + "." + std::to_string(minor);
+        } catch (...) {
+            continue;
+        }
+
+        return "0.00";
+    }();
+
+    return result;
+}
+
+// The SDK resolves FRHITexture::GetNativeResource's vtable slot ONCE, on the
+// first call, and only takes its safe UE5.5/5.6 direct-slot path when the
+// executable's version resource says 5.5/5.6. When the version resource holds
+// a game version instead (see resolved_engine_version_string), it falls back to
+// blind-calling vtable slots 2..14 on a live FRHITexture — which on Elliot hung
+// the render thread for 60 seconds and then killed the engine with
+// "A FRenderResource was deleted without being released first!".
+//
+// We cannot change what the SDK reads, but it consults its discovery cache
+// before that fallback, and it VALIDATES any cached slot with an SEH-guarded
+// call before trusting it. So seed the cache with a slot we established safely
+// ourselves: probe only the slots the UE5.5/5.6 D3D12 layouts actually use,
+// under SEH, and require a real D3D resource back. Must run before the first
+// get_native_resource() call anywhere - see the callers.
+void* seh_call_native_resource_candidate(const void* texture, void* function) {
+    __try {
+        using GetNativeResourceFn = void* (*)(const void*);
+        return ((GetNativeResourceFn)function)(texture);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+void seed_frhitexture_native_resource_slot(FRHITexture2D* texture) {
+    static bool s_done = false;
+
+    if (s_done || texture == nullptr || !g_framework->is_dx12() || IsBadReadPtr(texture, sizeof(void*))) {
+        return;
+    }
+
+    // Only needed while the SDK mis-reads the engine version; when the version
+    // resource is right it already takes the safe path on its own.
+    const auto sdk_version = sdk::get_file_version_info().dwFileVersionMS;
+    if (sdk_version == 0x00050005 || sdk_version == 0x00050006) {
+        s_done = true;
+        return;
+    }
+
+    const auto vtable = *(void***)texture;
+
+    if (vtable == nullptr || IsBadReadPtr(vtable, sizeof(void*) * 15) ||
+        !utility::get_module_within(vtable).has_value()) {
+        return; // not a usable candidate yet; try again on the next texture
+    }
+
+    // FRHITextureDesc placement identifies the layout, and each layout has its
+    // own defensible slot set (same table the SDK uses).
+    const auto texture_address = (uintptr_t)texture;
+    std::optional<uintptr_t> desc_offset{};
+
+    for (const uintptr_t candidate : {(uintptr_t)0x20, (uintptr_t)0xe0, (uintptr_t)0xf0}) {
+        if (IsBadReadPtr((void*)(texture_address + candidate), 0x38)) {
+            continue;
+        }
+
+        const auto extent_x = *(const int32_t*)(texture_address + candidate + 0x24);
+        const auto extent_y = *(const int32_t*)(texture_address + candidate + 0x28);
+        const auto num_mips = *(const uint8_t*)(texture_address + candidate + 0x30);
+        const auto num_samples = *(const uint8_t*)(texture_address + candidate + 0x31);
+        const auto dimension = *(const uint8_t*)(texture_address + candidate + 0x32);
+        const auto format = *(const uint8_t*)(texture_address + candidate + 0x33);
+
+        if (extent_x <= 0 || extent_y <= 0 || extent_x > 65536 || extent_y > 65536 ||
+            num_mips == 0 || num_mips > 32 ||
+            !(num_samples == 1 || num_samples == 2 || num_samples == 4 || num_samples == 8 || num_samples == 16) ||
+            dimension > 8 || format == 0 || format > 128) {
+            continue;
+        }
+
+        desc_offset = candidate;
+        break;
+    }
+
+    if (!desc_offset) {
+        return;
+    }
+
+    std::vector<size_t> slots{};
+    if (*desc_offset == 0xe0) {
+        slots = {7};
+    } else if (*desc_offset == 0xf0) {
+        slots = {5, 4};
+    } else {
+        slots = {4, 5};
+    }
+
+    for (const auto slot : slots) {
+        auto* const func = vtable[slot];
+
+        if (func == nullptr || IsBadReadPtr(func, 1)) {
+            continue;
+        }
+
+        auto* const resource = seh_call_native_resource_candidate(texture, func);
+
+        if (resource == nullptr || IsBadReadPtr(resource, sizeof(void*))) {
+            continue;
+        }
+
+        auto* const resource_vtable = *(void**)resource;
+
+        if (resource_vtable == nullptr || IsBadReadPtr(resource_vtable, sizeof(void*))) {
+            continue;
+        }
+
+        const auto resource_module = utility::get_module_within(resource_vtable);
+        const auto resource_module_path = resource_module ? utility::get_module_path(*resource_module) : std::nullopt;
+
+        if (!resource_module_path) {
+            continue;
+        }
+
+        auto lowered = std::string{*resource_module_path};
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+
+        if (!lowered.ends_with("d3d12.dll") && !lowered.ends_with("d3d12core.dll") && !lowered.ends_with("dxgi.dll")) {
+            continue;
+        }
+
+        if (const auto vtable_module = utility::get_module_within(vtable); vtable_module) {
+            sdk::discovery_cache::save_entry("frhitexture_get_native_resource", *vtable_module, {
+                {"vtable_index", (uint32_t)slot}
+            });
+        }
+
+        s_done = true;
+        SPDLOG_INFO(
+            "[NativeResource] Seeded FRHITexture::GetNativeResource slot {} (desc offset 0x{:x}) so the SDK never "
+            "blind-probes this title's vtable",
+            slot,
+            *desc_offset);
+        return;
+    }
+
+    SPDLOG_WARN_ONCE(
+        "[NativeResource] Could not establish a safe FRHITexture::GetNativeResource slot for texture {:x} "
+        "(desc offset 0x{:x})",
+        (uintptr_t)texture,
+        *desc_offset);
+}
+
 bool is_deadzone_ue56_executable() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -448,7 +663,7 @@ bool is_deadzone_ue56_executable() {
             return false;
         }
 
-        const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+        const auto str_version = resolved_engine_version_string();
         const auto file_version = sdk::get_file_version_info();
 
         return str_version.starts_with("5.6") || file_version.dwFileVersionMS == 0x00050006;
@@ -2505,7 +2720,7 @@ bool avowed_native_fix_gate_ready(uint32_t* out_stable_frames = nullptr, uint32_
 
 bool is_ue_5_7_or_newer() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         if (str_version.starts_with("5.7") || str_version.starts_with("5.8") || str_version.starts_with("5.9")) {
@@ -2518,7 +2733,7 @@ bool is_ue_5_7_or_newer() {
 
 bool is_ue_4_27_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("4.27");
@@ -2529,7 +2744,7 @@ bool is_ue_4_27_runtime() {
 
 bool is_ue_4_16_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("4.16");
@@ -2578,7 +2793,7 @@ bool prospi_is_current_game() {
 
 bool is_ue_5_8_or_newer() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         if (str_version.starts_with("5.8") || str_version.starts_with("5.9")) {
@@ -2591,7 +2806,7 @@ bool is_ue_5_8_or_newer() {
 
 bool is_ue_5_8() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.8");
@@ -2603,7 +2818,7 @@ bool is_ue_5_8() {
 
 bool is_ue_5_6_or_newer() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         if (str_version.starts_with("5.6") || str_version.starts_with("5.7") || str_version.starts_with("5.8") || str_version.starts_with("5.9")) {
@@ -2620,7 +2835,7 @@ bool is_ue_5_1_dx12_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.1");
@@ -2635,7 +2850,7 @@ bool is_ue_5_1_dx_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.1");
@@ -2650,7 +2865,7 @@ bool is_ue_5_2_dx_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.2");
@@ -2665,7 +2880,7 @@ bool is_ue_5_3_dx_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.3");
@@ -2676,7 +2891,7 @@ bool is_ue_5_3_dx_backend() {
 
 bool is_ue_5_0_to_5_3_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.0") ||
@@ -2690,7 +2905,7 @@ bool is_ue_5_0_to_5_3_runtime() {
 
 bool is_ue_5_4_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.4");
@@ -2709,7 +2924,7 @@ bool is_ue_5_4_dx_backend() {
 
 bool is_ue_5_5_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.5");
@@ -2740,7 +2955,7 @@ bool is_ue_5_6_dx12_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.6");
@@ -4595,6 +4810,27 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack() {
             // page-aligned address in Returnal and works; a size guard here
             // rejected it (nothing hooked → black right eye), and "improving"
             // it to the unwind-resolved body did not intercept either.
+
+            // find_virtual_function_start only accepts a start that some table
+            // in the module points at. BeginRenderingViewFamilies is not always
+            // in one: Elliot (UE5.6, private engine tree) devirtualizes it —
+            // the ViewExtensions loop sits in a chained .pdata fragment of a
+            // function with ZERO pointer references anywhere in .rdata/.data,
+            // so the vtable-validated resolve fails outright and NSF silently
+            // no-ops (corrupt right eye without the fix, black right eye with
+            // it, because the scene-capture pass is never issued).
+            // The unwind data still describes the real entry exactly — it walks
+            // UNW_FLAG_CHAININFO back to the primary RUNTIME_FUNCTION — so fall
+            // back to that rather than giving up. Never fall back to the raw
+            // return address: it points into the middle of the frame, and a
+            // chained fragment's start is not a callable entry either.
+            if (!candidate && unwind) {
+                SPDLOG_INFO(
+                    "[NativeStereoFix] BeginRenderingViewFamily has no table reference; using the unwind-resolved entry at {:x} (stack_index={}, pre-UE5.7 path)",
+                    *unwind,
+                    i);
+                return unwind;
+            }
 
             if (candidate) {
                 SPDLOG_INFO(
@@ -12175,9 +12411,10 @@ void FFakeStereoRenderingHook::localplayer_setup_viewpoint(void* localplayer, vo
 // the game — and so the log pinpoints which pass faulted. Plain args only
 // (no unwindable objects in a __try frame).
 static bool nsf_run_pass_guarded(
-    SafetyHookInline& hook, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+    SafetyHookInline& hook, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate,
+    void* trailing_ptr_arg, uintptr_t trailing_flag_arg) {
     __try {
-        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -12189,12 +12426,29 @@ static bool nsf_run_pass_guarded(
 static bool s_nsf_flow_disabled = false;
 
 
-static void nsf_brvf_member_handler(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+// The hooked function is NOT always the 3-argument singular overload. UE5.5+
+// moved the view-extension loop into
+// FRendererModule::BeginRenderingViewFamilies(Canvas, TArrayView<FSceneViewFamily*>,
+// FHitProxyConsumer*-or-builder, bool), and the pre-UE5.7 resolver hooks
+// whatever directly called the view extension — i.e. that 5-argument function
+// (Elliot/UE5.6: it loads the 4th argument straight into
+// FSceneRenderer::CreateSceneRenderer, choosing FDeferredShadingSceneRenderer vs
+// FMobileSceneRenderer, and the callers pass r9=consumer + a stack bool).
+// Re-calling the original with only three arguments therefore constructs the
+// scene renderer with whatever garbage is left in r9/[rsp+0x28] — the pass
+// silently renders nothing usable (observed as a frozen left eye with a live
+// right eye, because the two re-calls leave different garbage behind).
+// Accept and forward both trailing arguments. On the older 3-argument shape they
+// are ignored by the callee, and passing them costs nothing.
+static void nsf_brvf_member_handler(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate,
+                                    void* trailing_ptr_arg, uintptr_t trailing_flag_arg) {
     FFakeStereoRenderingHook::begin_render_viewfamily_real(
-        g_hook->get_render_module_begin_render_viewfamily_hook(), "primary", render_module, canvas, view_family_candidate);
+        g_hook->get_render_module_begin_render_viewfamily_hook(), "primary", render_module, canvas, view_family_candidate,
+        trailing_ptr_arg, trailing_flag_arg);
 }
 
-void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHook& hook, const char* tag, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHook& hook, const char* tag, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate,
+                                                            void* trailing_ptr_arg, uintptr_t trailing_flag_arg) {
     ZoneScopedN("BeginRenderViewFamilyReal");
     const auto profile_engine_render = should_profile_engine_render_timing();
     const auto begin_render_viewfamily_real_start =
@@ -12211,20 +12465,34 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHo
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamilyReal for the first time");
 
     if (!g_framework->is_game_data_intialized()) {
-        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         return;
     }
 
     auto& vr = VR::get();
     auto rtm = g_hook->get_render_target_manager();
 
+    // Once this hook installs it stays installed for the session, so with NSF
+    // switched back off every frame runs through here. Tear the capture down on
+    // the TRANSITION only: destroy_scene_capture() enqueues an RHI-thread task
+    // on every call even when there is nothing left to destroy, which gave
+    // plain Native Stereo a per-frame side effect it never had in titles where
+    // the hook could not install at all.
+    static bool s_capture_torn_down = false;
+
     if (!vr->is_hmd_active() || !vr->is_native_stereo_fix_enabled() || s_nsf_flow_disabled) {
         avowed_native_fix_gate_reset("hmd inactive or native stereo fix disabled");
-        rtm->destroy_scene_capture();
 
-        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        if (!s_capture_torn_down) {
+            rtm->destroy_scene_capture();
+            s_capture_torn_down = true;
+        }
+
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         return;
     }
+
+    s_capture_torn_down = false;
 
     // POSITIVE identification on SEH-PROBED COPIES only. In modular builds
     // (Returnal) this hooked address can be a shared/ICF-folded stub reached
@@ -12249,7 +12517,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHo
             SPDLOG_WARN("[NativeStereoFix] reject #{}: {} (candidate={:x} first_field={:x})",
                 s_nsf_reject_logged, reason, (uintptr_t)view_family_candidate, (uintptr_t)first_field);
         }
-        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
     };
     if (view_family_candidate == nullptr ||
         !nsf_seh_read(view_family_candidate, &first_field, sizeof(first_field))) {
@@ -12472,7 +12740,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHo
         // that gets unset after the texture is fully created. This function exits early otherwise.
         rtm->create_scene_capture();
         views.count = 1;
-        if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate)) {
+        if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg)) {
             s_nsf_flow_disabled = true;
             vr->m_native_stereo_fix->value() = false; // full coherent fallback: stops capture churn
             SPDLOG_ERROR(
@@ -12494,7 +12762,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHo
             scene_capture_native,
             false);
 
-        hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         views.count = prev_count;
         return;
     }
@@ -12563,7 +12831,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHo
         view_family.views.data[1]->constructor((sdk::FSceneViewInitOptions*)init_options_copy2.data());*/
     }
 
-    if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate)) {
+    if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg)) {
         s_nsf_flow_disabled = true;
         vr->m_native_stereo_fix->value() = false; // full coherent fallback: stops capture churn
         SPDLOG_ERROR(
@@ -12610,7 +12878,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(safetyhook::InlineHo
         std::swap(views[0], views[1]);
 
         // Call it again — SEH-contained (see nsf_run_pass_guarded).
-        if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate)) {
+        if (!nsf_run_pass_guarded(hook, render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg)) {
             s_nsf_flow_disabled = true;
             vr->m_native_stereo_fix->value() = false; // full coherent fallback: stops capture churn
             SPDLOG_ERROR(
@@ -22336,6 +22604,10 @@ void VRRenderTargetManager_Base::texture_hook_callback(safetyhook::Context& ctx,
                     texture_source, (uintptr_t)texture);
             } else {
                 SPDLOG_INFO(" Resulting texture: {:x}", (uintptr_t)texture);
+                // This is the earliest FRHITexture we hold, and this log line is
+                // the first get_native_resource() call in the process — seed the
+                // safe slot before it can trigger the SDK's blind vtable probe.
+                seed_frhitexture_native_resource_slot(texture);
                 SPDLOG_INFO(" Real resource: {:x}", (uintptr_t)texture->get_native_resource());
             }
         } else {

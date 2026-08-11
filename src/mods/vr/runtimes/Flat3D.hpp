@@ -60,6 +60,17 @@ struct Flat3D final : public VRRuntime {
         this->internal_render_frame_count = frame_count;
     }
 
+    // Same latch for the paths that can't hijack the RHI command at all.
+    // PreRenderViewFamily_RenderThread falls back to enqueue_render_poses when
+    // the command list has no usable root (Elliot/UE5.6: "Bad root or command
+    // list, falling back to Slate thread hook"), and the command-candidate
+    // rejection path does too. OpenVR and OpenXR both latch the frame here for
+    // exactly that reason; without it internal_render_frame_count stays 0 in
+    // those titles and the eye parity is stuck as described above.
+    void enqueue_render_poses(uint32_t frame_count) override {
+        this->internal_render_frame_count = frame_count;
+    }
+
     VRRuntime::Error update_render_target_size() override;
 
     // Per-eye render size == real backbuffer size, so each eye renders at

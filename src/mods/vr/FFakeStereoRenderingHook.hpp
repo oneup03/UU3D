@@ -811,7 +811,11 @@ public:
     // call site (multiple candidate addresses can be hooked simultaneously in
     // modular builds where the resolver cannot be certain — see the Returnal
     // notes at the resolution site). tag identifies the candidate in logs.
-    static void begin_render_viewfamily_real(safetyhook::InlineHook& hook, const char* tag, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family);
+    // trailing_ptr_arg / trailing_flag_arg are UE5.5+'s 4th and 5th
+    // BeginRenderingViewFamilies parameters, forwarded verbatim (see the
+    // definition) — ignored by the older 3-argument shape.
+    static void begin_render_viewfamily_real(safetyhook::InlineHook& hook, const char* tag, void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family,
+                                             void* trailing_ptr_arg, uintptr_t trailing_flag_arg);
     static void begin_render_viewfamily(ISceneViewExtension* extension, sdk::FSceneViewFamily& view_family);
     static void pre_render_viewfamily_renderthread(ISceneViewExtension* extension, sdk::FRHICommandListBase* cmd_list, sdk::FSceneViewFamily& view_family);
 
