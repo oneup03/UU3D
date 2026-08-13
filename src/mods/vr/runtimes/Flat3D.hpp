@@ -105,10 +105,17 @@ struct Flat3D final : public VRRuntime {
     std::atomic<float> separation_m{0.1f};
     std::atomic<float> convergence_m{1.0f};
 
-    // Live game-camera FoV in degrees (horizontal), sampled on the game
-    // thread via APlayerCameraManager::GetFOVAngle (includes ADS zoom and
-    // cine cameras). Holds the last good value when no camera is available.
+    // Live game-camera FoV in degrees, sampled on the game thread via
+    // APlayerCameraManager::GetFOVAngle (includes ADS zoom and cine cameras).
+    // Holds the last good value when no camera is available.
     std::atomic<float> game_fov_deg{90.0f};
+
+    // Which AXIS that angle refers to (EAspectRatioAxisConstraint, from the
+    // active camera component if it overrides, else the local player).
+    // GetFOVAngle hands back the same number either way — so a vertical FoV used
+    // as a horizontal one builds a far narrower frustum and the scene renders
+    // zoomed IN.
+    std::atomic<bool> game_fov_is_vertical{false};
 
     // Game FoV as tan of half-angles (P00 = 1/tan_half_h), derived from
     // game_fov_deg by the projection hook each frame.

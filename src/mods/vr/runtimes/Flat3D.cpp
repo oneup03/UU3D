@@ -90,12 +90,13 @@ VRRuntime::Error Flat3D::update_render_target_size() {
         }
     }
 
-    // An explicit render-resolution percentage does NOT size this target: it
-    // drives r.ScreenPercentage (VR::flat3d_apply_screen_percentage), which is what
-    // actually makes the engine render the scene smaller. What it selects HERE
-    // is simply the display's native size, so the engine's viewport and the
-    // surface it renders into always agree — a smaller target only ever
-    // received a 1:1 corner of a full-size render (the top-left crop).
+    // An explicit render-resolution percentage normally does NOT size this
+    // target: it drives a screen-percentage cvar (VR::flat3d_apply_screen_percentage),
+    // which is what actually makes the engine render the scene smaller, and this
+    // target stays native so the engine's viewport and the surface it renders
+    // into agree. Only the LEGACY stage sizes it here — that is the mode where a
+    // smaller target can receive a 1:1 corner of a full-size render (the
+    // top-left crop), which is why it is not the default.
     const auto scale = VR::get()->flat3d_render_scale();
 
     if (scale > 0.0f) {
@@ -107,10 +108,15 @@ VRRuntime::Error Flat3D::update_render_target_size() {
             native_h = (uint32_t)size.y;
         }
 
+        // The legacy stage is the exception: it sizes THIS target by the
+        // percentage, which is what titles that honour neither screen-percentage
+        // cvar are left with (Jedi Survivor).
+        const float target_scale = VR::get()->flat3d_render_scale_sizes_target() ? scale : 1.0f;
+
         // Keep dimensions even so the SbS double-wide and interlaced /
         // checkerboard patterns divide cleanly.
-        this->w = std::max<uint32_t>(128, native_w & ~1u);
-        this->h = std::max<uint32_t>(128, native_h & ~1u);
+        this->w = std::max<uint32_t>(128, ((uint32_t)std::lround(native_w * target_scale)) & ~1u);
+        this->h = std::max<uint32_t>(128, ((uint32_t)std::lround(native_h * target_scale)) & ~1u);
 
         // Give each eye its per-mode slice so the composite doesn't stretch it.
         apply_eye_split(this->w, this->h);

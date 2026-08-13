@@ -868,10 +868,25 @@ public:
                is_using_flat3d() && is_using_afr();
     }
 
-    // Drives r.ScreenPercentage from the 3D Render Resolution combo. 0 = we have
-    // never set it, so Auto leaves whatever the game manages for itself alone.
+    // Drives the screen percentage from the 3D Render Resolution combo.
     void flat3d_apply_screen_percentage();
-    int32_t m_flat3d_screen_percentage_applied{0};
+
+    // Which stage the render resolution drives: 0 = primary (r.ScreenPercentage,
+    // the upscaler's own input resolution), 1 = secondary (a separate pass after
+    // the temporal upscale, so it stacks with DLSS instead of fighting it),
+    // 2 = shrink our stereo render target directly (legacy).
+    int32_t flat3d_render_scale_stage() const {
+        return (int32_t)m_flat3d_render_scale_stage->value();
+    }
+
+    // Legacy stage: size the stereo target by the percentage instead of asking
+    // the engine to render less. Kept because some titles honour neither screen
+    // percentage cvar (Jedi Survivor), but it can leave the frame a top-left
+    // corner of a full-size render when the engine sizes scene work from its
+    // viewport rather than from the target we hand it.
+    bool flat3d_render_scale_sizes_target() const {
+        return flat3d_render_scale_stage() == 2 && flat3d_render_scale() > 0.0f;
+    }
 
     bool is_sceneview_compatibility_enabled() const {
         return m_sceneview_compatibility_mode->value();
@@ -1188,6 +1203,14 @@ private:
     // Reads APlayerController::bShowMouseCursor (drives the stereo cursor).
     // Game thread only; returns fallback when no world/controller yet.
     bool sample_flat3d_show_cursor(bool fallback);
+    bool sample_flat3d_fov_is_vertical(bool fallback);
+    std::optional<bool> camera_component_fov_is_vertical();
+
+    // Screen-percentage state: the value we last wrote (0 = we are not managing
+    // it, so Auto leaves whatever the game does alone) and the stage we wrote it
+    // to, so a stage switch can hand the previous one back first.
+    int32_t m_flat3d_screen_percentage_applied{0};
+    int32_t m_flat3d_screen_percentage_mode{0};
     bool sample_flat3d_game_paused(bool fallback);
     // Samples the camera position/forward and publishes the HUD marker
     // anchors collected this frame. Game thread only.
@@ -1948,6 +1971,12 @@ private:
 
     const ModCombo::Ptr m_flat3d_output_mode{ ModCombo::create(generate_name("Flat3D_OutputMode"), s_flat3d_output_mode_names) };
     const ModCombo::Ptr m_flat3d_render_scale{ ModCombo::create(generate_name("Flat3D_RenderResolution"), s_flat3d_render_scale_names, 0) };
+    static const inline std::vector<std::string> s_flat3d_render_scale_stage_names{
+        "Primary (r.ScreenPercentage)",
+        "Secondary (stacks with DLSS/TSR)",
+        "Stereo Render Target (legacy)",
+    };
+    const ModCombo::Ptr m_flat3d_render_scale_stage{ ModCombo::create(generate_name("Flat3D_RenderResolutionStage"), s_flat3d_render_scale_stage_names, 0) };
     // Auto-detected each frame in the native-output block: true when the output
     // is a real full-SbS double-wide panel (SbS mode on a ~32:9 display). Drives
     // Native Render + Upscale automatically (spoof the engine to render native
@@ -1973,6 +2002,15 @@ private:
     // through the per-eye aspect, so it is a symmetric zoom with no stretch.
     // NOTE: it is a tangent scale, not a degree scale — at a 90 deg hFoV, 2.0
     // gives ~127 deg, not 180.
+    // Which axis APlayerCameraManager::GetFOVAngle refers to. Auto reads UE's own
+    // EAspectRatioAxisConstraint; the forced options are the escape hatch for
+    // games that override it per camera component.
+    static const inline std::vector<std::string> s_flat3d_fov_axis_names{
+        "Auto (engine constraint)",
+        "Horizontal",
+        "Vertical",
+    };
+    const ModCombo::Ptr m_flat3d_fov_axis{ ModCombo::create(generate_name("Flat3D_FOVAxis"), s_flat3d_fov_axis_names, 0) };
     const ModSlider::Ptr m_flat3d_fov_multiplier{ ModSlider::create(generate_name("Flat3D_FOVMultiplier"), 0.5f, 3.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 0.5f, 0.1f) };
     const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };

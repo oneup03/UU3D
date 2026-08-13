@@ -425,7 +425,54 @@ bool marker_hook_post(UEVR_UFunctionHandle func_h, UEVR_UObjectHandle, void* par
 }
 } // namespace
 
-// 3D Render Resolution -> r.ScreenPercentage.
+namespace {
+// The two stages the render-resolution setting can drive.
+//
+// PRIMARY (r.ScreenPercentage) is the temporal upscaler's INPUT resolution — it
+// is the very knob DLSS/TSR/FSR use, and a DLSS quality preset is implemented by
+// setting it (Quality ~66.7, Balanced ~58, Performance 50, Ultra Performance
+// ~33). So with a fixed DLSS preset our write and the plugin's write fight, and
+// the two do NOT stack: whoever wrote last wins.
+//
+// SECONDARY (r.SecondaryScreenPercentage.GameViewport) is a separate spatial
+// pass applied AFTER the temporal upscale, so it is independent of DLSS and the
+// two MULTIPLY: secondary 50 with DLSS Performance renders at 25% internally.
+// That is the mode for stacking on an upscaler — at the cost of two upscales in
+// series, which is visible.
+const wchar_t* screen_percentage_cvar_name(int32_t mode) {
+    return mode == 1 ? L"r.SecondaryScreenPercentage.GameViewport" : L"r.ScreenPercentage";
+}
+
+void set_screen_percentage_cvar(int32_t mode, int32_t value) {
+    // find_cvar resolves by NAME through the console manager first, so the module
+    // hint only matters for locating the pointer in module data (and a shipping
+    // build is monolithic anyway).
+    const std::wstring name = screen_percentage_cvar_name(mode);
+    const std::wstring module = mode == 1 ? L"Engine" : L"Core";
+
+    GameThreadWorker::get().enqueue([name, module, value]() {
+        try {
+            auto** cvar = sdk::find_cvar_cached(module, name);
+
+            if (cvar == nullptr || *cvar == nullptr) {
+                spdlog::warn("[Flat3D] {} not found — 3D Render Resolution has no effect", utility::narrow(name));
+                return;
+            }
+
+            if (!(*cvar)->Set(std::to_wstring(value).c_str())) {
+                spdlog::warn("[Flat3D] {} setter unavailable", utility::narrow(name));
+                return;
+            }
+
+            spdlog::info("[Flat3D] 3D Render Resolution -> {} {}", utility::narrow(name), value);
+        } catch (...) {
+            spdlog::error("[Flat3D] Failed to set {}", utility::narrow(name));
+        }
+    });
+}
+} // namespace
+
+// 3D Render Resolution -> screen percentage (primary or secondary stage).
 //
 // The scene's cost is set by the SCREEN PERCENTAGE, not by the size of the
 // stereo target we advertise. Shrinking that target only changes where the
@@ -440,6 +487,27 @@ bool marker_hook_post(UEVR_UFunctionHandle func_h, UEVR_UObjectHandle, void* par
 // once (and only if we ever set it), so a title that manages its own screen
 // percentage is left alone until the user explicitly picks a percentage.
 void VR::flat3d_apply_screen_percentage() {
+    const int32_t mode = flat3d_render_scale_stage();
+
+    // Stage switched while a reduction was live: hand the OLD stage back to 100
+    // first, or it keeps a cut the UI no longer shows (and the two would
+    // silently multiply). applied is only ever non-zero for the cvar stages, so
+    // the legacy stage can never be the one restored here.
+    if (mode != m_flat3d_screen_percentage_mode) {
+        if (m_flat3d_screen_percentage_applied > 0) {
+            set_screen_percentage_cvar(m_flat3d_screen_percentage_mode, 100);
+            m_flat3d_screen_percentage_applied = 0;
+        }
+
+        m_flat3d_screen_percentage_mode = mode;
+    }
+
+    // Legacy stage sizes the stereo target instead (Flat3D::update_render_target_size);
+    // there is no cvar to drive.
+    if (mode == 2) {
+        return;
+    }
+
     const auto scale = flat3d_render_scale();
     const int32_t desired = scale > 0.0f
         ? std::clamp((int32_t)std::lround(scale * 100.0f), 10, 150)
@@ -449,27 +517,11 @@ void VR::flat3d_apply_screen_percentage() {
         return;
     }
 
-    m_flat3d_screen_percentage_applied = desired;
+    set_screen_percentage_cvar(mode, desired);
 
-    GameThreadWorker::get().enqueue([desired]() {
-        try {
-            auto** cvar = sdk::find_cvar_cached(L"Core", L"r.ScreenPercentage");
-
-            if (cvar == nullptr || *cvar == nullptr) {
-                spdlog::warn("[Flat3D] r.ScreenPercentage not found — 3D Render Resolution has no effect");
-                return;
-            }
-
-            if (!(*cvar)->Set(std::to_wstring(desired).c_str())) {
-                spdlog::warn("[Flat3D] r.ScreenPercentage setter unavailable");
-                return;
-            }
-
-            spdlog::info("[Flat3D] 3D Render Resolution -> r.ScreenPercentage {}", desired);
-        } catch (...) {
-            spdlog::error("[Flat3D] Failed to set r.ScreenPercentage");
-        }
-    });
+    // 100 means we handed it back: stop managing it, so Auto does not keep
+    // rewriting a value the game may want to own.
+    m_flat3d_screen_percentage_applied = (scale > 0.0f) ? desired : 0;
 }
 
 void VR::flat3d_marker_hook_post(void* ufunction, void* params) {
@@ -852,6 +904,93 @@ bool VR::sample_flat3d_show_cursor(bool fallback) {
     }
 
     return prop->get_value_from_object(controller);
+}
+
+// Which axis does the camera's FoV angle refer to?
+//
+// UE picks this in ULocalPlayer::GetProjectionData from EAspectRatioAxisConstraint:
+//
+//   (landscape viewport && MajorAxisFOV) || MaintainXFOV -> HORIZONTAL
+//     XAxisMultiplier = 1, YAxisMultiplier = W/H
+//   otherwise (MaintainYFOV, or a portrait viewport)     -> VERTICAL
+//     XAxisMultiplier = H/W, YAxisMultiplier = 1
+//
+// GetFOVAngle returns POV.FOV either way — the same number, a different meaning.
+// Treating a vertical FoV as horizontal renders a much narrower frustum: at 16:9
+// a 70 deg vertical FoV is a 102 deg horizontal one, so the scene comes out
+// heavily zoomed in (Jedi Survivor). The Flat3D output is always landscape, so
+// only the constraint matters here.
+//
+// Game thread only, sampled once per frame with the FoV itself.
+bool VR::sample_flat3d_fov_is_vertical(bool fallback) {
+    // Manual override first — the property can be absent, and a game may
+    // override the constraint per camera component.
+    switch (m_flat3d_fov_axis->value()) {
+    case 1: return false; // force horizontal
+    case 2: return true;  // force vertical
+    default: break;       // auto
+    }
+
+    // A cutscene camera can override the axis per CameraComponent without ever
+    // touching the local player's value, so the component wins when it opts in.
+    // Re-checked every frame, which is what makes the switch automatic.
+    if (const auto component_axis = camera_component_fov_is_vertical(); component_axis.has_value()) {
+        static int32_t last_logged_component = -1;
+
+        if (last_logged_component != (int32_t)*component_axis) {
+            last_logged_component = (int32_t)*component_axis;
+            spdlog::info("[Flat3D] Camera FoV axis: {} (CameraComponent override)",
+                         *component_axis ? "VERTICAL" : "horizontal");
+        }
+
+        return *component_axis;
+    }
+
+    const auto engine = sdk::UEngine::get();
+    if (engine == nullptr) {
+        return fallback;
+    }
+
+    const auto local_player = (sdk::UObject*)engine->get_localplayer(0);
+    if (local_player == nullptr) {
+        return fallback;
+    }
+
+    static sdk::UClass* cached_class = nullptr;
+    static sdk::FProperty* prop = nullptr;
+
+    const auto c = local_player->get_class();
+    if (c == nullptr) {
+        return fallback;
+    }
+
+    if (c != cached_class) {
+        cached_class = c;
+        prop = c->find_property(L"AspectRatioAxisConstraint");
+
+        if (prop == nullptr) {
+            spdlog::warn("[Flat3D] ULocalPlayer::AspectRatioAxisConstraint not found — assuming a horizontal "
+                         "camera FoV. If the view looks zoomed in, force the axis in the 3D settings.");
+        }
+    }
+
+    if (prop == nullptr) {
+        return fallback;
+    }
+
+    // TEnumAsByte<EAspectRatioAxisConstraint>: 0 MaintainYFOV, 1 MaintainXFOV,
+    // 2 MajorAxisFOV (the UE default, horizontal on a landscape viewport).
+    const auto constraint = *prop->get_data<uint8_t>(local_player);
+    const bool is_vertical = constraint == 0;
+
+    static int32_t last_logged = -1;
+    if (last_logged != (int32_t)constraint) {
+        last_logged = (int32_t)constraint;
+        spdlog::info("[Flat3D] Camera FoV axis: {} (AspectRatioAxisConstraint={})",
+                     is_vertical ? "VERTICAL" : "horizontal", constraint);
+    }
+
+    return is_vertical;
 }
 
 // Reads UGameplayStatics::IsGamePaused — a full-screen-menu signal that does not
@@ -2380,6 +2519,21 @@ void VR::on_draw_sidebar_flat3d() {
                           "resolution setting controls the 3D render resolution (upscaled).");
 
     m_flat3d_render_scale->draw("3D Render Resolution");
+    if (m_flat3d_render_scale->value() != 0) {
+        m_flat3d_render_scale_stage->draw("Applied To");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Primary is the upscaler's own input resolution — DLSS/TSR set it themselves,\n"
+                              "so a preset overrides this instead of stacking.\n"
+                              "Secondary runs after the upscale and multiplies with it.\n"
+                              "Legacy shrinks our render target for games that ignore both cvars;\n"
+                              "it can crop the frame to a corner, so try it last.");
+        }
+    }
+    m_flat3d_fov_axis->draw("Camera FoV Axis");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Which axis the game's FoV angle means. Auto reads the engine's constraint.\n"
+                          "Force Vertical if the view is zoomed in, Horizontal if it is too wide.");
+    }
     m_flat3d_fov_multiplier->draw("3D FoV Multiplier");
     if (m_flat3d_fov_multiplier->value() != 1.0f) {
         ImGui::TextWrapped("Scales the game's FoV. 1.0 = as-is, higher widens.");

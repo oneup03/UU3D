@@ -6413,6 +6413,84 @@ std::string VR::get_windrose_meta_ui_2d_status_text() const {
     return out.str();
 }
 
+// The ACTIVE camera component's own FoV-axis override, if it has one.
+//
+// A CameraComponent can set bOverrideAspectRatioAxisConstraint and carry its own
+// AspectRatioAxisConstraint, so a cutscene camera can use a different axis than
+// the local player without ever touching the local player's value. This is
+// checked first; nullopt means "no override in play", and the caller falls back
+// to the global ULocalPlayer constraint.
+//
+// Lives here (not in VR_Flat3D.cpp) because the object/function helpers it needs
+// are internal to this TU — the same pair the 16:9 camera compat path uses to
+// reach the live camera component.
+std::optional<bool> VR::camera_component_fov_is_vertical() try {
+    const auto engine = sdk::UEngine::get();
+    if (engine == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto world = engine->get_world();
+    const auto gameplay = sdk::UGameplayStatics::get();
+    if (world == nullptr || gameplay == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto pc = gameplay->get_player_controller(world, 0);
+    if (pc == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto pcm = pc->get_player_camera_manager();
+    if (pcm == nullptr) {
+        return std::nullopt;
+    }
+
+    // Not a stock UE function — plenty of titles won't have it, in which case
+    // there is no per-camera override to find and the global value stands.
+    const auto camera = call_object_object_function((sdk::UObject*)pcm, L"GetCurrentCamera");
+    if (!camera.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto component = read_object_property(*camera, L"CameraComponent");
+    if (!component.has_value()) {
+        return std::nullopt;
+    }
+
+    auto* comp = *component;
+    const auto klass = comp->get_class();
+    if (klass == nullptr) {
+        return std::nullopt;
+    }
+
+    static sdk::UClass* cached_class = nullptr;
+    static sdk::FProperty* override_prop = nullptr;
+    static sdk::FProperty* constraint_prop = nullptr;
+
+    if (klass != cached_class) {
+        cached_class = klass;
+        override_prop = klass->find_property(L"bOverrideAspectRatioAxisConstraint");
+        constraint_prop = klass->find_property(L"AspectRatioAxisConstraint");
+    }
+
+    if (override_prop == nullptr || constraint_prop == nullptr ||
+        override_prop->get_class() == nullptr ||
+        override_prop->get_class()->get_name().to_string() != L"BoolProperty")
+    {
+        return std::nullopt;
+    }
+
+    if (!((sdk::FBoolProperty*)override_prop)->get_value_from_object(comp)) {
+        return std::nullopt; // component defers to the local player
+    }
+
+    // TEnumAsByte<EAspectRatioAxisConstraint>: 0 MaintainYFOV = vertical.
+    return *constraint_prop->get_data<uint8_t>(comp) == 0;
+} catch (...) {
+    return std::nullopt;
+}
+
 void VR::update_fullscreen_16x9_camera_compatibility(sdk::UGameEngine* engine) {
     if (!m_compatibility_fullscreen_16x9_cameras->value()) {
         m_fullscreen_16x9_camera_compat = {};
@@ -9500,8 +9578,16 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TreePop();
         }
 
-        ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
-        if (ImGui::TreeNode("Game FOV")) {
+        // No-op under 3D Display mode: the flat3d projection is rebuilt from the
+        // game's own live FoV every frame (see the 3D Display page's Camera FoV
+        // Axis / FoV Multiplier), so there is no HMD FoV to match it to.
+        const bool show_game_fov = !is_using_flat3d();
+
+        if (show_game_fov) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+        }
+
+        if (show_game_fov && ImGui::TreeNode("Game FOV")) {
             m_match_game_fov->draw("Match Game FOV");
 
             if (m_match_game_fov->value()) {
@@ -9752,8 +9838,15 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TreePop();
         }
 
-        ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
-        if (ImGui::TreeNode("Camera Lerp")) {
+        // No-op under 3D Display mode: lerping smooths the HMD pose against the
+        // game camera, and flat3d has no headset pose to smooth.
+        const bool show_camera_lerp = !is_using_flat3d();
+
+        if (show_camera_lerp) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+        }
+
+        if (show_camera_lerp && ImGui::TreeNode("Camera Lerp")) {
             m_lerp_camera_pitch->draw("Lerp Pitch");
             ImGui::SameLine();
             m_lerp_camera_yaw->draw("Lerp Yaw");

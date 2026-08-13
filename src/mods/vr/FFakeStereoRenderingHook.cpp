@@ -15907,6 +15907,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         if (fov_sample_frame != (uint32_t)g_frame_count) {
             fov_sample_frame = (uint32_t)g_frame_count;
             flat3d->game_fov_deg.store(vr->sample_flat3d_game_fov(flat3d->game_fov_deg.load()));
+            flat3d->game_fov_is_vertical.store(vr->sample_flat3d_fov_is_vertical(flat3d->game_fov_is_vertical.load()));
             flat3d->game_wants_cursor.store(vr->sample_flat3d_show_cursor(flat3d->game_wants_cursor.load()));
             flat3d->game_paused.store(vr->sample_flat3d_game_paused(flat3d->game_paused.load()));
             vr->sample_flat3d_camera_and_publish_anchors();
@@ -15918,6 +15919,16 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         const float aspect = rt_h > 0.0f && rt_w > 0.0f ? (rt_w / rt_h) : (16.0f / 9.0f);
 
         float tan_half_h = glm::tan(half_fov);
+
+        // The sampled angle may be the VERTICAL FoV (UE's MaintainYFOV / portrait
+        // constraint — see VR::sample_flat3d_fov_is_vertical). Widen it to the
+        // horizontal one through the per-eye aspect, which reproduces UE's own
+        // XAxisMultiplier = H/W exactly: xs = (H/W)/tan == 1/(tan * aspect).
+        // Without this the frustum is far too narrow and the scene renders
+        // heavily zoomed in.
+        if (flat3d->game_fov_is_vertical.load()) {
+            tan_half_h *= aspect;
+        }
 
         // User FoV scale (see VR::flat3d_fov_multiplier). Applied ON TOP of the
         // game's live FoV sampled above, so the game keeps driving the camera
