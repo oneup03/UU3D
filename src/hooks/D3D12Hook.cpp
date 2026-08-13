@@ -42,7 +42,6 @@ constexpr size_t COPY_DESCRIPTORS_SIMPLE_VTABLE_INDEX = 24;
 constexpr size_t DRAW_INSTANCED_VTABLE_INDEX = 12;
 constexpr size_t DRAW_INDEXED_INSTANCED_VTABLE_INDEX = 13;
 constexpr size_t DISPATCH_VTABLE_INDEX = 14;
-constexpr size_t RS_SET_VIEWPORTS_VTABLE_INDEX = 21;
 constexpr size_t SET_PIPELINE_STATE_VTABLE_INDEX = 25;
 constexpr size_t RESOURCE_BARRIER_VTABLE_INDEX = 26;
 constexpr size_t CLEAR_DEPTH_STENCIL_VIEW_CMDLIST_VTABLE_INDEX = 47;
@@ -146,9 +145,67 @@ void add_unique_pointer_hook(
         return;
     }
 
+    // A hook we kept across a re-hook still owns this slot's chain (see
+    // release_restorable_slot_hooks) — patching again would capture whatever is
+    // in the slot now, which is the OTHER patcher's thunk, and the two would
+    // call each other forever.
+    if (lookup.find(slot_key) != lookup.end()) {
+        return;
+    }
+
+    // Belt: never capture our own detour as the original.
+    if (!IsBadReadPtr(slot, sizeof(void*)) && *slot == detour) {
+        SPDLOG_WARN("[D3D12Hook] Slot {:x} already holds our detour {:x}; refusing to hook it twice",
+            slot_key, (uintptr_t)detour);
+        return;
+    }
+
     auto hook = std::make_unique<PointerHook>(slot, detour);
     lookup.emplace(slot_key, hook.get());
     storage.emplace_back(std::move(hook));
+}
+
+// Destroy only the slot hooks we can still cleanly restore.
+//
+// Another patcher in this process can chain on top of a slot we patched
+// (GameDepthCapture's per-draw depth capture hooks two of the same slots:
+// ID3D12GraphicsCommandList::ClearDepthStencilView and
+// ID3D12Device::CreateDepthStencilView). PointerHook::remove() then correctly
+// refuses to restore, because the slot holds THEIR thunk — and their captured
+// original is OUR detour, so our code is still inside their call chain.
+//
+// Dropping our hook record in that state is what crashed FANTASY LIFE i: the
+// next hook() pass re-patched the slot and captured their thunk as our original,
+// closing a cycle (ours -> theirs -> ours) that blew the stack on the first
+// depth clear. Keep any hook we cannot restore, so its original stays reachable
+// and we never re-capture the slot.
+void release_restorable_slot_hooks(
+    std::vector<std::unique_ptr<PointerHook>>& storage,
+    std::unordered_map<uintptr_t, PointerHook*>& lookup,
+    void* detour,
+    const char* what
+) {
+    std::unordered_set<PointerHook*> kept{};
+
+    for (auto it = lookup.begin(); it != lookup.end();) {
+        auto** slot = reinterpret_cast<void**>(it->first);
+        const bool still_ours = !IsBadReadPtr(slot, sizeof(void*)) && *slot == detour;
+
+        if (still_ours) {
+            it = lookup.erase(it);
+            continue;
+        }
+
+        SPDLOG_INFO("[D3D12Hook] Keeping {} hook for slot {:x}: another patcher chained on top of it "
+                    "({:x}), so our original must stay reachable",
+            what, it->first, (uintptr_t)*slot);
+        kept.insert(it->second);
+        ++it;
+    }
+
+    std::erase_if(storage, [&](const std::unique_ptr<PointerHook>& hook) {
+        return kept.find(hook.get()) == kept.end();
+    });
 }
 }
 
@@ -630,21 +687,8 @@ bool D3D12Hook::hook() {
         spdlog::info("Initializing hooks");
         m_present_hook.reset();
         m_present1_hook.reset();
-        m_create_graphics_pipeline_state_hooks.clear();
-        m_create_pipeline_state_hooks.clear();
-        m_create_render_target_view_hooks.clear();
-        m_create_depth_stencil_view_hooks.clear();
-        m_set_pipeline_state_hooks.clear();
-        m_resource_barrier_hooks.clear();
-        m_clear_depth_stencil_view_cmd_hooks.clear();
-        m_create_graphics_pipeline_state_hook_lookup.clear();
-        m_create_pipeline_state_hook_lookup.clear();
-        m_create_render_target_view_hook_lookup.clear();
-        m_create_depth_stencil_view_hook_lookup.clear();
-        m_set_pipeline_state_hook_lookup.clear();
+        release_slot_hooks();
         m_set_pipeline_state_hook_generation.fetch_add(1, std::memory_order_release);
-        m_resource_barrier_hook_lookup.clear();
-        m_clear_depth_stencil_view_cmd_hook_lookup.clear();
         m_swapchain_hook.reset();
 
         m_is_phase_1 = true;
@@ -880,21 +924,8 @@ bool D3D12Hook::unhook() {
 
     m_present_hook.reset();
     m_present1_hook.reset();
-    m_create_graphics_pipeline_state_hooks.clear();
-    m_create_pipeline_state_hooks.clear();
-    m_create_render_target_view_hooks.clear();
-    m_create_depth_stencil_view_hooks.clear();
-    m_set_pipeline_state_hooks.clear();
-    m_resource_barrier_hooks.clear();
-    m_clear_depth_stencil_view_cmd_hooks.clear();
-    m_create_graphics_pipeline_state_hook_lookup.clear();
-    m_create_pipeline_state_hook_lookup.clear();
-    m_create_render_target_view_hook_lookup.clear();
-    m_create_depth_stencil_view_hook_lookup.clear();
-    m_set_pipeline_state_hook_lookup.clear();
+    release_slot_hooks();
     m_set_pipeline_state_hook_generation.fetch_add(1, std::memory_order_release);
-    m_resource_barrier_hook_lookup.clear();
-    m_clear_depth_stencil_view_cmd_hook_lookup.clear();
     m_depth_stencil_observer.store(nullptr, std::memory_order_release);
     m_swapchain_hook.reset();
 
@@ -902,6 +933,25 @@ bool D3D12Hook::unhook() {
     m_is_phase_1 = true;
 
     return true;
+}
+
+// Per-family teardown that preserves any hook another patcher chained on top of
+// (see release_restorable_slot_hooks).
+void D3D12Hook::release_slot_hooks() {
+    release_restorable_slot_hooks(m_create_graphics_pipeline_state_hooks, m_create_graphics_pipeline_state_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::create_graphics_pipeline_state), "CreateGraphicsPipelineState");
+    release_restorable_slot_hooks(m_create_pipeline_state_hooks, m_create_pipeline_state_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::create_pipeline_state), "CreatePipelineState");
+    release_restorable_slot_hooks(m_create_render_target_view_hooks, m_create_render_target_view_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::create_render_target_view), "CreateRenderTargetView");
+    release_restorable_slot_hooks(m_create_depth_stencil_view_hooks, m_create_depth_stencil_view_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::create_depth_stencil_view), "CreateDepthStencilView");
+    release_restorable_slot_hooks(m_set_pipeline_state_hooks, m_set_pipeline_state_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::set_pipeline_state), "SetPipelineState");
+    release_restorable_slot_hooks(m_resource_barrier_hooks, m_resource_barrier_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::resource_barrier), "ResourceBarrier");
+    release_restorable_slot_hooks(m_clear_depth_stencil_view_cmd_hooks, m_clear_depth_stencil_view_cmd_hook_lookup,
+        reinterpret_cast<void*>(&D3D12Hook::clear_depth_stencil_view_cmd), "ClearDepthStencilView");
 }
 
 PointerHook* D3D12Hook::find_create_graphics_pipeline_state_hook(void* slot) const {

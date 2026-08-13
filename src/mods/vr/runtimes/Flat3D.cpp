@@ -90,12 +90,12 @@ VRRuntime::Error Flat3D::update_render_target_size() {
         }
     }
 
-    // Explicit render-resolution override: a fraction of the native output
-    // size, taking priority over the captured game request. This is the
-    // escape hatch for games where Auto degrades to native-per-eye: a game
-    // that boots already at native (or that adopts/persists the native size
-    // our output hold imposes) never issues a sub-native ResizeBuffers, so
-    // there is no game request to preserve.
+    // An explicit render-resolution percentage does NOT size this target: it
+    // drives r.ScreenPercentage (VR::flat3d_apply_screen_percentage), which is what
+    // actually makes the engine render the scene smaller. What it selects HERE
+    // is simply the display's native size, so the engine's viewport and the
+    // surface it renders into always agree — a smaller target only ever
+    // received a 1:1 corner of a full-size render (the top-left crop).
     const auto scale = VR::get()->flat3d_render_scale();
 
     if (scale > 0.0f) {
@@ -109,11 +109,10 @@ VRRuntime::Error Flat3D::update_render_target_size() {
 
         // Keep dimensions even so the SbS double-wide and interlaced /
         // checkerboard patterns divide cleanly.
-        this->w = std::max<uint32_t>(128, ((uint32_t)std::lround(native_w * scale)) & ~1u);
-        this->h = std::max<uint32_t>(128, ((uint32_t)std::lround(native_h * scale)) & ~1u);
+        this->w = std::max<uint32_t>(128, native_w & ~1u);
+        this->h = std::max<uint32_t>(128, native_h & ~1u);
 
-        // The scale fraction is of the FULL native output; give each eye its
-        // per-mode slice so the composite doesn't stretch it.
+        // Give each eye its per-mode slice so the composite doesn't stretch it.
         apply_eye_split(this->w, this->h);
         return VRRuntime::Error::SUCCESS;
     }

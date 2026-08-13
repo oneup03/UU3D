@@ -9904,6 +9904,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::TextWrapped("Windrose only: forces 2D for specific fullscreen meta menus only. NPC, cutscene, and Adventure transitions clear stale 2D state so flicker should not persist after interaction.");
             }
             m_sceneview_compatibility_mode->draw("SceneView Compatibility Mode");
+            m_compatibility_single_view_render_target->draw("Single-View Render Target (3D Display, AFR)");
+            if (m_compatibility_single_view_render_target->value()) {
+                ImGui::TextWrapped(
+                    "Advertises a single-eye render target instead of the double-wide. Fixes AFR modes that "
+                    "draw only the left half of the frame (Fantasy Life i).");
+            }
             m_extreme_compat_mode->draw("Extreme Compatibility Mode");
 
             // changes to any of these options should trigger a regeneration of the eye projection matrices

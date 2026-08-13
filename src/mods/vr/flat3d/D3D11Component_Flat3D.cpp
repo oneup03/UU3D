@@ -68,7 +68,9 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     D3D11_TEXTURE2D_DESC dw_desc{};
     double_wide->GetDesc(&dw_desc);
 
-    const uint32_t src_eye_w = extreme ? dw_desc.Width : dw_desc.Width / 2;
+    // Single-width source: whole texture is one eye (see the D3D12 counterpart).
+    const bool single_width_src = extreme || dw_desc.Width <= vr->get_hmd_width() + 8;
+    const uint32_t src_eye_w = single_width_src ? dw_desc.Width : dw_desc.Width / 2;
 
     D3D11_TEXTURE2D_DESC bb_desc{};
     real_backbuffer->GetDesc(&bb_desc);

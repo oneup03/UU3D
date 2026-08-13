@@ -252,7 +252,13 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     const auto dw_desc = double_wide->GetDesc();
     const auto bb_desc = real_backbuffer->GetDesc();
 
-    const auto eye_w = (uint32_t)(extreme ? dw_desc.Width : dw_desc.Width / 2);
+    // Single-width source: the whole texture is ONE eye (extreme compat, or the
+    // single-view target above). Decided from the texture itself rather than the
+    // setting, so the frames right after a mode toggle — where the old
+    // double-wide is still live — keep slicing correctly.
+    const bool single_width_src =
+        extreme || dw_desc.Width <= (uint64_t)vr->get_hmd_width() + 8;
+    const auto eye_w = (uint32_t)(single_width_src ? dw_desc.Width : dw_desc.Width / 2);
     const auto eye_h = (uint32_t)dw_desc.Height;
 
     // The observer selects a DSV/RDG candidate by matching the scene source

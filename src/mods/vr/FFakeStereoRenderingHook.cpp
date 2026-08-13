@@ -10963,6 +10963,40 @@ bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
 }
 
+namespace {
+// FSceneViewInitOptions::ViewFamily is reached through a SCANNED offset. When
+// that scan lands wrong the "family" is whatever bytes live there, and reading
+// its scene interface dereferences a non-canonical address — which Windows
+// reports as EXCEPTION_ACCESS_VIOLATION "reading address 0xffffffffffffffff",
+// inside the engine's own FSceneView constructor (FANTASY LIFE i, on inject).
+//
+// Probe both reads under SEH and report absence rather than dying: every
+// consumer downstream already has a path for a null family/scene. Its own
+// function because sceneview_constructor holds objects that need unwinding, and
+// __try cannot coexist with those in one frame.
+__declspec(noinline) bool try_read_view_family_and_scene(sdk::FSceneViewInitOptions* init_options,
+                                                         sdk::FSceneViewFamily** out_family,
+                                                         sdk::FSceneInterface** out_scene) {
+    *out_family = nullptr;
+    *out_scene = nullptr;
+
+    __try {
+        auto* family = init_options->get_view_family();
+
+        if (family != nullptr) {
+            *out_scene = family->get_scene_interface();
+        }
+
+        *out_family = family;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *out_family = nullptr;
+        *out_scene = nullptr;
+        return false;
+    }
+}
+}
+
 // FSceneView constructor hook
 sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
     SPDLOG_INFO_ONCE("Called FSceneView constructor for the first time");
@@ -11054,10 +11088,13 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto init_options_scene_state = init_options->get_scene_state();
     const auto init_options_original_stereo_pass = init_options->get_stereo_pass();
-    const auto init_options_view_family = init_options->get_view_family();
-    const auto init_options_scene = init_options_view_family != nullptr
-        ? init_options_view_family->get_scene_interface()
-        : nullptr;
+    sdk::FSceneViewFamily* init_options_view_family = nullptr;
+    sdk::FSceneInterface* init_options_scene = nullptr;
+
+    if (!try_read_view_family_and_scene(init_options, &init_options_view_family, &init_options_scene)) {
+        SPDLOG_WARN_ONCE("[SceneView] Reading FSceneViewInitOptions::ViewFamily faulted — the scanned offset is "
+                         "wrong for this build. Continuing without the family; stereo may degrade to mono.");
+    }
     bool restore_init_options_after_constructor = false;
 
     utility::ScopeGuard restore_init_options_guard{[&]() {
@@ -11134,6 +11171,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 : is_ue5
                     ? init_options_ue5->constrained_view_rect
                     : init_options->constrained_view_rect;
+
         auto& init_options_projection_matrix = init_options->projection_matrix;
         auto& init_options_projection_matrix_ue5 =
             is_ue50_to_53
@@ -15875,10 +15913,29 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         }
 
         const float half_fov = glm::radians(flat3d->game_fov_deg.load()) * 0.5f;
-        const float tan_half_h = glm::tan(half_fov);
         const float rt_w = (float)flat3d->get_width();
         const float rt_h = (float)flat3d->get_height();
         const float aspect = rt_h > 0.0f && rt_w > 0.0f ? (rt_w / rt_h) : (16.0f / 9.0f);
+
+        float tan_half_h = glm::tan(half_fov);
+
+        // User FoV scale (see VR::flat3d_fov_multiplier). Applied ON TOP of the
+        // game's live FoV sampled above, so the game keeps driving the camera
+        // (ADS zoom, cine cameras) and this only widens/narrows it. >1 widens the
+        // frustum, which zooms the rendered scene OUT. Logged on change only —
+        // this is a normal setting, not a per-frame event.
+        if (const float fov_mult = vr->flat3d_fov_multiplier(); fov_mult != 1.0f) {
+            tan_half_h *= fov_mult;
+
+            static float last_logged_fov_mult = 1.0f;
+
+            if (fov_mult != last_logged_fov_mult) {
+                last_logged_fov_mult = fov_mult;
+                SPDLOG_INFO("[Flat3D][fov] FoV multiplier {:.3f}: hfov {:.2f} -> {:.2f} deg",
+                    fov_mult, glm::degrees(2.0f * half_fov), glm::degrees(2.0f * std::atan(tan_half_h)));
+            }
+        }
+
         // Our-side near-plane resolver (SDK dummy -> r.SetNearClipPlane / UE
         // default) so the UESDK submodule stays pristine. See VR::flat3d_effective_nearz.
         const float near_z = vr->flat3d_effective_nearz();
@@ -21384,8 +21441,16 @@ void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewpo
         this->request_dedicated_ui_target(x, y);
     }
 
-    x = VR::get()->get_hmd_width() * 2;
+    // See VR::flat3d_single_view_target.
+    const auto single_view = VR::get()->flat3d_single_view_target();
+
+    x = VR::get()->get_hmd_width() * (single_view ? 1 : 2);
     y = VR::get()->get_hmd_height();
+
+    if (single_view) {
+        SPDLOG_INFO_ONCE("[Flat3D] SINGLE-view render target {}x{}: one view per frame owns the WHOLE surface, "
+                         "so a double-wide would leave it covering only the left half", x, y);
+    }
 
     SPDLOG_DEBUG("RenderTargetSize After: {}x{}", x, y);
 }

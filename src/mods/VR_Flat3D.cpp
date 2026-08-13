@@ -172,6 +172,10 @@ void flat3d_flush_engine_dpi_cache(HWND wnd, int x, int y, LONG w, LONG h) {
 // width to the engine (GetClientRect/GetWindowRect) while the actual window stays
 // full. The compositor then composes the full-width eyes into the full panel —
 // full-SbS sharpness. Our OWN code reads the real rect through the hook original.
+//
+// The halve is RELATIVE on purpose: the rect it lands on may be DPI-VIRTUALIZED,
+// so writing an absolute physical width here would hand the engine a client
+// LARGER than the window really is.
 std::atomic<bool> g_flat3d_clientspoof_active{false};
 std::atomic<HWND> g_flat3d_clientspoof_hwnd{nullptr};
 SafetyHookInline g_clientrect_hook{};
@@ -420,6 +424,53 @@ bool marker_hook_post(UEVR_UFunctionHandle func_h, UEVR_UObjectHandle, void* par
     return true;
 }
 } // namespace
+
+// 3D Render Resolution -> r.ScreenPercentage.
+//
+// The scene's cost is set by the SCREEN PERCENTAGE, not by the size of the
+// stereo target we advertise. Shrinking that target only changes where the
+// finished frame lands: the engine still sizes its scene work from its viewport
+// (which follows the real window, held at native by the output block), so a
+// smaller target receives a 1:1 corner of a full-size render — the top-left crop
+// that made every sub-native setting look broken. Screen percentage is the
+// engine's own mechanism for exactly this: it renders the scene at a fraction
+// and upscales into a full-size viewport, so nothing mismatches.
+//
+// Written only when the value changes, on the game thread. Auto restores 100
+// once (and only if we ever set it), so a title that manages its own screen
+// percentage is left alone until the user explicitly picks a percentage.
+void VR::flat3d_apply_screen_percentage() {
+    const auto scale = flat3d_render_scale();
+    const int32_t desired = scale > 0.0f
+        ? std::clamp((int32_t)std::lround(scale * 100.0f), 10, 150)
+        : (m_flat3d_screen_percentage_applied > 0 ? 100 : 0);
+
+    if (desired == 0 || desired == m_flat3d_screen_percentage_applied) {
+        return;
+    }
+
+    m_flat3d_screen_percentage_applied = desired;
+
+    GameThreadWorker::get().enqueue([desired]() {
+        try {
+            auto** cvar = sdk::find_cvar_cached(L"Core", L"r.ScreenPercentage");
+
+            if (cvar == nullptr || *cvar == nullptr) {
+                spdlog::warn("[Flat3D] r.ScreenPercentage not found — 3D Render Resolution has no effect");
+                return;
+            }
+
+            if (!(*cvar)->Set(std::to_wstring(desired).c_str())) {
+                spdlog::warn("[Flat3D] r.ScreenPercentage setter unavailable");
+                return;
+            }
+
+            spdlog::info("[Flat3D] 3D Render Resolution -> r.ScreenPercentage {}", desired);
+        } catch (...) {
+            spdlog::error("[Flat3D] Failed to set r.ScreenPercentage");
+        }
+    });
+}
 
 void VR::flat3d_marker_hook_post(void* ufunction, void* params) {
     if (params == nullptr) {
@@ -1117,6 +1168,8 @@ void VR::update_flat3d_params() {
     if (flat3d == nullptr || !flat3d->loaded) {
         return;
     }
+
+    flat3d_apply_screen_percentage();
 
     // --- FoV auto-scale (always on) -----------------------------------------
     // Screen disparity is proportional to sep * P00 = sep / tan_half_h, so a
@@ -2327,11 +2380,13 @@ void VR::on_draw_sidebar_flat3d() {
                           "resolution setting controls the 3D render resolution (upscaled).");
 
     m_flat3d_render_scale->draw("3D Render Resolution");
+    m_flat3d_fov_multiplier->draw("3D FoV Multiplier");
+    if (m_flat3d_fov_multiplier->value() != 1.0f) {
+        ImGui::TextWrapped("Scales the game's FoV. 1.0 = as-is, higher widens.");
+    }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Per-eye render resolution as a fraction of the display's native size.\n"
-                          "Auto preserves the game's own resolution setting — but if the game runs\n"
-                          "(or persists) native resolution, Auto renders each eye at full native.\n"
-                          "Pick an explicit fraction to cap the render cost regardless.");
+        ImGui::SetTooltip("Scene render resolution, applied via r.ScreenPercentage.\n"
+                          "Auto leaves the game's own value alone.");
     }
 
     if (flat3d != nullptr && flat3d->get_width() != 0) {

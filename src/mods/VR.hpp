@@ -705,8 +705,16 @@ public:
         return flat3d_depth_source() == FLAT3D_DEPTH_ENGINE_POOL;
     }
 
-    // Per-eye 3D render resolution override as a fraction of the native
-    // output size (0 = Auto: preserve the game's own requested resolution).
+    // Multiplier applied to the game's live FoV when the render frustum is
+    // rebuilt. 1.0 = use the game camera's FoV unchanged.
+    float flat3d_fov_multiplier() const {
+        const auto v = m_flat3d_fov_multiplier->value();
+        return (std::isfinite(v) && v > 0.05f) ? v : 1.0f;
+    }
+
+    // 3D render resolution as a fraction of native, applied through
+    // r.ScreenPercentage (see flat3d_apply_screen_percentage) — it does NOT size
+    // the stereo target. 0 = Auto: leave the engine's screen percentage alone.
     float flat3d_render_scale() const {
         const auto v = (size_t)m_flat3d_render_scale->value();
         return v < s_flat3d_render_scale_values.size() ? s_flat3d_render_scale_values[v] : 0.0f;
@@ -835,6 +843,35 @@ public:
     uint32_t get_requested_splitscreen_index() const {
         return m_splitscreen_view_index->value();
     }
+
+    // Flat3D single-view render target. In AFR/Synced/AFW the engine renders ONE
+    // view per frame, and it sizes that view's VIEWPORT from the whole stereo
+    // target: with a 2W surface it spans 2W while only the left half is covered,
+    // so we read the left portion of a frame cut at the halfway line (widening
+    // the FoV rescales inside the cut instead of revealing the right side —
+    // Fantasy Life i). Advertising a single-eye surface makes viewport == eye
+    // rect. NOT for Native Stereo Fix: that still builds two views (the second is
+    // redirected to the scene capture) and a half-width surface renders nothing.
+    // Pair with 3D Render Resolution = 100%, or the surface still disagrees with
+    // the scale the engine lays the scene out at.
+    // One view per frame owns the WHOLE stereo surface (Alternating, Synced
+    // Sequential, AFW, and Extreme Compatibility, which reads one backbuffer at
+    // a time) — so a double-wide target leaves the engine's viewport spanning 2W
+    // with only the left half covered. Native Stereo renders both views into the
+    // double-wide and must keep it.
+    //
+    // The Native Stereo Fix checkbox is deliberately NOT consulted: NSF only
+    // does anything in Native Stereo, so testing it here would silently disable
+    // single-view for an AFR run just because the box was left ticked.
+    bool flat3d_single_view_target() const {
+        return m_compatibility_single_view_render_target->value() &&
+               is_using_flat3d() && is_using_afr();
+    }
+
+    // Drives r.ScreenPercentage from the 3D Render Resolution combo. 0 = we have
+    // never set it, so Auto leaves whatever the game manages for itself alone.
+    void flat3d_apply_screen_percentage();
+    int32_t m_flat3d_screen_percentage_applied{0};
 
     bool is_sceneview_compatibility_enabled() const {
         return m_sceneview_compatibility_mode->value();
@@ -1771,6 +1808,7 @@ private:
     const ModInt32::Ptr m_splitscreen_view_index{ ModInt32::create(generate_name("SplitscreenViewIndex"), 0, true) };
 
     const ModToggle::Ptr m_sceneview_compatibility_mode{ ModToggle::create(generate_name("Compatibility_SceneView"), false, true) };
+    const ModToggle::Ptr m_compatibility_single_view_render_target{ ModToggle::create(generate_name("Compatibility_SingleViewRenderTarget"), false, true) };
 
     const ModToggle::Ptr m_compatibility_skip_pip{ ModToggle::create(generate_name("Compatibility_SkipPostInitProperties"), false, true) };
     const ModToggle::Ptr m_compatibility_skip_uobjectarray_init{ ModToggle::create(generate_name("Compatibility_SkipUObjectArrayInit"), false, true) };
@@ -1928,6 +1966,14 @@ private:
     // HDR swapchains (PQ/scRGB) wash out the SDR-defined 3D output modes and
     // color correction — ask the engine to switch HDR output off while on.
     const ModToggle::Ptr m_flat3d_force_sdr{ ModToggle::create(generate_name("Flat3D_ForceSDR"), true) };
+    // Scales the Flat3D render FoV. The projection is rebuilt each frame from the
+    // GAME's live FoV (APlayerCameraManager::GetFOVAngle, so ADS zoom and cine
+    // cameras still drive it); this multiplies that, it does not replace it.
+    // 1.0 = untouched. Scales the HORIZONTAL tangent, and the vertical follows
+    // through the per-eye aspect, so it is a symmetric zoom with no stretch.
+    // NOTE: it is a tangent scale, not a degree scale — at a 90 deg hFoV, 2.0
+    // gives ~127 deg, not 180.
+    const ModSlider::Ptr m_flat3d_fov_multiplier{ ModSlider::create(generate_name("Flat3D_FOVMultiplier"), 0.5f, 3.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 0.5f, 0.1f) };
     const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_reference_fov{ ModSlider::create(generate_name("Flat3D_ReferenceFOV"), 40.0f, 140.0f, 90.0f) };
@@ -2197,6 +2243,7 @@ public:
             *m_flat3d_eye_swap,
             *m_flat3d_vsync,
             *m_flat3d_force_sdr,
+            *m_flat3d_fov_multiplier,
             *m_flat3d_depth,
             *m_flat3d_convergence,
             *m_flat3d_reference_fov,
@@ -2408,6 +2455,7 @@ public:
             *m_compatibility_dune_true_stereo,
             *m_compatibility_dune_native_dual_view_probe,
             *m_sceneview_compatibility_mode,
+            *m_compatibility_single_view_render_target,
             *m_keybind_recenter,
             *m_keybind_recenter_horizon,
             *m_keybind_set_standing_origin,

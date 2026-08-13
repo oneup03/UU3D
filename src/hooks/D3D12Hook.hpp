@@ -267,21 +267,31 @@ protected:
 
     std::unique_ptr<PointerHook> m_present_hook{};
     std::unique_ptr<PointerHook> m_present1_hook{};
-    std::vector<std::unique_ptr<PointerHook>> m_create_graphics_pipeline_state_hooks{};
-    std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_state_hooks{};
-    std::vector<std::unique_ptr<PointerHook>> m_create_render_target_view_hooks{};
-    std::vector<std::unique_ptr<PointerHook>> m_create_depth_stencil_view_hooks{};
-    std::vector<std::unique_ptr<PointerHook>> m_set_pipeline_state_hooks{};
-    std::vector<std::unique_ptr<PointerHook>> m_resource_barrier_hooks{};
-    std::vector<std::unique_ptr<PointerHook>> m_clear_depth_stencil_view_cmd_hooks{};
-    std::unordered_map<uintptr_t, PointerHook*> m_create_graphics_pipeline_state_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_state_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_create_depth_stencil_view_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_set_pipeline_state_hook_lookup{};
-    std::atomic<uint64_t> m_set_pipeline_state_hook_generation{1};
-    std::unordered_map<uintptr_t, PointerHook*> m_resource_barrier_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_clear_depth_stencil_view_cmd_hook_lookup{};
+    // PROCESS-WIDE, deliberately: the vtables these patch are shared by every
+    // device/command list in the process, and Framework re-hooks by DESTROYING
+    // this object and constructing a new one (Framework.cpp: m_d3d12_hook.reset()
+    // then make_unique). Per-instance records die with the old object, so the new
+    // one re-patched a slot another patcher (GameDepthCapture's per-draw depth
+    // capture) had already chained onto — capturing THEIR thunk as our original
+    // while their original was our detour. The two then called each other until
+    // the stack ran out (FANTASY LIFE i). Keeping the records static means the
+    // new instance sees the slot is already ours, skips it, and find_*_hook still
+    // resolves to the hook holding the real function.
+    static inline std::vector<std::unique_ptr<PointerHook>> m_create_graphics_pipeline_state_hooks{};
+    static inline std::vector<std::unique_ptr<PointerHook>> m_create_pipeline_state_hooks{};
+    static inline std::vector<std::unique_ptr<PointerHook>> m_create_render_target_view_hooks{};
+    static inline std::vector<std::unique_ptr<PointerHook>> m_create_depth_stencil_view_hooks{};
+    static inline std::vector<std::unique_ptr<PointerHook>> m_set_pipeline_state_hooks{};
+    static inline std::vector<std::unique_ptr<PointerHook>> m_resource_barrier_hooks{};
+    static inline std::vector<std::unique_ptr<PointerHook>> m_clear_depth_stencil_view_cmd_hooks{};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_create_graphics_pipeline_state_hook_lookup{};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_create_pipeline_state_hook_lookup{};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_create_depth_stencil_view_hook_lookup{};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_set_pipeline_state_hook_lookup{};
+    static inline std::atomic<uint64_t> m_set_pipeline_state_hook_generation{1};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_resource_barrier_hook_lookup{};
+    static inline std::unordered_map<uintptr_t, PointerHook*> m_clear_depth_stencil_view_cmd_hook_lookup{};
     std::atomic<D3D12DepthStencilObserver*> m_depth_stencil_observer{nullptr};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
     //std::unique_ptr<FunctionHook> m_create_swap_chain_hook{};
@@ -316,5 +326,10 @@ protected:
     PointerHook* find_set_pipeline_state_hook(void* slot) const;
     PointerHook* find_resource_barrier_hook(void* slot) const;
     PointerHook* find_clear_depth_stencil_view_cmd_hook(void* slot) const;
+
+    // Teardown for the vtable-slot hooks. Keeps any hook another patcher in this
+    // process has chained on top of, because our detour is still inside their
+    // call chain and needs its original to stay reachable.
+    void release_slot_hooks();
 };
 

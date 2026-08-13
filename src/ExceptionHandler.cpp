@@ -182,6 +182,92 @@ static LONG WINAPI first_chance_exception_logger(struct _EXCEPTION_POINTERS* ei)
                 ++logged;
             }
         }
+    } else {
+        // A stack overflow's RIP is wherever the guard page happened to be hit —
+        // often inside a lock or an allocator — so a single frame says nothing
+        // about WHICH recursion ran away. The used stack ABOVE rsp is committed
+        // and safe to read, and a runaway cycle stamps its return addresses into
+        // it thousands of times. Count them and print the most frequent: that IS
+        // the cycle. Fixed-size table, no heap, no unwinder — this runs on a
+        // thread with one page of stack left.
+        constexpr uintptr_t scan_bytes = 0x40000; // 256 KiB of already-used stack
+        constexpr size_t max_tracked = 24;
+
+        struct Frequent {
+            uintptr_t addr{};
+            uint32_t count{};
+        };
+
+        Frequent tracked[max_tracked]{};
+        size_t tracked_count = 0;
+        uint32_t matched = 0;
+        uintptr_t scanned = 0;
+        const auto rsp = ei->ContextRecord->Rsp;
+
+        for (uintptr_t off = 0; off < scan_bytes; off += sizeof(uintptr_t)) {
+            const auto slot = rsp + off;
+
+            // Probe once per page instead of once per qword: each failed probe is
+            // itself an exception, and 32k of them would take longer than the
+            // process has left.
+            if ((off & 0xfff) == 0 && IsBadReadPtr((void*)slot, 0x1000)) {
+                break;
+            }
+
+            scanned = off;
+            const auto val = *(uintptr_t*)slot;
+
+            if (val < 0x10000 || !utility::get_module_within(val).has_value()) {
+                continue;
+            }
+
+            ++matched;
+            bool found = false;
+
+            for (size_t i = 0; i < tracked_count; ++i) {
+                if (tracked[i].addr == val) {
+                    ++tracked[i].count;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found && tracked_count < max_tracked) {
+                tracked[tracked_count].addr = val;
+                tracked[tracked_count].count = 1;
+                ++tracked_count;
+            }
+        }
+
+        spdlog::error("[FirstChance] STACK OVERFLOW — scanned {:x} bytes of used stack, {} module return addresses, "
+                      "{} distinct tracked. The repeated frames below are the recursion cycle:",
+            scanned, matched, tracked_count);
+
+        // Selection sort by count, descending — tiny table, and std::sort would
+        // pull in more stack than this is worth here.
+        for (size_t printed = 0; printed < tracked_count && printed < 10; ++printed) {
+            size_t best = printed;
+
+            for (size_t i = printed + 1; i < tracked_count; ++i) {
+                if (tracked[i].count > tracked[best].count) {
+                    best = i;
+                }
+            }
+
+            const auto tmp = tracked[printed];
+            tracked[printed] = tracked[best];
+            tracked[best] = tmp;
+
+            const auto addr = tracked[printed].addr;
+
+            if (const auto mod = utility::get_module_within(addr)) {
+                const auto path = utility::get_module_path(*mod);
+                spdlog::error("[FirstChance]   x{:<6} {:x} ({} + {:x})",
+                    tracked[printed].count, addr, path.value_or("Unknown"), addr - (uintptr_t)*mod);
+            } else {
+                spdlog::error("[FirstChance]   x{:<6} {:x}", tracked[printed].count, addr);
+            }
+        }
     }
 
     if (const auto logger = spdlog::default_logger()) { logger->flush(); }
