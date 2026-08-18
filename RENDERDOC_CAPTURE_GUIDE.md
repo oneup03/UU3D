@@ -302,7 +302,7 @@ PowerShell and read the printed message:
 
 **Where's the UEVR log?**
 ```
-%APPDATA%\UnrealVRMod\<GameExeName>\log.txt
+%APPDATA%\UU3D\<GameExeName>\log.txt
 ```
 `<GameExeName>` is the exe name without `.exe` (e.g. `UnrealGame-Win64-Shipping`).
 Search it for `RenderDoc`, `prehook`, `ready event`, and `capture_safe` to see

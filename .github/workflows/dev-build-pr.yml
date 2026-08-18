@@ -1,5 +1,5 @@
 name: Dev Build PR
-on: [pull_request_target, workflow_dispatch]
+on: [pull_request, workflow_dispatch]
 env:
   BUILD_TYPE: Release
 permissions:

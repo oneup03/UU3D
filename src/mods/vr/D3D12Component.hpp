@@ -20,6 +20,10 @@
 
 #include "d3d12/CommandContext.hpp"
 #include "d3d12/TextureContext.hpp"
+#include "d3d12/DepthStencilObserver.hpp"
+
+#include "flat3d/Flat3DCompositorD3D12.hpp"
+#include "flat3d/Flat3DKatangaD3D12.hpp"
 
 #include "PDAFWPlugin.h"
 
@@ -31,13 +35,14 @@ public:
     EyeFrameBuffers m_eyeFrameBuffers;
 
 public:
-    D3D12Component() 
+    D3D12Component()
         : m_openvr{this}
     {
 
     }
 
     vr::EVRCompositorError on_frame(VR* vr);
+    vr::EVRCompositorError on_frame_flat3d(VR* vr);
     void on_post_present(VR* vr);
     void on_reset(VR* vr);
 
@@ -60,6 +65,46 @@ private:
 
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
+    bool ensure_2d_screen_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
+    bool ensure_halo_electra_quad_source_texture(ID3D12Device* device, uint64_t width, uint32_t height);
+    // Lazily (re)create m_ui_invert_tex to match the given UI texture desc.
+    bool ensure_ui_invert_tex(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
+
+    enum class ShfSceneMode {
+        Unknown,
+        Stereo3D,
+        Mono2D,
+    };
+
+    static const char* shf_scene_mode_name(ShfSceneMode mode);
+    ShfSceneMode classify_shf_scene_mode(const D3D12_RESOURCE_DESC& source_desc, const D3D12_RESOURCE_DESC& real_desc) const;
+    void log_shf_scene_mode_if_needed(
+        ShfSceneMode mode,
+        const D3D12_RESOURCE_DESC& source_desc,
+        const D3D12_RESOURCE_DESC& real_desc,
+        uint64_t frame_count,
+        bool using_mono_expansion);
+    bool ensure_shf_mono_scene_texture(ID3D12Device* device, const D3D12_RESOURCE_DESC& source_desc);
+    d3d12::TextureContext* render_shf_mono_scene_texture(ID3D12Device* device);
+    bool ensure_dune_hmd_mono_scene_texture(ID3D12Device* device, const D3D12_RESOURCE_DESC& source_desc);
+    d3d12::TextureContext* render_dune_hmd_mono_scene_texture(
+        ID3D12Device* device,
+        D3D12_RESOURCE_STATES source_state);
+
+    // Flat3D AFW: reproject the freshly-rendered eye (left half of double_wide)
+    // into the other eye via the PDAFWPlugin, consuming the globally-harvested
+    // DLSS / raw-buffer depth + motion vectors. Returns the warped other-eye
+    // texture (left in ALL_SHADER_RESOURCE), or nullptr when AFW is inactive /
+    // the plugin is the dummy / depth isn't live yet (caller falls back to plain
+    // AFR). Defined in D3D12Component_Flat3D.cpp. See on_frame_flat3d.
+    ID3D12Resource* run_flat3d_framewarp(
+        VR* vr,
+        ID3D12Resource* double_wide,
+        uint32_t eye_w, uint32_t eye_h,
+        DXGI_FORMAT eye_format,
+        DXGI_FORMAT backbuffer_format,
+        bool extreme,
+        uint32_t backbuffer_index);
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -69,6 +114,28 @@ private:
     d3d12::TextureContext m_backbuffer_copy{};
 
     d3d12::TextureContext m_game_ui_tex{};
+    // Off-screen destination for the UI alpha-invert pass. The invert used to
+    // render the UI texture onto ITSELF (src == dst), an illegal simultaneous
+    // SRV+RTV bind that removed the device on some titles (FF7 Rebirth). We now
+    // invert into this separate texture and route the UI through it.
+    d3d12::TextureContext m_ui_invert_tex{};
+    static constexpr uint32_t UE58_CONVERTED_UI_SLOT_COUNT = 3;
+    // Slate can rotate native D3D12 resources between frames. Keep each source
+    // SRV alive until the conversion command list that binds it has completed.
+    static constexpr uint32_t UE58_SLATE_UI_SOURCE_SLOT_COUNT = UE58_CONVERTED_UI_SLOT_COUNT + 1;
+    struct UE58SlateUiSourceSlot {
+        d3d12::TextureContext texture{};
+        uint32_t conversion_references{};
+    };
+    std::array<UE58SlateUiSourceSlot, UE58_SLATE_UI_SOURCE_SLOT_COUNT> m_ue58_ui_source_slots{};
+    std::array<d3d12::TextureContext, UE58_CONVERTED_UI_SLOT_COUNT> m_ue58_converted_ui_tex{};
+    uint32_t m_ue58_converted_ui_slot_cursor{};
+    d3d12::TextureContext* m_ue58_active_converted_ui_tex{};
+    uint32_t m_ue58_active_converted_ui_slot{UE58_CONVERTED_UI_SLOT_COUNT};
+    std::array<int32_t, UE58_CONVERTED_UI_SLOT_COUNT> m_ue58_converted_ui_source_slots{ -1, -1, -1 };
+    std::array<uint64_t, UE58_CONVERTED_UI_SLOT_COUNT> m_ue58_converted_ui_consumer_fence_values{};
+    ComPtr<ID3D12Fence> m_ue58_converted_ui_consumer_fence{};
+    uint64_t m_ue58_converted_ui_consumer_fence_value{};
     d3d12::TextureContext m_game_tex{};
     d3d12::TextureContext m_scene_capture_tex{};
     std::array<d3d12::CommandContext, 3> m_game_tex_commands{};
@@ -221,6 +288,21 @@ private:
     } m_openxr;
 
     uint32_t m_backbuffer_size[2]{};
+
+    flat3d::Flat3DCompositorD3D12 m_flat3d_compositor{};
+    flat3d::Flat3DKatangaD3D12 m_flat3d_katanga12{};
+
+    // Flat3D "DSV Observer" depth source: API-level scene-depth capture via the
+    // D3D12Hook depth-stencil observer (no engine hook). See DepthStencilObserver.
+    d3d12::DepthStencilCaptureObserver m_flat3d_depth_observer{};
+
+public:
+    // Diagnostic string for the 3D Display page's DSV Observer status line.
+    std::string get_flat3d_depth_trace_summary() const {
+        return m_flat3d_depth_observer.depth_trace_summary();
+    }
+
+private:
 
     uint32_t m_last_rendered_frame{0};
     bool m_force_reset{true};

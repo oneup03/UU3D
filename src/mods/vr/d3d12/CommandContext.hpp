@@ -49,6 +49,10 @@ struct CommandContext {
 
     bool waiting_for_fence{false};
     bool has_commands{false};
+    // Set by execute(); the Flat3D compositor reads it to disable the depth /
+    // coverage readback that invalidated the list. AFW's CommandContext has no
+    // poisoned/recovery machinery, and this branch deliberately keeps it that way.
+    bool last_close_failed{false};
 
     std::wstring internal_name{L"CommandContext object"};
 };

@@ -207,6 +207,10 @@ bool D3D11Component::TextureContext::clear_rtv(float* color) {
 }
 
 vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
+    if (vr->get_runtime()->is_flat3d()) {
+        return on_frame_flat3d(vr); // flat 3D monitor mode: composite to the real backbuffer, no VR submit
+    }
+
     if (m_force_reset || m_last_afr_state != vr->is_using_afr()) {
         if (!setup()) {
             SPDLOG_ERROR_EVERY_N_SEC(1, "Failed to setup D3D11Component, trying again next frame");
@@ -961,7 +965,8 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
 
 void D3D11Component::on_post_present(VR* vr) {
     // Clear the (real) backbuffer if VR is enabled. Otherwise it will flicker and all sorts of nasty things.
-    if (vr->is_hmd_active()) {
+    // Flat 3D monitor mode: the backbuffer IS the output — never clear it.
+    if (vr->is_hmd_active() && !vr->get_runtime()->is_flat3d()) {
         auto& hook = g_framework->get_d3d11_hook();
         auto device = hook->get_device();
         auto swapchain = hook->get_swap_chain();
@@ -1022,6 +1027,14 @@ void D3D11Component::on_reset(VR* vr) {
     m_constant_buffer.Reset();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
+    m_ui_invert_ps.Reset();
+    m_ui_invert_blend.Reset();
+    m_ui_invert_ready = false;
+    m_daysgone_ui_key_ps.Reset();
+    m_daysgone_ui_key_blend.Reset();
+    m_daysgone_ui_key_ready = false;
+    m_flat3d_compositor.reset();
+    m_flat3d_katanga.shutdown();
     m_is_shader_setup = false;
 
     for (auto& tex : m_2d_screen_tex) {

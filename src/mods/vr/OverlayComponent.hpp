@@ -46,6 +46,13 @@ public:
         return m_ui_invert_alpha->value();
     }
 
+    // Draw just the UI Invert Alpha slider. Lets it live in the Compatibility
+    // tab (always visible), since the full Overlay Options node is only drawn
+    // in VR-compositor mode (hidden under Flat3D / 3D Display).
+    void draw_ui_invert_alpha(const char* label) {
+        m_ui_invert_alpha->draw(label);
+    }
+
 private:
     // Cached data for imgui VR overlay so we know when we need to update it
     // instead of doing it constantly every frame

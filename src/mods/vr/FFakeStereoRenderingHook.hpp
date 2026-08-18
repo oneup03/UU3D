@@ -301,6 +301,187 @@ public:
         return m_hooked_slate_thread;
     }
 
+    bool has_seen_stable_slate_draw() const {
+        return m_has_seen_stable_slate_draw;
+    }
+
+    bool has_successful_command_list_hijack() const {
+        return m_has_successful_command_list_hijack;
+    }
+
+    bool prefers_slate_thread_for_session() const {
+        return m_prefer_slate_thread_for_session;
+    }
+
+    bool has_seen_prerender_viewfamily() const {
+        return m_has_seen_prerender_viewfamily;
+    }
+
+    safetyhook::InlineHook& get_render_module_begin_render_viewfamily_hook() {
+        return m_render_module_begin_render_viewfamily_hook;
+    }
+
+    bool has_scene_view_family_offsets_ready() const {
+        return m_has_scene_view_family_offsets_ready;
+    }
+
+    bool set_dune_character_creation_active(bool active) {
+        return m_dune_character_creation_active.exchange(active, std::memory_order_acq_rel);
+    }
+
+    bool is_dune_character_creation_active() const {
+        return m_dune_character_creation_active.load(std::memory_order_acquire);
+    }
+
+    void set_dune_has_live_pawn(bool active) {
+        m_dune_has_live_pawn.store(active, std::memory_order_release);
+    }
+
+    bool dune_has_live_pawn() const {
+        return m_dune_has_live_pawn.load(std::memory_order_acquire);
+    }
+
+    struct DuneTrueStereoFrameSnapshot {
+        uint32_t render_frame{};
+        uint8_t eye{};
+    };
+
+    struct NativeStereoFramePacket {
+        std::shared_ptr<const VRRenderTargetManager_Base::SceneCaptureTargetSnapshot> capture{};
+        sdk::FSceneViewFamily* family{};
+        sdk::FSceneView* left_view{};
+        sdk::FSceneView* right_view{};
+        sdk::FSceneViewStateInterface* left_state{};
+        sdk::FSceneViewStateInterface* right_state{};
+        sdk::FRenderTarget* main_target{};
+        sdk::FSceneInterface* scene{};
+        uint64_t serial{};
+        uint64_t capture_generation{};
+        uint32_t engine_frame{};
+        int32_t render_frame{};
+        int32_t player_index{-1};
+        uint32_t left_pass{};
+        uint32_t right_pass{};
+    };
+
+    std::shared_ptr<const NativeStereoFramePacket> get_native_stereo_frame_packet_for_submit(int32_t render_frame) const;
+    void note_native_stereo_frame_packet_consumed(uint64_t serial);
+    void reject_native_stereo_frame_packet(uint64_t serial, const char* detail);
+
+    std::optional<DuneTrueStereoFrameSnapshot> get_dune_true_stereo_frame_snapshot() const {
+        const auto packed = m_dune_true_stereo_frame.load(std::memory_order_acquire);
+        if ((packed & 0x2ull) == 0) {
+            return std::nullopt;
+        }
+
+        return DuneTrueStereoFrameSnapshot{
+            .render_frame = static_cast<uint32_t>(packed >> 2),
+            .eye = static_cast<uint8_t>(packed & 0x1ull),
+        };
+    }
+
+    std::string get_dune_final_output_probe_status_text() const;
+
+    void note_stable_slate_draw() {
+        if (!m_has_seen_stable_slate_draw) {
+            m_has_seen_stable_slate_draw = true;
+            m_first_stable_slate_draw_at = std::chrono::steady_clock::now();
+        }
+    }
+
+    void note_prerender_viewfamily_seen() {
+        m_has_seen_prerender_viewfamily = true;
+    }
+
+    void note_scene_view_family_offsets_ready() {
+        m_has_scene_view_family_offsets_ready = true;
+    }
+
+    void note_successful_command_list_hijack() {
+        m_has_successful_command_list_hijack = true;
+    }
+
+    uintptr_t get_daysgone_slate_native_ui_target() const {
+        return m_daysgone_slate_native_ui_target.load();
+    }
+
+    uint32_t get_daysgone_slate_native_ui_width() const {
+        return m_daysgone_slate_native_ui_width.load();
+    }
+
+    uint32_t get_daysgone_slate_native_ui_height() const {
+        return m_daysgone_slate_native_ui_height.load();
+    }
+
+    bool should_use_daysgone_slate_ui_overlay() const {
+        return m_daysgone_bend_ui_use_slate_overlay->value() &&
+            m_daysgone_slate_native_ui_target.load() != 0;
+    }
+
+    float get_daysgone_slate_ui_key_threshold() const {
+        return m_daysgone_bend_ui_key_threshold->value();
+    }
+
+    float get_daysgone_slate_ui_key_softness() const {
+        return m_daysgone_bend_ui_key_softness->value();
+    }
+
+    float get_daysgone_slate_ui_key_opacity() const {
+        return m_daysgone_bend_ui_key_opacity->value();
+    }
+
+    float get_daysgone_slate_ui_offset_x() const {
+        return m_daysgone_bend_ui_screen_offset_x->value();
+    }
+
+    float get_daysgone_slate_ui_offset_y() const {
+        return m_daysgone_bend_ui_screen_offset_y->value();
+    }
+
+    float get_daysgone_slate_ui_scale() const {
+        return m_daysgone_bend_ui_screen_scale->value() * m_daysgone_bend_ui_draw_scale->value();
+    }
+
+    bool should_split_daysgone_slate_ui_overlay() const {
+        return m_daysgone_bend_ui_split_overlay->value();
+    }
+
+    float get_daysgone_slate_ui_menu_src_x() const {
+        return m_daysgone_bend_ui_menu_src_x->value();
+    }
+
+    float get_daysgone_slate_ui_menu_src_y() const {
+        return m_daysgone_bend_ui_menu_src_y->value();
+    }
+
+    float get_daysgone_slate_ui_menu_src_w() const {
+        return m_daysgone_bend_ui_menu_src_w->value();
+    }
+
+    float get_daysgone_slate_ui_menu_src_h() const {
+        return m_daysgone_bend_ui_menu_src_h->value();
+    }
+
+    float get_daysgone_slate_ui_menu_offset_x() const {
+        return m_daysgone_bend_ui_menu_offset_x->value();
+    }
+
+    float get_daysgone_slate_ui_menu_offset_y() const {
+        return m_daysgone_bend_ui_menu_offset_y->value();
+    }
+
+    float get_daysgone_slate_ui_menu_scale() const {
+        return m_daysgone_bend_ui_menu_scale->value();
+    }
+
+    float get_daysgone_slate_ui_footer_src_y() const {
+        return m_daysgone_bend_ui_footer_src_y->value();
+    }
+
+    float get_daysgone_slate_ui_footer_src_h() const {
+        return m_daysgone_bend_ui_footer_src_h->value();
+    }
+
     bool should_recreate_textures() const {
         return m_wants_texture_recreation;
     }
@@ -377,7 +558,15 @@ public:
     static void setup_viewpoint(ISceneViewExtension* extension, void* player_controller, void* view_info);
     static void localplayer_setup_viewpoint(void* localplayer, void* view_info, void* pass);
     static void setup_view_family(ISceneViewExtension* extension, sdk::FSceneViewFamily& view_family);
-    static void begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family);
+    // hook: the inline hook whose trampoline reaches the original for THIS
+    // call site (multiple candidate addresses can be hooked simultaneously in
+    // modular builds where the resolver cannot be certain — see the Returnal
+    // notes at the resolution site). tag identifies the candidate in logs.
+    // trailing_ptr_arg / trailing_flag_arg are UE5.5+'s 4th and 5th
+    // BeginRenderingViewFamilies trailing parameters, forwarded verbatim (see
+    // the definition) — ignored by the older 3-argument shape.
+    static void begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family,
+                                             void* trailing_ptr_arg, uintptr_t trailing_flag_arg);
     static void begin_render_viewfamily(ISceneViewExtension* extension, sdk::FSceneViewFamily& view_family);
     static void pre_render_viewfamily_renderthread(ISceneViewExtension* extension, sdk::FRHICommandListBase* cmd_list, sdk::FSceneViewFamily& view_family);
 
@@ -516,6 +705,17 @@ private:
     Rotator<float> m_last_afr_rotation{};
     Rotator<double> m_last_afr_rotation_double{};
 
+    // Flat3D AFR eye alternation (game thread only). g_frame_count is slaved
+    // to the ENGINE's frame number, which some titles (Hogwarts) do NOT
+    // advance for the forced synced-sequential draw — raw %2 then renders the
+    // same eye twice per pair and the pair has no stereo baseline (depth
+    // collapses). The view-offset hook alternates per DRAW instead (a stalled
+    // frame number takes the complement of the previous draw's eye) and the
+    // projection hook reuses the stored index so both stay coherent within a
+    // draw.
+    int64_t m_afr_draw_frame{-1};
+    int m_afr_draw_index{-1};
+
     Rotator<float> m_last_pre_rotation{};
     Rotator<double> m_last_pre_rotation_double{};
 
@@ -598,8 +798,69 @@ private:
     const ModToggle::Ptr m_recreate_textures_on_reset{ ModToggle::create("VR_RecreateTexturesOnReset", true) };
     const ModInt32::Ptr m_frame_delay_compensation{ ModInt32::create("VR_FrameDelayCompensation", 0) };
     const ModToggle::Ptr m_asynchronous_scan{ ModToggle::create("VR_AsynchronousScan", true) };
-    // Off by default because it can cause issues with some games
-    const ModToggle::Ptr m_use_fmalloc_scene_view_extensions{ ModToggle::create("VR_UseFMallocSceneViewExtensions", false) };
+    // ON by default: the view-extensions array we splice into
+    // GEngine->ViewExtensions must come from the game's own allocator. Games
+    // that add/remove transient scene-view extensions at runtime (SMT5V does
+    // it around loads/cutscenes) Realloc/Shrink that TArray — with a CRT-
+    // allocated block that dies as "FMallocBinned2 Attempt to realloc an
+    // unrecognized block" (LowLevelFatalError, exception 0x4000). Turn OFF
+    // only for titles whose GMalloc discovery misfires.
+    const ModToggle::Ptr m_use_fmalloc_scene_view_extensions{ ModToggle::create("VR_UseFMallocSceneViewExtensions", true) };
+    // Off by default: restores safetyhook's trampoline lock path for games that dislike the faster original-call path.
+    const ModToggle::Ptr m_safe_tick_hook{ ModToggle::create("VR_SafeTickHook", false) };
+    const ModInt32::Ptr m_daysgone_bend_ui_mode{ ModInt32::create("VR_DaysGoneBendUI_Mode", 2, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_force_player_camera{ ModToggle::create("VR_DaysGoneBendUI_ForcePlayerCamera", true, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_override_widget_transform{ ModToggle::create("VR_DaysGoneBendUI_OverrideWidgetTransform", true, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_override_root_transform{ ModToggle::create("VR_DaysGoneBendUI_OverrideRootTransform", false, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_force_widget_refresh{ ModToggle::create("VR_DaysGoneBendUI_ForceWidgetRefresh", true, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_viewport_slot_fix{ ModToggle::create("VR_DaysGoneBendUI_ViewportSlotFix", true, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_live_watchdog{ ModToggle::create("VR_DaysGoneBendUI_LiveWatchdog", false, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_apply_child_render_transform{ ModToggle::create("VR_DaysGoneBendUI_ApplyChildRenderTransform", false, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_viewport_slot_offset_x{ ModSlider::create("VR_DaysGoneBendUI_ViewportSlotOffsetX", -1920.0f, 1920.0f, -240.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_viewport_slot_offset_y{ ModSlider::create("VR_DaysGoneBendUI_ViewportSlotOffsetY", -1080.0f, 1080.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_viewport_slot_scale{ ModSlider::create("VR_DaysGoneBendUI_ViewportSlotScale", 0.1f, 4.0f, 0.85f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_viewport_slot_opacity{ ModSlider::create("VR_DaysGoneBendUI_ViewportSlotOpacity", 0.0f, 2.0f, 1.0f, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_use_slate_overlay{ ModToggle::create("VR_DaysGoneBendUI_UseSlateOverlay", false, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_suppress_in_scene_composite{ ModToggle::create("VR_DaysGoneBendUI_SuppressInSceneComposite", false, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_split_overlay{ ModToggle::create("VR_DaysGoneBendUI_SplitOverlay", true, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_src_x{ ModSlider::create("VR_DaysGoneBendUI_MenuSrcX", 0.0f, 1.0f, 0.52f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_src_y{ ModSlider::create("VR_DaysGoneBendUI_MenuSrcY", 0.0f, 1.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_src_w{ ModSlider::create("VR_DaysGoneBendUI_MenuSrcW", 0.05f, 1.0f, 0.48f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_src_h{ ModSlider::create("VR_DaysGoneBendUI_MenuSrcH", 0.05f, 1.0f, 0.48f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_offset_x{ ModSlider::create("VR_DaysGoneBendUI_MenuOffsetX", -2400.0f, 2400.0f, -450.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_offset_y{ ModSlider::create("VR_DaysGoneBendUI_MenuOffsetY", -2400.0f, 2400.0f, -650.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_menu_scale{ ModSlider::create("VR_DaysGoneBendUI_MenuScale", 0.1f, 4.0f, 1.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_footer_src_y{ ModSlider::create("VR_DaysGoneBendUI_FooterSrcY", 0.0f, 1.0f, 0.68f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_footer_src_h{ ModSlider::create("VR_DaysGoneBendUI_FooterSrcH", 0.05f, 1.0f, 0.32f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_key_threshold{ ModSlider::create("VR_DaysGoneBendUI_KeyThreshold", 0.0f, 0.5f, 0.025f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_key_softness{ ModSlider::create("VR_DaysGoneBendUI_KeySoftness", 0.001f, 0.5f, 0.045f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_key_opacity{ ModSlider::create("VR_DaysGoneBendUI_KeyOpacity", 0.0f, 2.0f, 1.0f, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_disable_taa_crop{ ModToggle::create("VR_DaysGoneBendUI_DisableBendTAACrop", true, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_override_composite_extent{ ModToggle::create("VR_DaysGoneBendUI_OverrideCompositeExtent", false, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_composite_width{ ModSlider::create("VR_DaysGoneBendUI_CompositeWidth", 320.0f, 8192.0f, 1920.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_composite_height{ ModSlider::create("VR_DaysGoneBendUI_CompositeHeight", 180.0f, 8192.0f, 1080.0f, true) };
+    const ModToggle::Ptr m_daysgone_bend_ui_override_shader_params{ ModToggle::create("VR_DaysGoneBendUI_OverrideShaderParams", false, true) };
+    const ModInt32::Ptr m_daysgone_bend_ui_shader_param_target{ ModInt32::create("VR_DaysGoneBendUI_ShaderParamTarget", 3, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_shader_offset_x{ ModSlider::create("VR_DaysGoneBendUI_ShaderOffsetX", -4.0f, 4.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_shader_offset_y{ ModSlider::create("VR_DaysGoneBendUI_ShaderOffsetY", -4.0f, 4.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_shader_scale_x{ ModSlider::create("VR_DaysGoneBendUI_ShaderScaleX", 0.05f, 8.0f, 1.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_shader_scale_y{ ModSlider::create("VR_DaysGoneBendUI_ShaderScaleY", 0.05f, 8.0f, 1.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_distance_from_camera{ ModSlider::create("VR_DaysGoneBendUI_DistanceFromCamera", -6000.0f, 6000.0f, -1371.022f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_camera_fov{ ModSlider::create("VR_DaysGoneBendUI_CameraFOV", 10.0f, 140.0f, 70.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_loc_x{ ModSlider::create("VR_DaysGoneBendUI_WidgetLocX", -4000.0f, 4000.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_loc_y{ ModSlider::create("VR_DaysGoneBendUI_WidgetLocY", -4000.0f, 4000.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_loc_z{ ModSlider::create("VR_DaysGoneBendUI_WidgetLocZ", -6000.0f, 2000.0f, -1371.022f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_rot_pitch{ ModSlider::create("VR_DaysGoneBendUI_WidgetRotPitch", -180.0f, 180.0f, 90.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_rot_yaw{ ModSlider::create("VR_DaysGoneBendUI_WidgetRotYaw", -180.0f, 180.0f, 90.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_rot_roll{ ModSlider::create("VR_DaysGoneBendUI_WidgetRotRoll", -180.0f, 180.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_widget_scale{ ModSlider::create("VR_DaysGoneBendUI_WidgetScale", 0.05f, 8.0f, 1.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_screen_offset_x{ ModSlider::create("VR_DaysGoneBendUI_ScreenOffsetX", -1920.0f, 1920.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_screen_offset_y{ ModSlider::create("VR_DaysGoneBendUI_ScreenOffsetY", -1080.0f, 1080.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_screen_scale{ ModSlider::create("VR_DaysGoneBendUI_ScreenScale", 0.1f, 4.0f, 1.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_draw_scale{ ModSlider::create("VR_DaysGoneBendUI_DrawScale", 0.1f, 4.0f, 1.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_root_loc_x{ ModSlider::create("VR_DaysGoneBendUI_RootLocX", -4000.0f, 4000.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_root_loc_y{ ModSlider::create("VR_DaysGoneBendUI_RootLocY", -4000.0f, 4000.0f, 0.0f, true) };
+    const ModSlider::Ptr m_daysgone_bend_ui_root_loc_z{ ModSlider::create("VR_DaysGoneBendUI_RootLocZ", -6000.0f, 2000.0f, -1200.0f, true) };
 
     void setup_options() {
         m_options = {

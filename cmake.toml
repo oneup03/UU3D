@@ -47,6 +47,23 @@ add_subdirectory(dependencies/submodules/UESDK)
 # backend and builds the suspended launcher + smoke validator. Non-fatal if the
 # RenderDoc source/runtime isn't present.
 include(cmake/RenderDocFull.cmake)
+
+set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
+message(STATUS "Using vendored safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b + UEVR patches)...")
+add_subdirectory(dependencies/vendor/safetyhook)
+
+# LeiaSR (Simulated Reality) SDK. The SR-lib submodule's own CMake package owns
+# the SDK layout, the import-library set and the /DELAYLOAD list, so none of it
+# is hardcoded here: an SDK version bump or a new SR DLL is picked up without
+# touching this file. Consumed by [target.uevr] via SRLib::SDK +
+# srlib_apply_delayload(). Requires the api_expansion branch (see .gitmodules);
+# on master the submodule has no CMakeLists.txt and we silently build without
+# LeiaSR, exactly as with the submodule missing entirely.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/CMakeLists.txt")
+    add_subdirectory(dependencies/submodules/SR-lib)
+else()
+    message(STATUS "SR-lib: submodule not checked out (or on a branch without the CMake package); LeiaSR disabled.")
+endif()
 """
 
 [target.spdlog]
@@ -255,7 +272,9 @@ include-directories = [
     "src/",
     "include/",
     "${OPENXR_SOURCE_DIR}/src",
-    "dependencies/vendor/renderdoc"
+    "dependencies/vendor/renderdoc",
+    "dependencies/submodules/nvapi",
+    "dependencies/submodules/adl_sdk/include"
 ]
 compile-options = ["/GS-", "/bigobj", "/EHa", "/MP"]
 compile-features = ["cxx_std_23"]
@@ -277,12 +296,17 @@ link-libraries = [
     "sdkgenny",
     "asmjit",
     "luavrlib",
-	"pdafwmod"
+    "pdafwmod",
+    "delayimp",
+    "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/nvapi/amd64/nvapi64.lib"
 ]
 
 [template.ue4template.properties]
 OUTPUT_NAME = "UEVRBackend"
-LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll"
+# SR runtime DLLs are NOT listed here — srlib_apply_delayload() in
+# [target.uevr] applies the complete, SDK-owned list (see cmake.toml's project
+# cmake-after). Keeping them here too would let the two lists drift.
+LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:nvapi64.dll"
 RUNTIME_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 LIBRARY_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/lib/${CMKR_TARGET}"
@@ -315,5 +339,24 @@ add_custom_command(
 # Build the RenderDoc launcher + smoke tools and stage renderdoc.dll beside
 # UEVRBackend.dll. No-op if RenderDoc isn't available on this machine.
 uevr_attach_full_renderdoc(uevr)
+
+# LeiaSR. SRLib::SR is the whole integration: SR.cpp/SR.hpp wrap the SDK, and it
+# PUBLIC-links SRLib::SDK for the SR + third_party include dirs and every import
+# library. srlib_apply_delayload() applies the full /DELAYLOAD set so
+# UEVRBackend.dll still loads on machines that have never had the SR Platform
+# installed — the loader would otherwise refuse it with a popup naming
+# opencv_world343.dll before any of our code runs.
+#
+# Both compositors go through SRInterfaceDX11 / SRInterfaceDX12 and never touch
+# the SDK directly, so SR-lib owns the SRContext lifetime, the DLL preflight and
+# the load-bearing "initialize() after weaver creation" ordering. Their
+# __has_include("SR.hpp") probe is what compiles the LeiaSR paths in at all, so
+# it keys off this link rather than off an SDK header being present.
+if(SRLIB_FOUND)
+    target_link_libraries(uevr PRIVATE SRLib::SR)
+    srlib_apply_delayload(uevr)
+else()
+    message(STATUS "uevr: building without LeiaSR support (SR-lib SDK not found).")
+endif()
 
 """

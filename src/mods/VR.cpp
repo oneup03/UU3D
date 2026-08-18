@@ -94,19 +94,35 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
         }
         RHIThreadID = std::this_thread::get_id();
         auto render_frame_count = vr->get_render_frame_count();
-        EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
-        EyeIndex nEyeOther = (render_frame_count % 2 == 0) ? EyeRight : EyeLeft;
+        // Same eye-parity expression as run_flat3d_framewarp / update_camera_data /
+        // the compositors — a hardcoded ==0 here swaps the harvest's eye slots
+        // whenever m_left_eye_interval is 1.
+        EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
+        EyeIndex nEyeOther = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeRight : EyeLeft;
         if (render_frame_count - vr->last_dlss_frame_count > 2)
             vr->dlss_continue_frame_count = 0;
         vr->last_dlss_frame_count = render_frame_count;
         vr->dlss_continue_frame_count++;
         static int lastPausedFrame = render_frame_count;
+
+        // Flat3D "DLSS Depth" source: snapshot the DLSS input depth into our OWN
+        // per-eye copy on the game's command list. Plugin-free (uses the game device
+        // + CopyResource), and independent of the rendering method — so it works in
+        // Native / Synced / AFR, not just AFW.
+        if (vr->flat3d_wants_dlss_depth() && depth) {
+            vr->capture_dlss_depth_copy(InCmdList, depth, (int)nEye);
+        }
+
+        // --- AFW (plugin) depth + motion-vector harvest -----------------------
+        // depthDesc/motionVectorsDesc are allocated by the AFW warp block and copied
+        // here via the plugin's D3D12 renderer; requires the real PDAFWPlugin.
         bool bufferValid = vr->is_hmd_active() && motionVectors && vr->motionVectorsDesc[nEye].pTexture && vr->depthDesc[nEye].pTexture;
         if (!bufferValid)
             lastPausedFrame = render_frame_count;
         if (lastPausedFrame > render_frame_count)
             lastPausedFrame = render_frame_count;
-        if (vr->is_using_afw() && vr->afw_resolution_change_skip_frames <= 0 && (render_frame_count - lastPausedFrame > 30) && bufferValid) {
+        if (vr->is_using_afw() && vr->d3d12Renderer != nullptr && vr->afw_resolution_change_skip_frames <= 0 &&
+            (render_frame_count - lastPausedFrame > 30) && bufferValid) {
             TextureDesc src;
             src.pTexture = depth;
             src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -116,7 +132,7 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
                 vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 vr->d3d12Renderer->SetupTextureDesc(vr->rawMVDesc[nEye]);
             }
-            if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() && 
+            if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
                 vr->rawVelocityDesc[nEye].pTexture && vr->rawVelocityDesc[nEyeOther].pTexture) {
                 if (vr->rawMVDesc[nEye].pTexture && vr->motionVectorsDesc[nEye].pTexture) {
                     vr->update_camera_data(render_frame_count);
@@ -143,7 +159,7 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
                 vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
             }
         }
-        if (vr->is_renderdoc) {
+        if (vr->is_renderdoc && vr->d3d12Renderer != nullptr) {
             static TextureDesc colorDesc[2];
             static TextureDesc outputDesc[2];
             if (color && colorDesc[nEye].pTexture != color) {
@@ -167,10 +183,13 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     return result;
 }
 
-//decltype(&ID3D12GraphicsCommandList::ResourceBarrier) ptrResourceBarrier; // 26
+// AFW/NeverDLSS raw harvest. Inline-hooked on the command list's function body
+// (not a second patch of vtable slot 26): a vtable patch here and D3D12Hook's
+// PointerHook on the same slot each captured the other as "original" after a
+// re-hook, recursing every ResourceBarrier to a stack overflow (P3R crash).
+// An inline hook patches the function itself, so it composes instead.
 static SafetyHookInline ResourceBarrier_Hook{};
 void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
-    //(This->*ptrResourceBarrier)(NumBarriers, pBarriers);
     ResourceBarrier_Hook.call(This, NumBarriers, pBarriers);
     const auto& vr = VR::get();
 
@@ -187,7 +206,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
     ID3D12Resource* velocityCandidate = nullptr;
     ID3D12Resource* motionVectorsCandidate = nullptr;
     auto render_frame_count = vr->get_render_frame_count();
-    EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
+    EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
     bool isNeverDLSS = vr->is_never_dlss();
     for (int i = 0; i < NumBarriers; i++) {
         auto& barrier = pBarriers[i];
@@ -267,19 +286,15 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
 }
 
 static std::map<SIZE_T, ID3D12Resource*> DSVMap = {};
-decltype(&ID3D12Device::CreateDepthStencilView) ptrCreateDepthStencilView; // 21
 void WINAPI hk_ID3D12Device_CreateDepthStencilView(
     ID3D12Device* This, ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    (This->*ptrCreateDepthStencilView)(pResource, pDesc, DestDescriptor);
     DSVMap[DestDescriptor.ptr] = pResource;
 }
 
-//decltype(&ID3D12GraphicsCommandList::ClearDepthStencilView) ptrClearDepthStencilView; // 47
 static SafetyHookInline ClearDepthStencilView_Hook{};
-void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This, 
+void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This,
     D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView, D3D12_CLEAR_FLAGS ClearFlags, FLOAT Depth, UINT8 Stencil, UINT NumRects, const D3D12_RECT* pRects) {
 
-    //(This->*ptrClearDepthStencilView)(DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
     ClearDepthStencilView_Hook.call(This, DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
 
     const auto& vr = VR::get();
@@ -289,7 +304,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
 
     auto render_frame_count = vr->get_render_frame_count();
     bool isNeverDLSS = vr->is_never_dlss();
-    EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
+    EyeIndex nEye = (render_frame_count % 2 == vr->get_left_eye_interval()) ? EyeLeft : EyeRight;
     if (isNeverDLSS && DSVMap.contains(DepthStencilView.ptr)) {
         auto depth = DSVMap[DepthStencilView.ptr];
         auto desc = depth->GetDesc();
@@ -320,23 +335,261 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
     }
 }
 
-uintptr_t hookVtable(void* target, int index, void* detours) {
-    uintptr_t* pVTable = *(uintptr_t**)target;
-    DWORD dwOldProct = 0;
-    BOOL bRet = ::VirtualProtect(pVTable, 4, PAGE_READWRITE, &dwOldProct);
-    auto origFunc = pVTable[index];
-    pVTable[index] = (uintptr_t)detours;
-    return origFunc;
-}
-
 std::shared_ptr<VR>& VR::get() {
     //static std::shared_ptr<VR> instance = std::make_shared<VR>();
     return g_framework->vr();
 }
 
 // Called when the mod is initialized
+void VR::init_framewarp_module() {
+    if (!g_framework->is_dx12()) {
+        return;
+    }
+    if (m_framewarp_device_initialized && m_ngx_hooks_installed) {
+        return; // fully initialized
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr || hook->get_device() == nullptr || hook->get_command_queue() == nullptr) {
+        return; // D3D12 not ready yet; retried next frame
+    }
+
+    // --- Plugin device + raw D3D12 harvest hooks (once) --------------------
+    if (!m_framewarp_device_initialized) {
+        if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
+            const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
+            if (current_path) {
+                auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
+                if (LoadLibraryW(fspath.c_str()) == nullptr) {
+                    spdlog::info("[VR][AFW] Could not load PDAFWPlugin.dll (AFW will be unavailable)");
+                }
+            }
+        }
+
+        is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
+
+        pd::DeviceParams params{};
+        params.d3d12Device = hook->get_device();
+        params.d3d12Queue = hook->get_command_queue();
+        d3d12Renderer = InitDevice(params);
+
+        if (d3d12Renderer == nullptr) {
+            // No real plugin (the shipped no-op dummy returns null, or the DLL is
+            // absent). AFW itself and the NeverDLSS raw hooks (which record on the
+            // plugin's command list) stay disabled — but the DLSS/NGX depth harvest
+            // does NOT need the plugin, so we still fall through and install it so
+            // the Flat3D "DLSS Depth" source works via our own copy.
+            spdlog::warn("[VR][AFW] PDAFWPlugin InitDevice returned null; AFW disabled "
+                         "(drop the real PDAFWPlugin.dll beside UEVRBackend.dll for AFW). "
+                         "DLSS Depth capture still works via our own copy.");
+        } else {
+            // CreateDepthStencilView stays a D3D12Hook post-original callback.
+            // Upstream still patches device vtable slot 21 directly, which goes
+            // mutually recursive with D3D12Hook's own PointerHook on that slot
+            // after a re-hook (stack overflow in P3R).
+            D3D12Hook::s_on_raw_create_depth_stencil_view.store(&hk_ID3D12Device_CreateDepthStencilView, std::memory_order_release);
+
+            // ResourceBarrier / ClearDepthStencilView are inline-hooked on the
+            // command list's function bodies rather than its vtable slots, so
+            // they compose with D3D12Hook's PointerHooks instead of recursing.
+            // This is upstream's mechanism (fixes the harvest not firing in Halo
+            // Campaign Evolved, where the vtable patch never saw the barriers).
+            if (auto* cmd_list = d3d12Renderer->BeginCommandList(0); cmd_list != nullptr) {
+                auto* const vtable = *(uintptr_t**)cmd_list;
+
+                if (auto rb = safetyhook::InlineHook::create(
+                        (LPVOID)vtable[26], reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ResourceBarrier))) {
+                    ResourceBarrier_Hook = std::move(rb.value());
+                } else {
+                    spdlog::error("[VR][AFW] Hook ID3D12GraphicsCommandList::ResourceBarrier failed: {}",
+                                  (INT)rb.error().type);
+                }
+
+                if (auto cd = safetyhook::InlineHook::create(
+                        (LPVOID)vtable[47], reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ClearDepthStencilView))) {
+                    ClearDepthStencilView_Hook = std::move(cd.value());
+                } else {
+                    spdlog::error("[VR][AFW] Hook ID3D12GraphicsCommandList::ClearDepthStencilView failed: {}",
+                                  (INT)cd.error().type);
+                }
+
+                d3d12Renderer->EndCommandList(0);
+            } else {
+                spdlog::error("[VR][AFW] Could not obtain a plugin command list; raw depth harvest disabled");
+            }
+
+            spdlog::info("[VR][AFW] Frame Warp device initialized");
+        }
+
+        m_framewarp_device_initialized = true;
+    }
+
+    // --- DLSS / NGX harvest hooks (retry until nvngx.dll is loaded) --------
+    // nvngx loads lazily when the game first initializes DLSS, which can be well
+    // after this mod initializes — so this is retried each frame from
+    // on_pre_engine_tick until it succeeds.
+    if (!m_ngx_hooks_installed) {
+        auto dllNGX = GetModuleHandle("_nvngx.dll");
+        if (!dllNGX) {
+            dllNGX = GetModuleHandle("nvngx.dll");
+        }
+        // OptiScaler ships as a local dxgi.dll or winmm.dll exporting the NGX
+        // entry points; prefer it over nvngx.dll when present (upstream parity).
+        for (const char* opti_name : {"dxgi.dll", "winmm.dll"}) {
+            const auto dllOpti = GetModuleHandle(opti_name);
+            if (dllOpti != nullptr && GetProcAddress(dllOpti, "NVSDK_NGX_D3D12_CreateFeature") != nullptr) {
+                dllNGX = dllOpti;
+                spdlog::info("[VR][AFW] OptiScaler detected ({}), hooking it instead of nvngx.dll", opti_name);
+                break;
+            }
+        }
+        if (!dllNGX) {
+            return; // DLSS not initialized by the game yet
+        }
+
+        auto result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_CreateFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
+
+        result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_ReleaseFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
+
+        result = safetyhook::InlineHook::create(
+            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
+        if (!result) {
+            spdlog::error("[VR][AFW] Hook NVSDK_NGX_D3D12_EvaluateFeature failed: {}", (INT)result.error().type);
+            return;
+        }
+        NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
+
+        m_ngx_hooks_installed = true;
+        spdlog::info("[VR][AFW] DLSS/NGX harvest hooks installed (nvngx.dll found)");
+    }
+}
+
+void VR::capture_dlss_depth_copy(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* depth, int eye) {
+    if (cmd_list == nullptr || depth == nullptr || eye < 0 || eye > 1) {
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr) {
+        return;
+    }
+    auto* device = hook->get_device();
+    if (device == nullptr) {
+        return;
+    }
+
+    const auto src_desc = depth->GetDesc();
+    // The DLSS input depth is always a plain 2D, single-sample, shader-readable
+    // texture. Bail on anything unexpected rather than issue a bad copy/barrier.
+    if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || src_desc.SampleDesc.Count != 1 ||
+        src_desc.Width == 0 || src_desc.Height == 0 ||
+        (src_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
+        return;
+    }
+
+    std::scoped_lock lock(m_dlss_depth_mutex);
+
+    // (Re)allocate the owned copy to match the source (a plain shader-readable copy
+    // — strip DSV/RTV/UAV/deny flags but keep the format/extent so CopyResource is
+    // an exact whole-resource copy).
+    bool need_alloc = m_dlss_depth[eye] == nullptr;
+    if (!need_alloc) {
+        const auto cur = m_dlss_depth[eye]->GetDesc();
+        need_alloc = cur.Width != src_desc.Width || cur.Height != src_desc.Height ||
+                     cur.Format != src_desc.Format || cur.DepthOrArraySize != src_desc.DepthOrArraySize ||
+                     cur.MipLevels != src_desc.MipLevels;
+    }
+    if (need_alloc) {
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        auto dst_desc = src_desc;
+        dst_desc.Flags &= ~(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        dst_desc.Alignment = 0;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource> tex{};
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &dst_desc,
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex)))) {
+            spdlog::warn("[VR][DLSS depth] Could not allocate the owned depth copy");
+            return;
+        }
+        tex->SetName(L"Flat3D DLSS Depth Copy");
+        m_dlss_depth[eye] = std::move(tex);
+    }
+
+    // The DLSS input depth is passed in NON_PIXEL_SHADER_RESOURCE (DLSS samples it).
+    // Round-trip through COPY_SOURCE and restore it before the copy list is closed,
+    // leaving our owned copy shader-readable for the Flat3D compositor.
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    for (auto& b : barriers) {
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    barriers[0].Transition.pResource = depth;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.pResource = m_dlss_depth[eye].Get();
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cmd_list->ResourceBarrier(2, barriers);
+
+    cmd_list->CopyResource(m_dlss_depth[eye].Get(), depth);
+
+    std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+    std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+    cmd_list->ResourceBarrier(2, barriers);
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> VR::get_dlss_depth_copy(int eye) {
+    if (eye < 0 || eye > 1) {
+        return nullptr;
+    }
+    std::scoped_lock lock(m_dlss_depth_mutex);
+    return m_dlss_depth[eye];
+}
+
 std::optional<std::string> VR::clean_initialize() try {
     ZoneScopedN(__FUNCTION__);
+
+    // Flat 3D display mode takes priority over the HMD runtimes when the
+    // frontend requests it. No VR API/DLL is required for it.
+    if (m_requested_runtime_name->value() == "flat3d") {
+        auto flat3d_error = initialize_flat3d();
+
+        if (!flat3d_error && m_flat3d->loaded) {
+            m_openvr->is_hmd_active = false;
+            m_openvr->was_hmd_active = false;
+            m_openvr->needs_pose_update = false;
+            m_openxr->needs_pose_update = false;
+
+            // AFW works under Flat3D too: install the plugin device + DLSS/NGX +
+            // raw D3D12 harvest hooks here, since this path returns before the
+            // normal Frame Warp init below. Retryable, so a late-loading nvngx.dll
+            // (DLSS) still gets hooked from the per-frame retry in on_present.
+            init_framewarp_module();
+
+            m_init_finished = true;
+            return Mod::on_initialize();
+        }
+
+        if (flat3d_error) {
+            spdlog::error("Flat3D failed to initialize: {}", *flat3d_error);
+        }
+        // fall through to the HMD runtimes
+    }
 
     auto openvr_error = initialize_openvr();
 
@@ -378,108 +631,10 @@ std::optional<std::string> VR::clean_initialize() try {
 
     m_init_finished = true;
 
-    // #############################
-    // #Frame Warp Module Start
-    // #############################
-    if (!g_framework->is_dx12())
-        return Mod::on_initialize();
-
-    if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
-        const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
-        if (current_path) {
-            auto fspath = std::filesystem::path{*current_path} / L"PDAFWPlugin.dll";
-            if (LoadLibraryW(fspath.c_str()) == nullptr) {
-                spdlog::info("[VR] Could not load PDAFWPlugin.dll");
-            }
-        }
-    }
-
-    is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
-
-    auto& hook = g_framework->get_d3d12_hook();
-    hook->get_command_queue();
-    pd::DeviceParams params{};
-    params.d3d12Device = hook->get_device();
-    params.d3d12Queue = hook->get_command_queue();
-    d3d12Renderer = InitDevice(params);
-
-    *(uintptr_t*)&ptrCreateDepthStencilView = hookVtable(params.d3d12Device, 21, hk_ID3D12Device_CreateDepthStencilView);
-
-    auto cmdList = d3d12Renderer->BeginCommandList(0);
-    {
-        uintptr_t* pVTable = *(uintptr_t**)cmdList;
-        DWORD dwOldProct = 0;
-        BOOL bRet = ::VirtualProtect(pVTable, 4, PAGE_READWRITE, &dwOldProct);
-        auto origResourceBarrier = pVTable[26];
-        auto origClearDepthStencilView = pVTable[47];
-
-        auto result = safetyhook::InlineHook::create((LPVOID)origResourceBarrier, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ResourceBarrier));
-        if (!result) {
-            spdlog::error("Hook ID3D12GraphicsCommandList ResourceBarrier Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        ResourceBarrier_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create((LPVOID)origClearDepthStencilView, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ClearDepthStencilView));
-        if (!result) {
-            spdlog::error("Hook ID3D12GraphicsCommandList ClearDepthStencilView Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        ClearDepthStencilView_Hook = std::move(result.value());
-    }
-    //*(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
-    //*(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);
-    d3d12Renderer->EndCommandList(0);
-
-    auto dllNGX = LoadLibrary("_nvngx.dll");
-    if (!dllNGX)
-        dllNGX = LoadLibrary("nvngx.dll");
-    auto dllOptiScaler = LoadLibrary("dxgi.dll");
-    if (dllOptiScaler) {
-        if (GetProcAddress(dllOptiScaler, "NVSDK_NGX_D3D12_CreateFeature")) {
-            dllNGX = dllOptiScaler;
-            spdlog::info("OptiScaler detected, hooking it instead of nvngx.dll.");
-        } else {
-            dllOptiScaler = LoadLibrary("winmm.dll");
-            if (dllOptiScaler) {
-                if (GetProcAddress(dllOptiScaler, "NVSDK_NGX_D3D12_CreateFeature")) {
-                    dllNGX = dllOptiScaler;
-                    spdlog::info("OptiScaler detected, hooking it instead of nvngx.dll.");
-                }
-            } 
-        }
-    }
-    if (!dllNGX) {
-        spdlog::error("nvngx.dll not loaded!");
-    } else {
-        auto result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_CreateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_ReleaseFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
-
-        result = safetyhook::InlineHook::create(
-            GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
-        if (!result) {
-            spdlog::error("Hook NVSDK_NGX_D3D12_EvaluateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
-        }
-        NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
-    }
-
-    // #############################
-    // #Frame Warp Module End
-    // #############################
+    // AFW (Async Frame Warp): plugin device + DLSS/NGX + raw D3D12 harvest hooks.
+    // Retryable and dummy-plugin-safe; also runs for Flat3D (see the flat3d branch
+    // above). Defined in init_framewarp_module().
+    init_framewarp_module();
 
     // all OK
     return Mod::on_initialize();
@@ -1088,6 +1243,14 @@ bool VR::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == WM_DEVICECHANGE && !m_spoofed_gamepad_connection) {
         spdlog::info("[VR] Received WM_DEVICECHANGE");
         m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
+    }
+
+    // 3D Display stereo cursor: keep the game from arming a hardware cursor —
+    // the OS composites it flat on top of the stereo output (one copy at
+    // screen depth). The compositor draws the per-eye cursor instead.
+    if (message == WM_SETCURSOR && is_using_flat3d() && m_flat3d_cursor_mode->value() != 0) {
+        SetCursor(nullptr);
+        return false;
     }
 
     return true;
@@ -1774,6 +1937,14 @@ void VR::update_imgui_state_from_xinput_state(XINPUT_STATE& state, bool is_vr_co
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
+    // AFW init retry: no-op once fully installed. Re-attempts the DLSS/NGX hooks
+    // until the game has loaded nvngx.dll (it loads lazily on first DLSS use).
+    init_framewarp_module();
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto previous_engine_tick = m_last_engine_tick;
+    const bool hitch_diagnostics_enabled = m_enable_hitch_diagnostics->value();
+
     m_cvar_manager->on_pre_engine_tick(engine, delta);
     m_last_engine_tick = std::chrono::steady_clock::now();
 
@@ -1792,6 +1963,2299 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     if (m_fake_stereo_hook != nullptr && !m_fake_stereo_hook->is_ignoring_next_viewport_draw()) {
         update_action_states();
     }
+}
+
+void VR::update_imgui_state_from_vr_controller_fallback() {
+    // A few games only delay-load XInput when a physical gamepad is first
+    // queried. Their normal VR controller path therefore never reaches
+    // on_xinput_get_state. Feed UEVR's ImGui navigation directly from the
+    // already-synchronized OpenXR actions until a real XInput callback arrives.
+    if (m_has_observed_xinput.load(std::memory_order_relaxed) ||
+        g_framework == nullptr ||
+        !is_using_controllers())
+    {
+        return;
+    }
+
+    XINPUT_STATE state{};
+    const auto left_joystick = get_left_joystick();
+    const auto right_joystick = get_right_joystick();
+    const auto wants_swap = m_swap_controllers->value();
+
+    const auto& a_button_left = !wants_swap ? m_action_a_button_left : m_action_a_button_right;
+    const auto& a_button_right = !wants_swap ? m_action_a_button_right : m_action_a_button_left;
+    const auto& b_button_left = !wants_swap ? m_action_b_button_left : m_action_b_button_right;
+    const auto& b_button_right = !wants_swap ? m_action_b_button_right : m_action_b_button_left;
+
+    if (is_action_active_any_joystick(a_button_right)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
+    }
+
+    if (is_action_active_any_joystick(a_button_left)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_B;
+    }
+
+    if (is_action_active_any_joystick(b_button_right)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_X;
+    }
+
+    if (is_action_active_any_joystick(b_button_left)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_Y;
+    }
+
+    if (is_action_active(m_action_joystick_click, left_joystick)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
+    }
+
+    if (is_action_active(m_action_joystick_click, right_joystick)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+    }
+
+    if (is_action_active(m_action_trigger, left_joystick)) {
+        state.Gamepad.bLeftTrigger = 255;
+    }
+
+    if (is_action_active(m_action_trigger, right_joystick)) {
+        state.Gamepad.bRightTrigger = 255;
+    }
+
+    if (is_action_active(m_action_grip, left_joystick)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    }
+
+    if (is_action_active(m_action_grip, right_joystick)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    }
+
+    if (is_action_active_any_joystick(m_action_dpad_up)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+    }
+
+    if (is_action_active_any_joystick(m_action_dpad_right)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+    }
+
+    if (is_action_active_any_joystick(m_action_dpad_down)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+    }
+
+    if (is_action_active_any_joystick(m_action_dpad_left)) {
+        state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+    }
+
+    const auto left_axis = get_joystick_axis(left_joystick);
+    const auto right_axis = get_joystick_axis(right_joystick);
+    state.Gamepad.sThumbLX = (int16_t)std::clamp(left_axis.x * 32767.0f, -32767.0f, 32767.0f);
+    state.Gamepad.sThumbLY = (int16_t)std::clamp(left_axis.y * 32767.0f, -32767.0f, 32767.0f);
+    state.Gamepad.sThumbRX = (int16_t)std::clamp(right_axis.x * 32767.0f, -32767.0f, 32767.0f);
+    state.Gamepad.sThumbRY = (int16_t)std::clamp(right_axis.y * 32767.0f, -32767.0f, 32767.0f);
+
+    update_imgui_state_from_xinput_state(state, true);
+}
+
+void VR::update_subnautica2_save_thumbnail_guard(sdk::UGameEngine* engine) {
+    if (!is_subnautica2_executable() || m_subnautica2_save_thumbnail_guard_done) {
+        return;
+    }
+
+    if (!m_subnautica2_save_thumbnail_fallback_logged) {
+        m_subnautica2_save_thumbnail_fallback_logged = true;
+        SPDLOG_INFO("[Subnautica2][SaveThumbnailGuard] Skipping save-thumbnail byte patch path and forcing UObject thumbnail-disable fallback");
+    }
+
+    if (engine == nullptr) {
+        return;
+    }
+
+    const auto object_array = sdk::FUObjectArray::get();
+    if (object_array == nullptr || IsBadReadPtr(object_array, sizeof(void*))) {
+        return;
+    }
+
+    const auto object_count = object_array->get_object_count();
+    if (object_count <= 0) {
+        return;
+    }
+
+    if (m_subnautica2_save_thumbnail_guard_cursor < 0 || m_subnautica2_save_thumbnail_guard_cursor >= object_count) {
+        m_subnautica2_save_thumbnail_guard_cursor = 0;
+    }
+
+    // Subnautica 2 save thumbnails use a UWE screenshot readback path that can
+    // overrun its thumbnail crop allocation in VR. Scan incrementally and only
+    // touch the narrow UWE settings shape to avoid a startup hitch.
+    constexpr int32_t SCAN_BUDGET_PER_TICK = 2048;
+    constexpr uint32_t MAX_FULL_SWEEPS = 3;
+
+    int32_t scanned = 0;
+    while (scanned < SCAN_BUDGET_PER_TICK && m_subnautica2_save_thumbnail_guard_full_sweeps < MAX_FULL_SWEEPS) {
+        auto* item = object_array->get_object(m_subnautica2_save_thumbnail_guard_cursor);
+        ++scanned;
+
+        m_subnautica2_save_thumbnail_guard_cursor++;
+        if (m_subnautica2_save_thumbnail_guard_cursor >= object_count) {
+            m_subnautica2_save_thumbnail_guard_cursor = 0;
+            ++m_subnautica2_save_thumbnail_guard_full_sweeps;
+        }
+
+        if (item == nullptr || IsBadReadPtr(item, sizeof(void*))) {
+            continue;
+        }
+
+        auto* object = (sdk::UObject*)item->get_object();
+        if (object == nullptr || IsBadReadPtr(object, sizeof(void*))) {
+            continue;
+        }
+
+        sdk::UClass* klass = nullptr;
+        try {
+            klass = object->get_class();
+        } catch (...) {
+            klass = nullptr;
+        }
+
+        if (klass == nullptr || IsBadReadPtr(klass, sizeof(void*))) {
+            continue;
+        }
+
+        const auto key = (uintptr_t)klass;
+        auto it = m_subnautica2_save_thumbnail_guard_class_cache.find(key);
+        const bool candidate = it != m_subnautica2_save_thumbnail_guard_class_cache.end()
+            ? it->second
+            : is_subnautica2_save_thumbnail_settings_class(klass);
+
+        if (it == m_subnautica2_save_thumbnail_guard_class_cache.end()) {
+            m_subnautica2_save_thumbnail_guard_class_cache.emplace(key, candidate);
+        }
+
+        if (!candidate) {
+            continue;
+        }
+
+        bool patched = false;
+        if (disable_subnautica2_save_thumbnails_on_object(object)) {
+            ++m_subnautica2_save_thumbnail_guard_patched_objects;
+            patched = true;
+        }
+
+        if (auto* cdo = klass->get_class_default_object(); cdo != nullptr && cdo != object && !IsBadReadPtr(cdo, sizeof(void*))) {
+            if (disable_subnautica2_save_thumbnails_on_object(cdo)) {
+                ++m_subnautica2_save_thumbnail_guard_patched_objects;
+                patched = true;
+            }
+        }
+
+        if (patched) {
+            m_subnautica2_save_thumbnail_guard_done = true;
+            m_subnautica2_save_thumbnail_guard_found_candidate = true;
+            SPDLOG_INFO(
+                "[Subnautica2][SaveThumbnailGuard] Applied after scanning {} objects over {} full sweeps; patched_objects={}",
+                scanned,
+                m_subnautica2_save_thumbnail_guard_full_sweeps,
+                m_subnautica2_save_thumbnail_guard_patched_objects);
+            return;
+        }
+    }
+
+    if (m_subnautica2_save_thumbnail_guard_full_sweeps >= MAX_FULL_SWEEPS && !m_subnautica2_save_thumbnail_guard_warned_exhausted) {
+        m_subnautica2_save_thumbnail_guard_warned_exhausted = true;
+        m_subnautica2_save_thumbnail_guard_done = true;
+        SPDLOG_WARN(
+            "[Subnautica2][SaveThumbnailGuard] Did not find a UWE save-thumbnail settings object after {} FUObjectArray sweeps; save-thumbnail readback remains enabled",
+            m_subnautica2_save_thumbnail_guard_full_sweeps);
+    }
+}
+
+void VR::restore_subnautica2_native_water_cvars() {
+    if (!m_subnautica2_native_water_cvars_applied || m_subnautica2_native_water_previous_ints.empty()) {
+        m_subnautica2_native_water_cvars_applied = false;
+        m_subnautica2_native_water_cvars_logged = false;
+        m_subnautica2_native_water_cvar_attempts = 0;
+        m_subnautica2_native_water_last_mode = -1;
+        m_subnautica2_native_water_next_apply = {};
+        return;
+    }
+
+    const auto console_manager = sdk::FConsoleManager::get();
+    if (console_manager == nullptr) {
+        return;
+    }
+
+    uint32_t restored{};
+    uint32_t missing{};
+    uint32_t failed{};
+
+    for (const auto& [name, value] : m_subnautica2_native_water_previous_ints) {
+        auto* object = console_manager->find(name);
+        if (object == nullptr || object->AsCommand() != nullptr) {
+            ++missing;
+            continue;
+        }
+
+        auto* variable = (sdk::IConsoleVariable*)object;
+        bool ok{};
+
+        try {
+            ok = variable->Set(std::to_wstring(value).c_str());
+        } catch (...) {
+            ok = false;
+        }
+
+        if (ok) {
+            ++restored;
+        } else {
+            ++failed;
+        }
+    }
+
+    SPDLOG_INFO(
+        "[Subnautica2][NativeWaterCompat] Restored water cvars restored={} missing={} failed={}",
+        restored,
+        missing,
+        failed);
+
+    m_subnautica2_native_water_previous_ints.clear();
+    m_subnautica2_native_water_cvars_applied = false;
+    m_subnautica2_native_water_cvars_logged = false;
+    m_subnautica2_native_water_cvar_attempts = 0;
+    m_subnautica2_native_water_last_mode = -1;
+    m_subnautica2_native_water_next_apply = {};
+}
+
+void VR::update_subnautica2_native_water_compatibility(sdk::UGameEngine* engine) {
+    (void)engine;
+
+    const bool active =
+        is_subnautica2_executable() &&
+        g_framework != nullptr &&
+        g_framework->is_dx12() &&
+        is_hmd_active() &&
+        m_compatibility_subnautica2_native_water->value() &&
+        m_rendering_method->value() == RenderingMethod::NATIVE_STEREO &&
+        !m_native_stereo_fix->value();
+
+    if (!active) {
+        restore_subnautica2_native_water_cvars();
+        return;
+    }
+
+    auto selected_mode = static_cast<int32_t>(m_subnautica2_native_water_mode->value());
+    if (selected_mode < SUBNAUTICA2_NATIVE_WATER_SAFE_REFLECTIONS ||
+        selected_mode > SUBNAUTICA2_NATIVE_WATER_DISABLE_SINGLE_LAYER) {
+        selected_mode = SUBNAUTICA2_NATIVE_WATER_SAFE_REFLECTIONS;
+    }
+
+    const bool mode_changed = selected_mode != m_subnautica2_native_water_last_mode;
+    if (mode_changed && m_subnautica2_native_water_cvars_applied) {
+        // Switching modes must not retain disables from the previous mode.
+        restore_subnautica2_native_water_cvars();
+    }
+
+    if (mode_changed) {
+        m_subnautica2_native_water_cvars_logged = false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_subnautica2_native_water_next_apply != std::chrono::steady_clock::time_point{} &&
+        now < m_subnautica2_native_water_next_apply &&
+        !mode_changed) {
+        return;
+    }
+
+    // This is not a per-frame hammer path. It only corrects drift occasionally,
+    // with immediate reapply when the user changes modes.
+    m_subnautica2_native_water_next_apply = now + std::chrono::seconds(5);
+    ++m_subnautica2_native_water_cvar_attempts;
+
+    const auto console_manager = sdk::FConsoleManager::get();
+    if (console_manager == nullptr) {
+        if (m_subnautica2_native_water_cvar_attempts == 1 || (m_subnautica2_native_water_cvar_attempts % 120) == 0) {
+            SPDLOG_WARN("[Subnautica2][NativeWaterCompat] FConsoleManager unavailable; cannot apply water cvars yet");
+        }
+        return;
+    }
+
+    struct ForcedCVar {
+        const wchar_t* name;
+        int value;
+    };
+
+    // UE5.6 SingleLayerWater uses per-view scene-color/reflection inputs that can
+    // diverge in Subnautica 2 native stereo. Keep the water system enabled and
+    // disable the native-stereo-sensitive subpaths first; fall back to disabling
+    // SingleLayerWater only when the user explicitly chooses that mode.
+    static constexpr std::array<ForcedCVar, 9> safe_reflections_cvars{{
+        ForcedCVar{L"r.Water.Enabled", 1},
+        ForcedCVar{L"r.Water.WaterMesh.Enabled", 1},
+        ForcedCVar{L"r.Water.SingleLayer", 1},
+        ForcedCVar{L"r.ParallelSingleLayerWaterPass", 0},
+        ForcedCVar{L"r.Water.SingleLayer.TiledSceneColorCopy", 0},
+        ForcedCVar{L"r.Water.SingleLayer.TiledComposite", 0},
+        ForcedCVar{L"r.Water.SingleLayer.Reflection", 2},
+        ForcedCVar{L"r.Water.SingleLayer.SSRTAA", 0},
+        ForcedCVar{L"r.NGX.DLSS.WaterReflections.TemporalAA", 0},
+    }};
+
+    static constexpr std::array<ForcedCVar, 9> no_reflections_cvars{{
+        ForcedCVar{L"r.Water.Enabled", 1},
+        ForcedCVar{L"r.Water.WaterMesh.Enabled", 1},
+        ForcedCVar{L"r.Water.SingleLayer", 1},
+        ForcedCVar{L"r.ParallelSingleLayerWaterPass", 0},
+        ForcedCVar{L"r.Water.SingleLayer.TiledSceneColorCopy", 0},
+        ForcedCVar{L"r.Water.SingleLayer.TiledComposite", 0},
+        ForcedCVar{L"r.Water.SingleLayer.Reflection", 0},
+        ForcedCVar{L"r.Water.SingleLayer.SSRTAA", 0},
+        ForcedCVar{L"r.NGX.DLSS.WaterReflections.TemporalAA", 0},
+    }};
+
+    static constexpr std::array<ForcedCVar, 9> disable_single_layer_cvars{{
+        ForcedCVar{L"r.Water.Enabled", 1},
+        ForcedCVar{L"r.Water.WaterMesh.Enabled", 1},
+        ForcedCVar{L"r.Water.SingleLayer", 0},
+        ForcedCVar{L"r.ParallelSingleLayerWaterPass", 0},
+        ForcedCVar{L"r.Water.SingleLayer.TiledSceneColorCopy", 0},
+        ForcedCVar{L"r.Water.SingleLayer.TiledComposite", 0},
+        ForcedCVar{L"r.Water.SingleLayer.Reflection", 0},
+        ForcedCVar{L"r.Water.SingleLayer.SSRTAA", 0},
+        ForcedCVar{L"r.NGX.DLSS.WaterReflections.TemporalAA", 0},
+    }};
+
+    const char* mode_name = "Native Water Safe Reflections";
+    const ForcedCVar* forced_cvars = safe_reflections_cvars.data();
+    size_t forced_cvar_count = safe_reflections_cvars.size();
+
+    switch (selected_mode) {
+    case SUBNAUTICA2_NATIVE_WATER_NO_REFLECTIONS:
+        mode_name = "Native Water No Reflections";
+        forced_cvars = no_reflections_cvars.data();
+        forced_cvar_count = no_reflections_cvars.size();
+        break;
+    case SUBNAUTICA2_NATIVE_WATER_DISABLE_SINGLE_LAYER:
+        mode_name = "Disable SingleLayerWater Fallback";
+        forced_cvars = disable_single_layer_cvars.data();
+        forced_cvar_count = disable_single_layer_cvars.size();
+        break;
+    default:
+        break;
+    };
+
+    uint32_t found{};
+    uint32_t set_ok{};
+    uint32_t set_failed{};
+    uint32_t already_ok{};
+    uint32_t missing{};
+
+    for (size_t i = 0; i < forced_cvar_count; ++i) {
+        const auto& forced = forced_cvars[i];
+        const std::wstring cvar_name{forced.name};
+        auto* object = console_manager->find(cvar_name);
+        if (object == nullptr || object->AsCommand() != nullptr) {
+            ++missing;
+            continue;
+        }
+
+        ++found;
+        auto* variable = (sdk::IConsoleVariable*)object;
+        int before{};
+        int after{};
+        bool ok{};
+
+        try {
+            before = variable->GetInt();
+            if (!m_subnautica2_native_water_previous_ints.contains(cvar_name)) {
+                m_subnautica2_native_water_previous_ints.emplace(cvar_name, before);
+            }
+
+            if (before == forced.value) {
+                ok = true;
+                ++already_ok;
+            } else {
+                ok = variable->Set(std::to_wstring(forced.value).c_str());
+            }
+
+            after = variable->GetInt();
+        } catch (...) {
+            ok = false;
+        }
+
+        if (!ok) {
+            ++set_failed;
+        } else if (before != forced.value) {
+            ++set_ok;
+        }
+
+        if (!m_subnautica2_native_water_cvars_logged) {
+            SPDLOG_INFO(
+                "[Subnautica2][NativeWaterCompat] forced {}: before={} requested={} after={} ok={}",
+                utility::narrow(forced.name),
+                before,
+                forced.value,
+                after,
+                ok);
+        }
+    }
+
+    if (found == 0) {
+        if (!m_subnautica2_native_water_cvars_logged || (m_subnautica2_native_water_cvar_attempts % 120) == 0) {
+            SPDLOG_WARN(
+                "[Subnautica2][NativeWaterCompat] No SingleLayerWater cvars found attempt={} missing={}",
+                m_subnautica2_native_water_cvar_attempts,
+                missing);
+        }
+        return;
+    }
+
+    if (!m_subnautica2_native_water_cvars_logged) {
+        SPDLOG_INFO(
+            "[Subnautica2][NativeWaterCompat] Applied native water cvar guard mode=\"{}\" found={} missing={} already_ok={} set_ok={} set_failed={}",
+            mode_name,
+            found,
+            missing,
+            already_ok,
+            set_ok,
+            set_failed);
+        m_subnautica2_native_water_cvars_logged = true;
+    }
+
+    m_subnautica2_native_water_cvars_applied = true;
+    m_subnautica2_native_water_last_mode = selected_mode;
+}
+
+void VR::restore_1666amsterdam_native_postprocess_cvars() {
+    if (!m_1666amsterdam_native_postprocess_cvars_applied ||
+        m_1666amsterdam_native_postprocess_previous_ints.empty()) {
+        m_1666amsterdam_native_postprocess_cvars_applied = false;
+        m_1666amsterdam_native_postprocess_cvars_logged = false;
+        m_1666amsterdam_native_postprocess_cvar_attempts = 0;
+        m_1666amsterdam_native_postprocess_next_apply = {};
+        return;
+    }
+
+    const auto console_manager = sdk::FConsoleManager::get();
+    if (console_manager == nullptr) {
+        return;
+    }
+
+    uint32_t restored{};
+    uint32_t missing{};
+    uint32_t failed{};
+
+    for (const auto& [name, value] : m_1666amsterdam_native_postprocess_previous_ints) {
+        auto* object = console_manager->find(name);
+        if (object == nullptr || object->AsCommand() != nullptr) {
+            ++missing;
+            continue;
+        }
+
+        auto* variable = (sdk::IConsoleVariable*)object;
+        bool ok{};
+
+        try {
+            ok = variable->Set(std::to_wstring(value).c_str());
+        } catch (...) {
+            ok = false;
+        }
+
+        if (ok) {
+            ++restored;
+        } else {
+            ++failed;
+        }
+    }
+
+    SPDLOG_INFO(
+        "[1666Amsterdam][NativePostProcess] Restored cvars restored={} missing={} failed={}",
+        restored,
+        missing,
+        failed);
+
+    m_1666amsterdam_native_postprocess_previous_ints.clear();
+    m_1666amsterdam_native_postprocess_cvars_applied = false;
+    m_1666amsterdam_native_postprocess_cvars_logged = false;
+    m_1666amsterdam_native_postprocess_cvar_attempts = 0;
+    m_1666amsterdam_native_postprocess_next_apply = {};
+}
+
+void VR::update_1666amsterdam_native_postprocess_compatibility(sdk::UGameEngine* engine) {
+    (void)engine;
+
+    const bool active =
+        is_1666amsterdam_executable() &&
+        g_framework != nullptr &&
+        g_framework->is_dx12() &&
+        is_hmd_active() &&
+        m_compatibility_1666amsterdam_native_postprocess->value() &&
+        m_rendering_method->value() == RenderingMethod::NATIVE_STEREO &&
+        !m_native_stereo_fix->value();
+
+    if (!active) {
+        restore_1666amsterdam_native_postprocess_cvars();
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_1666amsterdam_native_postprocess_next_apply != std::chrono::steady_clock::time_point{} &&
+        now < m_1666amsterdam_native_postprocess_next_apply) {
+        return;
+    }
+
+    // Amsterdam's full temporal path can replace the secondary-eye scene with
+    // black while its geometry, HUD, and gamma-only path remain valid.
+    m_1666amsterdam_native_postprocess_next_apply = now + std::chrono::seconds(5);
+    ++m_1666amsterdam_native_postprocess_cvar_attempts;
+
+    const auto console_manager = sdk::FConsoleManager::get();
+    if (console_manager == nullptr) {
+        if (m_1666amsterdam_native_postprocess_cvar_attempts == 1 ||
+            (m_1666amsterdam_native_postprocess_cvar_attempts % 120) == 0) {
+            SPDLOG_WARN("[1666Amsterdam][NativePostProcess] FConsoleManager unavailable");
+        }
+        return;
+    }
+
+    struct ForcedCVar {
+        const wchar_t* name;
+        int value;
+    };
+
+    // Preserve the full tonemap/exposure chain, but bypass temporal history and
+    // temporal upscaling. FXAA is spatial and therefore cannot consume a stale
+    // or primary-eye-only history texture.
+    static constexpr std::array<ForcedCVar, 3> forced_cvars{{
+        ForcedCVar{L"r.AntiAliasingMethod", 1},
+        ForcedCVar{L"r.TemporalAA.Upsampling", 0},
+        ForcedCVar{L"r.TemporalAA.Upscaler", 0},
+    }};
+
+    uint32_t found{};
+    uint32_t already_ok{};
+    uint32_t set_ok{};
+    uint32_t set_failed{};
+    uint32_t missing{};
+
+    for (const auto& forced : forced_cvars) {
+        const std::wstring cvar_name{forced.name};
+        auto* object = console_manager->find(cvar_name);
+        if (object == nullptr || object->AsCommand() != nullptr) {
+            ++missing;
+            continue;
+        }
+
+        ++found;
+        auto* variable = (sdk::IConsoleVariable*)object;
+        int before{};
+        int after{};
+        bool ok{};
+
+        try {
+            before = variable->GetInt();
+            if (!m_1666amsterdam_native_postprocess_previous_ints.contains(cvar_name)) {
+                m_1666amsterdam_native_postprocess_previous_ints.emplace(cvar_name, before);
+            }
+
+            if (before == forced.value) {
+                ok = true;
+                ++already_ok;
+            } else {
+                ok = variable->Set(std::to_wstring(forced.value).c_str());
+            }
+
+            after = variable->GetInt();
+        } catch (...) {
+            ok = false;
+        }
+
+        if (!ok || after != forced.value) {
+            ++set_failed;
+        } else if (before != forced.value) {
+            ++set_ok;
+        }
+
+        if (!m_1666amsterdam_native_postprocess_cvars_logged) {
+            SPDLOG_INFO(
+                "[1666Amsterdam][NativePostProcess] forced {}: before={} requested={} after={} ok={}",
+                utility::narrow(forced.name),
+                before,
+                forced.value,
+                after,
+                ok && after == forced.value);
+        }
+    }
+
+    if (found == 0) {
+        if (!m_1666amsterdam_native_postprocess_cvars_logged ||
+            (m_1666amsterdam_native_postprocess_cvar_attempts % 120) == 0) {
+            SPDLOG_WARN(
+                "[1666Amsterdam][NativePostProcess] No target cvars found attempt={} missing={}",
+                m_1666amsterdam_native_postprocess_cvar_attempts,
+                missing);
+        }
+        return;
+    }
+
+    if (!m_1666amsterdam_native_postprocess_cvars_logged) {
+        SPDLOG_INFO(
+            "[1666Amsterdam][NativePostProcess] Applied FXAA temporal bypass found={} missing={} already_ok={} set_ok={} set_failed={}",
+            found,
+            missing,
+            already_ok,
+            set_ok,
+            set_failed);
+        m_1666amsterdam_native_postprocess_cvars_logged = true;
+    }
+
+    m_1666amsterdam_native_postprocess_cvars_applied = true;
+}
+
+void VR::restore_daysgone_gbuffer_cvar() {
+    if (!m_daysgone_gbuffer_cvar_applied) {
+        m_daysgone_gbuffer_cvar_logged = false;
+        m_daysgone_gbuffer_previous_valid = false;
+        m_daysgone_gbuffer_previous_value = 1;
+        m_daysgone_gbuffer_cvar_attempts = 0;
+        m_daysgone_gbuffer_next_apply = {};
+        return;
+    }
+
+    const auto console_manager = sdk::FConsoleManager::get();
+    if (console_manager == nullptr) {
+        return;
+    }
+
+    auto* object = console_manager->find(L"r.GBuffer");
+    bool restored{};
+    bool failed{};
+
+    if (object != nullptr && object->AsCommand() == nullptr && m_daysgone_gbuffer_previous_valid) {
+        auto* variable = (sdk::IConsoleVariable*)object;
+
+        try {
+            restored = variable->Set(std::to_wstring(m_daysgone_gbuffer_previous_value).c_str());
+        } catch (...) {
+            restored = false;
+        }
+
+        failed = !restored;
+    }
+
+    SPDLOG_INFO(
+        "[DaysGone][GBufferSafeMode] Restored r.GBuffer previous={} restored={} failed={} had_previous={}",
+        m_daysgone_gbuffer_previous_value,
+        restored,
+        failed,
+        m_daysgone_gbuffer_previous_valid);
+
+    m_daysgone_gbuffer_cvar_applied = false;
+    m_daysgone_gbuffer_cvar_logged = false;
+    m_daysgone_gbuffer_previous_valid = false;
+    m_daysgone_gbuffer_previous_value = 1;
+    m_daysgone_gbuffer_cvar_attempts = 0;
+    m_daysgone_gbuffer_next_apply = {};
+}
+
+void VR::update_daysgone_gbuffer_compatibility(sdk::UGameEngine* engine) {
+    (void)engine;
+
+    const bool active =
+        is_daysgone_executable() &&
+        g_framework != nullptr &&
+        g_framework->is_dx11() &&
+        is_hmd_active() &&
+        m_compatibility_daysgone_gbuffer_safe_mode->value();
+
+    if (!active) {
+        restore_daysgone_gbuffer_cvar();
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_daysgone_gbuffer_next_apply != std::chrono::steady_clock::time_point{} &&
+        now < m_daysgone_gbuffer_next_apply) {
+        return;
+    }
+
+    // Days Gone's black road/terrain patches were narrowed to the deferred
+    // GBuffer path. Reapply sparingly to correct drift without touching a hot path.
+    m_daysgone_gbuffer_next_apply = now + std::chrono::seconds(5);
+    ++m_daysgone_gbuffer_cvar_attempts;
+
+    const auto console_manager = sdk::FConsoleManager::get();
+    if (console_manager == nullptr) {
+        if (m_daysgone_gbuffer_cvar_attempts == 1 || (m_daysgone_gbuffer_cvar_attempts % 120) == 0) {
+            SPDLOG_WARN("[DaysGone][GBufferSafeMode] FConsoleManager unavailable; cannot apply r.GBuffer yet");
+        }
+        return;
+    }
+
+    auto* object = console_manager->find(L"r.GBuffer");
+    if (object == nullptr || object->AsCommand() != nullptr) {
+        if (!m_daysgone_gbuffer_cvar_logged || (m_daysgone_gbuffer_cvar_attempts % 120) == 0) {
+            SPDLOG_WARN("[DaysGone][GBufferSafeMode] r.GBuffer cvar not found");
+        }
+        return;
+    }
+
+    auto* variable = (sdk::IConsoleVariable*)object;
+    int before{};
+    int after{};
+    bool ok{};
+
+    try {
+        before = variable->GetInt();
+
+        if (!m_daysgone_gbuffer_previous_valid) {
+            m_daysgone_gbuffer_previous_valid = true;
+            m_daysgone_gbuffer_previous_value = before;
+        }
+
+        if (before == 0) {
+            ok = true;
+        } else {
+            ok = variable->Set(L"0");
+            CVarManager::record_global_change(L"r.GBuffer", L"0", "daysgone_gbuffer_safe_mode");
+        }
+
+        after = variable->GetInt();
+    } catch (...) {
+        ok = false;
+    }
+
+    if (!m_daysgone_gbuffer_cvar_logged) {
+        SPDLOG_INFO(
+            "[DaysGone][GBufferSafeMode] Applied r.GBuffer=0 before={} after={} ok={} previous={}",
+            before,
+            after,
+            ok,
+            m_daysgone_gbuffer_previous_value);
+        m_daysgone_gbuffer_cvar_logged = true;
+    } else if (!ok && (m_daysgone_gbuffer_cvar_attempts % 120) == 0) {
+        SPDLOG_WARN(
+            "[DaysGone][GBufferSafeMode] Failed to maintain r.GBuffer=0 attempt={} before={} after={}",
+            m_daysgone_gbuffer_cvar_attempts,
+            before,
+            after);
+    }
+
+    if (ok) {
+        m_daysgone_gbuffer_cvar_applied = true;
+    }
+}
+
+void VR::update_everspace2_cinematic_bars(sdk::UGameEngine* engine) {
+    (void)engine;
+
+    auto& state = m_everspace2_cinematic_bars;
+    const bool enabled =
+        is_everspace2_executable_cached() &&
+        m_compatibility_everspace2_remove_cinematic_bars->value();
+
+    if (!enabled) {
+        if (state.was_enabled) {
+            state = {};
+        }
+        return;
+    }
+
+    if (!state.was_enabled) {
+        state = {};
+        state.was_enabled = true;
+        SPDLOG_INFO("[Everspace2][CinematicBars] Compatibility enabled; waiting for WG_Ingame_HUD");
+    }
+
+    if (state.processed_hud != nullptr &&
+        is_live_uobject_identity(
+            (sdk::UObject*)state.processed_hud,
+            state.processed_index,
+            state.processed_serial)) {
+        return;
+    }
+
+    state.processed_hud = nullptr;
+    state.processed_index = -1;
+    state.processed_serial = 0;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (state.hud_class == nullptr) {
+        if (state.next_class_lookup != std::chrono::steady_clock::time_point{} &&
+            now < state.next_class_lookup) {
+            return;
+        }
+
+        state.next_class_lookup = now + std::chrono::seconds(2);
+        state.hud_class = sdk::find_uobject<sdk::UClass>(
+            L"WidgetBlueprintGeneratedClass /Game/Blueprints/UI/HUD/WG_Ingame_HUD.WG_Ingame_HUD_C",
+            true);
+        if (state.hud_class == nullptr) {
+            return;
+        }
+
+        state.scan_cursor = -1;
+    }
+
+    const auto hud_class = (sdk::UClass*)state.hud_class;
+    const auto objects = sdk::FUObjectArray::get();
+    if (objects == nullptr) {
+        return;
+    }
+
+    if (state.next_scan != std::chrono::steady_clock::time_point{} && now < state.next_scan) {
+        return;
+    }
+
+    const auto object_count = objects->get_object_count();
+    const auto try_remove_from_hud = [&](sdk::UObject* object, int32_t index, int32_t serial) {
+        if (object == nullptr || object == hud_class->get_class_default_object() ||
+            !is_live_uobject_identity(object, index, serial) ||
+            object->get_class() != hud_class) {
+            return false;
+        }
+
+        if (!remove_everspace2_cinematic_bars(object)) {
+            if (!state.invalid_layout_logged) {
+                SPDLOG_WARN(
+                    "[Everspace2][CinematicBars] Exact WG_Ingame_HUD bar layout/function validation failed; leaving UI unchanged");
+                state.invalid_layout_logged = true;
+            }
+            return false;
+        }
+
+        state.processed_hud = object;
+        state.processed_index = index;
+        state.processed_serial = serial;
+        ++state.removed_instances;
+        SPDLOG_INFO(
+            "[Everspace2][CinematicBars] Removed BarImageTop/BarImageBottom from {} instance={} index={} serial={}",
+            get_log_object_name(object),
+            state.removed_instances,
+            state.processed_index,
+            state.processed_serial);
+        return true;
+    };
+
+    // UObjectHook already maintains this exact class set in normal ES2 runs.
+    // Use it first so enabling the checkbox in-game reacts immediately.
+    if (const auto object_hook = UObjectHook::get();
+        object_hook != nullptr && object_hook->is_fully_hooked() && !object_hook->is_disabled()) {
+        for (const auto object_base : object_hook->get_objects_by_class(hud_class)) {
+            auto object = (sdk::UObject*)object_base;
+            if (object == nullptr || !object_hook->exists(object)) {
+                continue;
+            }
+
+            const auto index = (int32_t)object->get_internal_index();
+            const auto item = index >= 0 && index < object_count ? objects->get_object(index) : nullptr;
+            if (item != nullptr && try_remove_from_hud(object, index, item->get_serial_number())) {
+                return;
+            }
+        }
+    }
+
+    // Fail-safe fallback searches newest objects first. Runtime HUD instances
+    // live near the end of GUObjectArray, so a live toggle should not wait for
+    // a full 600k-object ascending sweep.
+    constexpr int32_t OBJECTS_PER_TICK = 4096;
+    if (state.scan_cursor <= 0 || state.scan_cursor > object_count) {
+        state.scan_cursor = object_count;
+    }
+    const auto scan_start = std::max(0, state.scan_cursor - OBJECTS_PER_TICK);
+
+    for (auto index = state.scan_cursor - 1; index >= scan_start; --index) {
+        const auto item = objects->get_object(index);
+        if (item == nullptr) {
+            continue;
+        }
+
+        auto object = (sdk::UObject*)item->get_object();
+        if (try_remove_from_hud(object, index, item->get_serial_number())) {
+            return;
+        }
+    }
+
+    state.scan_cursor = scan_start;
+    if (state.scan_cursor == 0) {
+        state.scan_cursor = object_count;
+        state.next_scan = now + std::chrono::milliseconds(500);
+    }
+}
+
+void VR::on_post_engine_tick(sdk::UGameEngine* engine, float delta) {
+    ZoneScopedN(__FUNCTION__);
+
+    if (!get_runtime()->loaded || !is_hmd_active()) {
+        return;
+    }
+
+    // Some Supermassive camera paths rewrite crop/aspect state during engine
+    // tick. Reapply the opt-in compatibility after game tick, but keep it to
+    // the active camera only; broad object sweeps caused cadence/flicker issues.
+    update_fullscreen_16x9_camera_compatibility(engine);
+}
+
+void VR::update_shf_auto_2d_mode(sdk::UGameEngine* engine) {
+    if (!is_shf_executable()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_shf_auto_2d_last_sample.time_since_epoch().count() != 0 &&
+        now - m_shf_auto_2d_last_sample < std::chrono::milliseconds(250)) {
+        return;
+    }
+
+    m_shf_auto_2d_last_sample = now;
+
+    const auto decision = evaluate_shf_auto_2d(engine);
+
+    if (decision.should_force) {
+        if (!m_shf_auto_2d_active) {
+            m_shf_auto_2d_previous_mode = m_2d_screen_mode->value();
+            m_shf_auto_2d_active = true;
+            spdlog::info(
+                "[SHf][Auto2D] active=true previous={} cutscene={} fov={:.3f} url={} target={}",
+                m_shf_auto_2d_previous_mode,
+                utility::narrow(decision.cutscene),
+                decision.fov.value_or(0.0f),
+                utility::narrow(decision.url),
+                decision.target.empty() ? "unresolved" : utility::narrow(decision.target));
+        }
+
+        m_2d_screen_mode->value() = true;
+        return;
+    }
+
+    if (m_shf_auto_2d_active) {
+        m_2d_screen_mode->value() = m_shf_auto_2d_previous_mode;
+        m_shf_auto_2d_active = false;
+        spdlog::info(
+            "[SHf][Auto2D] active=false restored={} cutscene={} fov={} url={} target={}",
+            m_shf_auto_2d_previous_mode,
+            utility::narrow(decision.cutscene),
+            decision.fov.has_value() ? std::format("{:.3f}", *decision.fov) : "unresolved",
+            decision.url.empty() ? "unresolved" : utility::narrow(decision.url),
+            decision.target.empty() ? "unresolved" : utility::narrow(decision.target));
+    }
+}
+
+void VR::update_dispatch_auto_2d_mode(sdk::UGameEngine* engine) {
+    if (!is_dispatch_executable()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_dispatch_auto_2d_last_sample.time_since_epoch().count() != 0 &&
+        now - m_dispatch_auto_2d_last_sample < std::chrono::milliseconds(250)) {
+        return;
+    }
+
+    m_dispatch_auto_2d_last_sample = now;
+
+    const auto decision = evaluate_dispatch_auto_2d(engine);
+
+    if (decision.should_force) {
+        if (!m_dispatch_auto_2d_active) {
+            m_dispatch_auto_2d_previous_mode = m_2d_screen_mode->value();
+            m_dispatch_auto_2d_active = true;
+            spdlog::info(
+                "[Dispatch][Auto2D] active=true previous={} reason={} subsystem={} source={} player={} texture={} playing={} preparing={} buffering={} ready={}",
+                m_dispatch_auto_2d_previous_mode,
+                decision.reason,
+                decision.subsystem.empty() ? "unresolved" : decision.subsystem,
+                decision.source.empty() ? "unresolved" : decision.source,
+                decision.player.empty() ? "unresolved" : decision.player,
+                decision.texture.empty() ? "unresolved" : decision.texture,
+                decision.playing.has_value() ? (*decision.playing ? "true" : "false") : "unresolved",
+                decision.preparing.has_value() ? (*decision.preparing ? "true" : "false") : "unresolved",
+                decision.buffering.has_value() ? (*decision.buffering ? "true" : "false") : "unresolved",
+                decision.ready.has_value() ? (*decision.ready ? "true" : "false") : "unresolved");
+        }
+
+        m_2d_screen_mode->value() = true;
+        return;
+    }
+
+    if (m_dispatch_auto_2d_active) {
+        m_2d_screen_mode->value() = m_dispatch_auto_2d_previous_mode;
+        m_dispatch_auto_2d_active = false;
+        spdlog::info("[Dispatch][Auto2D] active=false restored={}", m_dispatch_auto_2d_previous_mode);
+    }
+}
+
+void VR::update_mixtape_auto_2d_mode(sdk::UGameEngine* engine) {
+    if (!is_mixtape_executable()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_mixtape_auto_2d_last_sample.time_since_epoch().count() != 0 &&
+        now - m_mixtape_auto_2d_last_sample < std::chrono::milliseconds(250)) {
+        return;
+    }
+
+    m_mixtape_auto_2d_last_sample = now;
+
+    const auto decision = evaluate_mixtape_auto_2d(engine);
+
+    if (decision.should_force) {
+        if (!m_mixtape_auto_2d_active.load(std::memory_order_relaxed)) {
+            m_mixtape_auto_2d_previous_mode = m_2d_screen_mode->value();
+            m_mixtape_auto_2d_active.store(true, std::memory_order_relaxed);
+            spdlog::info(
+                "[Mixtape][Auto2D] active=true previous={} reason={} player={} url={} playing={} preparing={} buffering={} ready={}",
+                m_mixtape_auto_2d_previous_mode,
+                decision.reason,
+                decision.player.empty() ? "unresolved" : decision.player,
+                decision.url.empty() ? "unresolved" : decision.url,
+                decision.playing.has_value() ? (*decision.playing ? "true" : "false") : "unresolved",
+                decision.preparing.has_value() ? (*decision.preparing ? "true" : "false") : "unresolved",
+                decision.buffering.has_value() ? (*decision.buffering ? "true" : "false") : "unresolved",
+                decision.ready.has_value() ? (*decision.ready ? "true" : "false") : "unresolved");
+        }
+
+        m_2d_screen_mode->value() = true;
+        return;
+    }
+
+    if (m_mixtape_auto_2d_active.exchange(false, std::memory_order_relaxed)) {
+        m_2d_screen_mode->value() = m_mixtape_auto_2d_previous_mode;
+        spdlog::info("[Mixtape][Auto2D] active=false restored={}", m_mixtape_auto_2d_previous_mode);
+    }
+}
+
+void VR::update_halo_electra_cinematic_state(sdk::UGameEngine* engine) {
+    (void)engine;
+
+    if (!is_halo_campaign_evolved_executable() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx12())
+    {
+        return;
+    }
+
+    if (!ensure_halo_electra_native_hooks()) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto active_player = g_halo_electra_active_player.load(std::memory_order_acquire);
+
+    if (active_player != 0) {
+        m_halo_electra_restore_after = {};
+
+        if (!m_halo_electra_cinematic_active.exchange(true, std::memory_order_relaxed)) {
+            spdlog::info(
+                "[Halo][Electra] renderer-quad=true reason=classified-prerender player={:x} frames={} flushes={}",
+                active_player,
+                g_halo_electra_present_count.load(std::memory_order_relaxed),
+                g_halo_electra_flush_count.load(std::memory_order_relaxed));
+        }
+        return;
+    }
+
+    if (!m_halo_electra_cinematic_active.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    constexpr auto RESTORE_DEBOUNCE = std::chrono::milliseconds(750);
+    if (m_halo_electra_restore_after.time_since_epoch().count() == 0) {
+        m_halo_electra_restore_after = now + RESTORE_DEBOUNCE;
+    }
+
+    if (now < m_halo_electra_restore_after) {
+        return;
+    }
+
+    if (m_halo_electra_cinematic_active.exchange(false, std::memory_order_relaxed)) {
+        m_halo_electra_restore_after = {};
+        spdlog::info(
+            "[Halo][Electra] renderer-quad=false frames={} flushes={}",
+            g_halo_electra_present_count.load(std::memory_order_relaxed),
+            g_halo_electra_flush_count.load(std::memory_order_relaxed));
+    }
+}
+
+void VR::set_windrose_meta_ui_2d_state_active(
+    std::string_view state_name,
+    uintptr_t state_id,
+    std::string_view source,
+    bool force_2d,
+    bool active)
+{
+    if (m_rendering_method->value() != RenderingMethod::NATIVE_STEREO) {
+        return;
+    }
+
+    std::scoped_lock _{m_windrose_meta_ui_auto_2d_mtx};
+
+    const std::string key{state_name};
+    const std::string source_key{source};
+
+    if (active && force_2d) {
+        m_windrose_meta_ui_auto_2d_tokens[state_id] = WindroseMetaUiToken{
+            key,
+            source_key,
+            std::chrono::steady_clock::now()};
+        m_windrose_meta_ui_auto_2d_last_state = key;
+        m_windrose_meta_ui_auto_2d_last_source = source_key;
+        m_windrose_meta_ui_auto_2d_restore_after = {};
+
+        if (!m_windrose_meta_ui_auto_2d_active) {
+            m_windrose_meta_ui_auto_2d_previous_mode = m_2d_screen_mode->value();
+            m_windrose_meta_ui_auto_2d_active = true;
+            spdlog::info(
+                "[Windrose][MetaUI2D] active=true previous={} state={} source={} tokens={}",
+                m_windrose_meta_ui_auto_2d_previous_mode,
+                key,
+                source_key,
+                m_windrose_meta_ui_auto_2d_tokens.size());
+        }
+
+        if (!m_2d_screen_mode->value()) {
+            m_2d_screen_mode->value() = true;
+        }
+        return;
+    }
+
+    if (active && !force_2d) {
+        // Windrose sends Adventure/NPC/cutscene transitions through the same HFSM path
+        // as fullscreen menus. Treat them as a hard boundary so stale menu tokens cannot
+        // keep the whole scene forced into 2D after dialogue or cutscene playback.
+        if (m_windrose_meta_ui_auto_2d_active || !m_windrose_meta_ui_auto_2d_tokens.empty()) {
+            const auto cleared = m_windrose_meta_ui_auto_2d_tokens.size();
+            m_windrose_meta_ui_auto_2d_tokens.clear();
+            m_windrose_meta_ui_auto_2d_last_state = key;
+            m_windrose_meta_ui_auto_2d_last_source = source_key;
+            m_windrose_meta_ui_auto_2d_restore_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+            ++m_windrose_meta_ui_auto_2d_stale_clears;
+            spdlog::info(
+                "[Windrose][MetaUI2D] stale clear state={} source={} cleared={} pending_restore_ms=150 stale_clears={}",
+                key,
+                source_key,
+                cleared,
+                m_windrose_meta_ui_auto_2d_stale_clears);
+        }
+        return;
+    }
+
+    if (!force_2d) {
+        return;
+    }
+
+    auto erased = m_windrose_meta_ui_auto_2d_tokens.erase(state_id);
+    if (erased == 0 && !key.empty()) {
+        for (auto it = m_windrose_meta_ui_auto_2d_tokens.begin(); it != m_windrose_meta_ui_auto_2d_tokens.end(); ++it) {
+            if (it->second.name == key && it->second.source == source_key) {
+                m_windrose_meta_ui_auto_2d_tokens.erase(it);
+                erased = 1;
+                break;
+            }
+        }
+    }
+
+    if (m_windrose_meta_ui_auto_2d_tokens.empty()) {
+        // Tab switches can emit Exit then Enter in the same tick; defer restore a touch
+        // so we do not flap 2D mode while R5 swaps HFSM states.
+        m_windrose_meta_ui_auto_2d_restore_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+        m_windrose_meta_ui_auto_2d_last_state = key;
+        m_windrose_meta_ui_auto_2d_last_source = source_key;
+        spdlog::info(
+            "[Windrose][MetaUI2D] pending restore state={} source={} erased={}",
+            key,
+            source_key,
+            erased);
+    }
+}
+
+void VR::update_windrose_meta_ui_auto_2d_mode() {
+    std::scoped_lock _{m_windrose_meta_ui_auto_2d_mtx};
+
+    if (!m_windrose_meta_ui_auto_2d_active) {
+        return;
+    }
+
+    if (!m_windrose_meta_ui_auto_2d_tokens.empty()) {
+        if (!m_2d_screen_mode->value()) {
+            m_2d_screen_mode->value() = true;
+        }
+        return;
+    }
+
+    if (m_windrose_meta_ui_auto_2d_restore_after.time_since_epoch().count() == 0 ||
+        std::chrono::steady_clock::now() < m_windrose_meta_ui_auto_2d_restore_after)
+    {
+        if (!m_2d_screen_mode->value()) {
+            m_2d_screen_mode->value() = true;
+        }
+        return;
+    }
+
+    m_2d_screen_mode->value() = m_windrose_meta_ui_auto_2d_previous_mode;
+    spdlog::info(
+        "[Windrose][MetaUI2D] active=false restored={} last_state={} last_source={} stale_clears={}",
+        m_windrose_meta_ui_auto_2d_previous_mode,
+        m_windrose_meta_ui_auto_2d_last_state,
+        m_windrose_meta_ui_auto_2d_last_source,
+        m_windrose_meta_ui_auto_2d_stale_clears);
+
+    m_windrose_meta_ui_auto_2d_active = false;
+    m_windrose_meta_ui_auto_2d_previous_mode = false;
+    m_windrose_meta_ui_auto_2d_restore_after = {};
+    m_windrose_meta_ui_auto_2d_last_state.clear();
+    m_windrose_meta_ui_auto_2d_last_source.clear();
+}
+
+void VR::clear_windrose_meta_ui_2d_state(std::string_view reason) {
+    std::scoped_lock _{m_windrose_meta_ui_auto_2d_mtx};
+
+    if (!m_windrose_meta_ui_auto_2d_active && m_windrose_meta_ui_auto_2d_tokens.empty()) {
+        return;
+    }
+
+    const auto cleared = m_windrose_meta_ui_auto_2d_tokens.size();
+    m_windrose_meta_ui_auto_2d_tokens.clear();
+    m_windrose_meta_ui_auto_2d_restore_after = {};
+    m_2d_screen_mode->value() = m_windrose_meta_ui_auto_2d_previous_mode;
+    spdlog::info(
+        "[Windrose][MetaUI2D] manual clear reason={} restored={} cleared={}",
+        std::string{reason},
+        m_windrose_meta_ui_auto_2d_previous_mode,
+        cleared);
+
+    m_windrose_meta_ui_auto_2d_active = false;
+    m_windrose_meta_ui_auto_2d_previous_mode = false;
+    m_windrose_meta_ui_auto_2d_last_state.clear();
+    m_windrose_meta_ui_auto_2d_last_source.clear();
+}
+
+std::string VR::get_windrose_meta_ui_2d_status_text() const {
+    std::scoped_lock _{m_windrose_meta_ui_auto_2d_mtx};
+
+    std::ostringstream out;
+    out << (m_windrose_meta_ui_auto_2d_active ? "active" : "inactive")
+        << " tokens=" << m_windrose_meta_ui_auto_2d_tokens.size();
+
+    if (m_windrose_meta_ui_auto_2d_restore_after.time_since_epoch().count() != 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < m_windrose_meta_ui_auto_2d_restore_after) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                m_windrose_meta_ui_auto_2d_restore_after - now).count();
+            out << " restore_in_ms=" << remaining;
+        }
+    }
+
+    if (!m_windrose_meta_ui_auto_2d_last_state.empty()) {
+        out << " last=" << m_windrose_meta_ui_auto_2d_last_state;
+    }
+
+    if (!m_windrose_meta_ui_auto_2d_last_source.empty()) {
+        out << " source=" << m_windrose_meta_ui_auto_2d_last_source;
+    }
+
+    out << " stale_clears=" << m_windrose_meta_ui_auto_2d_stale_clears;
+    return out.str();
+}
+
+// The ACTIVE camera component's own FoV-axis override, if it has one.
+//
+// A CameraComponent can set bOverrideAspectRatioAxisConstraint and carry its own
+// AspectRatioAxisConstraint, so a cutscene camera can use a different axis than
+// the local player without ever touching the local player's value. This is
+// checked first; nullopt means "no override in play", and the caller falls back
+// to the global ULocalPlayer constraint.
+//
+// Lives here (not in VR_Flat3D.cpp) because the object/function helpers it needs
+// are internal to this TU — the same pair the 16:9 camera compat path uses to
+// reach the live camera component.
+std::optional<bool> VR::camera_component_fov_is_vertical() try {
+    const auto engine = sdk::UEngine::get();
+    if (engine == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto world = engine->get_world();
+    const auto gameplay = sdk::UGameplayStatics::get();
+    if (world == nullptr || gameplay == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto pc = gameplay->get_player_controller(world, 0);
+    if (pc == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto pcm = pc->get_player_camera_manager();
+    if (pcm == nullptr) {
+        return std::nullopt;
+    }
+
+    // Not a stock UE function — plenty of titles won't have it, in which case
+    // there is no per-camera override to find and the global value stands.
+    const auto camera = call_object_object_function((sdk::UObject*)pcm, L"GetCurrentCamera");
+    if (!camera.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto component = read_object_property(*camera, L"CameraComponent");
+    if (!component.has_value()) {
+        return std::nullopt;
+    }
+
+    auto* comp = *component;
+    const auto klass = comp->get_class();
+    if (klass == nullptr) {
+        return std::nullopt;
+    }
+
+    static sdk::UClass* cached_class = nullptr;
+    static sdk::FProperty* override_prop = nullptr;
+    static sdk::FProperty* constraint_prop = nullptr;
+
+    if (klass != cached_class) {
+        cached_class = klass;
+        override_prop = klass->find_property(L"bOverrideAspectRatioAxisConstraint");
+        constraint_prop = klass->find_property(L"AspectRatioAxisConstraint");
+    }
+
+    if (override_prop == nullptr || constraint_prop == nullptr ||
+        override_prop->get_class() == nullptr ||
+        override_prop->get_class()->get_name().to_string() != L"BoolProperty")
+    {
+        return std::nullopt;
+    }
+
+    if (!((sdk::FBoolProperty*)override_prop)->get_value_from_object(comp)) {
+        return std::nullopt; // component defers to the local player
+    }
+
+    // TEnumAsByte<EAspectRatioAxisConstraint>: 0 MaintainYFOV = vertical.
+    return *constraint_prop->get_data<uint8_t>(comp) == 0;
+} catch (...) {
+    return std::nullopt;
+}
+
+void VR::update_fullscreen_16x9_camera_compatibility(sdk::UGameEngine* engine) {
+    if (!m_compatibility_fullscreen_16x9_cameras->value()) {
+        m_fullscreen_16x9_camera_compat = {};
+        return;
+    }
+
+    constexpr auto camera_poll_interval = std::chrono::milliseconds(100);
+    constexpr auto transition_burst_duration = std::chrono::milliseconds(500);
+    constexpr auto keepalive_interval = std::chrono::milliseconds(1000);
+    const auto now = std::chrono::steady_clock::now();
+
+    auto world = engine != nullptr ? engine->get_world() : nullptr;
+    auto gameplay = sdk::UGameplayStatics::get();
+
+    if (world == nullptr || gameplay == nullptr) {
+        return;
+    }
+
+    auto pc = gameplay->get_player_controller(world, 0);
+    if (pc == nullptr) {
+        return;
+    }
+
+    auto pcm = pc->get_player_camera_manager();
+    if (pcm == nullptr) {
+        return;
+    }
+
+    auto aspect_ratio = m_compatibility_fullscreen_16x9_camera_aspect->value();
+    if (!std::isfinite(aspect_ratio) || aspect_ratio <= 0.1f) {
+        const auto runtime = get_runtime();
+        if (runtime != nullptr && runtime->get_height() > 0) {
+            aspect_ratio = (float)runtime->get_width() / (float)runtime->get_height();
+        } else {
+            aspect_ratio = 16.0f / 9.0f;
+        }
+    }
+
+    aspect_ratio = std::clamp(aspect_ratio, 0.5f, 4.0f);
+
+    auto& state = m_fullscreen_16x9_camera_compat;
+    const bool just_enabled = !state.was_enabled;
+    const bool pcm_changed = state.last_pcm != pcm;
+    const bool aspect_changed = std::abs(state.last_aspect - aspect_ratio) > 0.001f;
+    const bool should_poll_camera =
+        just_enabled ||
+        pcm_changed ||
+        aspect_changed ||
+        state.last_camera_poll.time_since_epoch().count() == 0 ||
+        now - state.last_camera_poll >= camera_poll_interval ||
+        now < state.burst_until;
+
+    sdk::UObject* current_camera = (sdk::UObject*)state.last_camera;
+    sdk::UObject* camera_component = (sdk::UObject*)state.last_camera_component;
+
+    if (should_poll_camera) {
+        state.last_camera_poll = now;
+
+        if (auto camera = call_object_object_function((sdk::UObject*)pcm, L"GetCurrentCamera"); camera.has_value()) {
+            current_camera = *camera;
+        } else {
+            current_camera = nullptr;
+        }
+
+        if (current_camera != nullptr) {
+            if (auto component = read_object_property(current_camera, L"CameraComponent"); component.has_value()) {
+                camera_component = *component;
+            } else {
+                camera_component = nullptr;
+            }
+        } else {
+            camera_component = nullptr;
+        }
+    }
+
+    const bool camera_changed = state.last_camera != current_camera;
+    const bool component_changed = state.last_camera_component != camera_component;
+    const bool keepalive_due =
+        state.last_apply.time_since_epoch().count() == 0 ||
+        now - state.last_apply >= keepalive_interval;
+    const bool in_transition_burst = now < state.burst_until;
+
+    if (just_enabled || pcm_changed || camera_changed || component_changed || aspect_changed) {
+        state.burst_until = now + transition_burst_duration;
+    }
+
+    const bool should_apply =
+        just_enabled ||
+        pcm_changed ||
+        camera_changed ||
+        component_changed ||
+        aspect_changed ||
+        in_transition_burst ||
+        keepalive_due;
+
+    state.was_enabled = true;
+    state.last_pcm = pcm;
+    state.last_camera = current_camera;
+    state.last_camera_component = camera_component;
+    state.last_aspect = aspect_ratio;
+
+    if (!should_apply) {
+        return;
+    }
+
+    bool wrote_any = false;
+    wrote_any |= write_object_bool_property((sdk::UObject*)pcm, L"bUse16_9CamerasAsFullscreen", true);
+    wrote_any |= write_object_bool_property((sdk::UObject*)pcm, L"bForceOutputToConstraintXFov", false);
+    wrote_any |= write_game_camera_aspect_constraints(pcm, aspect_ratio);
+
+    if (current_camera != nullptr) {
+        wrote_any |= write_object_bool_property(current_camera, L"bEnableCameraViewportRemapPPMI", false);
+
+        if (camera_component != nullptr) {
+            wrote_any |= write_camera_component_fullscreen_aspect(camera_component, aspect_ratio);
+        }
+    }
+
+    state.last_apply = now;
+
+    if (is_directive8020_executable_cached()) {
+        if (wrote_any &&
+            (state.last_log.time_since_epoch().count() == 0 || now - state.last_log >= std::chrono::seconds(5))) {
+            state.last_log = now;
+            SPDLOG_INFO(
+                "[Directive8020][AspectCompat] aspect={:.3f} reason={}{}{}{}{}{} current_camera={} component={}",
+                aspect_ratio,
+                just_enabled ? "enabled " : "",
+                pcm_changed ? "pcm " : "",
+                camera_changed ? "camera " : "",
+                component_changed ? "component " : "",
+                aspect_changed ? "aspect " : "",
+                keepalive_due ? "keepalive" : (in_transition_burst ? "burst" : "apply"),
+                current_camera != nullptr,
+                camera_component != nullptr);
+        }
+    }
+
+    if (wrote_any) {
+        SPDLOG_INFO_ONCE("[Compatibility] Fullscreen 16:9 Cameras active; aspect={:.3f}, camera constraints/remap disabled where available", aspect_ratio);
+    } else {
+        SPDLOG_WARN_ONCE("[Compatibility] Fullscreen 16:9 Cameras is enabled, but no supported camera/aspect fields were found");
+    }
+}
+
+void VR::update_game_fov() {
+    const auto update_prospi_telephoto_perf_override = [&](bool should_apply) {
+        const auto restore = [&]() {
+            if (!m_prospi_telephoto_perf_override_applied) {
+                m_match_game_fov_prospi_telephoto_perf_active.store(false, std::memory_order_relaxed);
+                return;
+            }
+
+            set_runtime_cvar_float(L"r.ViewDistanceScale", m_prospi_telephoto_perf_baseline_view_distance_scale);
+            set_runtime_cvar_float(L"r.StaticMeshLODDistanceScale", m_prospi_telephoto_perf_baseline_static_mesh_lod_distance_scale);
+            set_runtime_cvar_int(L"r.SkeletalMeshLODBias", m_prospi_telephoto_perf_baseline_skeletal_mesh_lod_bias);
+            m_prospi_telephoto_perf_override_applied = false;
+            m_match_game_fov_prospi_telephoto_perf_active.store(false, std::memory_order_relaxed);
+            spdlog::info(
+                "[PROSPI_TELEPHOTO_PERF] active=false view_distance={:.2f} static_mesh_lod_scale={:.2f} skeletal_lod_bias={}",
+                m_prospi_telephoto_perf_baseline_view_distance_scale,
+                m_prospi_telephoto_perf_baseline_static_mesh_lod_distance_scale,
+                m_prospi_telephoto_perf_baseline_skeletal_mesh_lod_bias
+            );
+        };
+
+        if (!is_prospi_executable() || !m_match_game_fov_prospi_telephoto_perf_override->value()) {
+            restore();
+            return;
+        }
+
+        if (!should_apply) {
+            restore();
+            return;
+        }
+
+        if (!m_prospi_telephoto_perf_baselines_valid) {
+            m_prospi_telephoto_perf_baseline_view_distance_scale = get_runtime_cvar_float(L"r.ViewDistanceScale").value_or(1.0f);
+            m_prospi_telephoto_perf_baseline_static_mesh_lod_distance_scale = get_runtime_cvar_float(L"r.StaticMeshLODDistanceScale").value_or(1.0f);
+            m_prospi_telephoto_perf_baseline_skeletal_mesh_lod_bias = get_runtime_cvar_int(L"r.SkeletalMeshLODBias").value_or(0);
+            m_prospi_telephoto_perf_baselines_valid = true;
+        }
+
+        const auto target_view_distance_scale = std::clamp(m_match_game_fov_prospi_telephoto_perf_view_distance_scale->value(), 0.10f, 2.0f);
+        const auto target_static_mesh_lod_distance_scale = std::clamp(m_match_game_fov_prospi_telephoto_perf_static_mesh_lod_distance_scale->value(), 0.10f, 4.0f);
+        const auto target_skeletal_mesh_lod_bias = std::clamp((int)std::lround(m_match_game_fov_prospi_telephoto_perf_skeletal_mesh_lod_bias->value()), 0, 4);
+
+        set_runtime_cvar_float(L"r.ViewDistanceScale", target_view_distance_scale);
+        set_runtime_cvar_float(L"r.StaticMeshLODDistanceScale", target_static_mesh_lod_distance_scale);
+        set_runtime_cvar_int(L"r.SkeletalMeshLODBias", target_skeletal_mesh_lod_bias);
+
+        if (!m_prospi_telephoto_perf_override_applied) {
+            spdlog::info(
+                "[PROSPI_TELEPHOTO_PERF] active=true view_distance={:.2f} static_mesh_lod_scale={:.2f} skeletal_lod_bias={}",
+                target_view_distance_scale,
+                target_static_mesh_lod_distance_scale,
+                target_skeletal_mesh_lod_bias
+            );
+        }
+
+        m_prospi_telephoto_perf_override_applied = true;
+        m_match_game_fov_prospi_telephoto_perf_active.store(true, std::memory_order_relaxed);
+    };
+
+    const auto reset_prospi_state = [&]() {
+        update_prospi_telephoto_perf_override(false);
+        m_match_game_fov_prospi_preset.store((int32_t)ProSpiCameraPreset::None, std::memory_order_relaxed);
+        m_match_game_fov_prospi_actual_min_active.store(0.0f, std::memory_order_relaxed);
+        m_match_game_fov_prospi_calibration_applied.store(false, std::memory_order_relaxed);
+        m_match_game_fov_prospi_calibration_dolly_distance_active.store(0.0f, std::memory_order_relaxed);
+        m_match_game_fov_prospi_calibration_multiplier_active.store(1.0f, std::memory_order_relaxed);
+        m_match_game_fov_prospi_calibration_actual_min_active.store(0.0f, std::memory_order_relaxed);
+        m_match_game_fov_prospi_tv_override_active.store(false, std::memory_order_relaxed);
+        m_match_game_fov_prospi_auto_dolly_distance_active.store(0.0f, std::memory_order_relaxed);
+        m_match_game_fov_prospi_telephoto_perf_active.store(false, std::memory_order_relaxed);
+        m_match_game_fov_read_only_camera_active.store(false, std::memory_order_relaxed);
+        m_match_game_fov_would_write_game_camera.store(false, std::memory_order_relaxed);
+        m_match_game_fov_camera_cut_stabilizer_active.store(false, std::memory_order_relaxed);
+        m_match_game_fov_camera_cut_stabilizer_remaining_ms.store(0, std::memory_order_relaxed);
+        m_match_game_fov_generic_camera_preset_applied.store(false, std::memory_order_relaxed);
+        m_match_game_fov_generic_camera_tracking_active.store(false, std::memory_order_relaxed);
+
+        std::scoped_lock _{m_prospi_camera_calibration_mtx};
+        m_prospi_current_camera_id.clear();
+        m_prospi_sticky_preset_valid = false;
+        m_prospi_sticky_preset = (int32_t)ProSpiCameraPreset::None;
+        m_prospi_sticky_location = {};
+        m_prospi_sticky_rotation = {};
+        m_prospi_sticky_raw_fov = 0.0f;
+        m_prospi_sticky_calibration_valid = false;
+        m_prospi_sticky_camera_id.clear();
+
+        {
+            std::scoped_lock generic_lock{m_generic_camera_preset_mtx};
+            m_current_game_camera_id.clear();
+            m_active_generic_camera_preset = {};
+        }
+
+        m_camera_cut_state = {};
+    };
+
+    if (!m_match_game_fov->value()) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        m_game_fov_raw.store(0.0f, std::memory_order_relaxed);
+        m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    auto engine = sdk::UEngine::get();
+    auto world = engine != nullptr ? engine->get_world() : nullptr;
+    auto gameplay = sdk::UGameplayStatics::get();
+
+    if (world == nullptr || gameplay == nullptr) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    auto pc = gameplay->get_player_controller(world, 0);
+    if (pc == nullptr) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    auto pcm = pc->get_player_camera_manager();
+    if (pcm == nullptr) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    auto fov = read_game_fov(pcm);
+    if (!fov.has_value()) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        m_game_fov_raw.store(0.0f, std::memory_order_relaxed);
+        m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    if (!std::isfinite(*fov) || *fov <= 0.01f || *fov >= 179.0f) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        m_game_fov_raw.store(0.0f, std::memory_order_relaxed);
+        m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    const auto raw_fov = *fov;
+    m_game_fov_raw.store(raw_fov, std::memory_order_relaxed);
+
+    auto game_fov_for_matching = raw_fov;
+    auto active_fov_multiplier = std::clamp(m_match_game_fov_multiplier->value(), 0.1f, 3.0f);
+    auto active_dolly_distance = std::clamp(m_match_game_fov_dolly_distance->value(), 10.0f, 50000.0f);
+    auto effective_fov = raw_fov * active_fov_multiplier;
+    if (!std::isfinite(effective_fov)) {
+        m_game_fov_valid.store(false, std::memory_order_relaxed);
+        m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+        reset_prospi_state();
+        return;
+    }
+
+    auto projection_min_fov = m_match_game_fov_min_enabled->value() ? m_match_game_fov_min->value() : 5.0f;
+    const auto prospi_actual_min_fov = std::clamp(m_match_game_fov_prospi_actual_min->value(), 5.0f, 175.0f);
+    auto prospi_preset = ProSpiCameraPreset::None;
+    auto active_prospi_actual_min_fov = 0.0f;
+    auto wrote_prospi_fov = false;
+    auto wants_game_fov_write = false;
+    auto deferred_game_fov_write = raw_fov;
+    auto prospi_calibration_applied = false;
+    auto prospi_tv_override_applied = false;
+    auto generic_camera_preset_applied = false;
+    auto read_only_camera_for_frame = m_match_game_fov_read_only_camera->value();
+    const auto camera_cut_stabilizer_enabled = m_match_game_fov_camera_cut_stabilizer->value();
+    const auto generic_camera_presets_tracking_enabled =
+        m_match_game_fov_dolly->value() &&
+        m_match_game_fov_generic_camera_presets->value();
+    const auto generic_camera_presets_apply_enabled =
+        generic_camera_presets_tracking_enabled &&
+        m_match_game_fov_generic_camera_presets_auto_apply->value();
+    const auto should_track_generic_camera = camera_cut_stabilizer_enabled || generic_camera_presets_tracking_enabled;
+    const char* prospi_dolly_source = "Base";
+    std::string prospi_camera_id{};
+
+    const auto is_prospi = is_prospi_executable();
+    const auto location = read_game_camera_location(pcm);
+    const auto rotation = read_game_camera_rotation(pcm);
+    GameCameraSample camera_sample{};
+    if (should_track_generic_camera && location.has_value() && rotation.has_value()) {
+        camera_sample.valid = true;
+        camera_sample.player_camera_manager = reinterpret_cast<uintptr_t>(pcm);
+        camera_sample.raw_fov = raw_fov;
+        camera_sample.timestamp = std::chrono::steady_clock::now();
+        camera_sample.location = *location;
+        camera_sample.rotation = *rotation;
+        camera_sample.camera_id = build_generic_camera_preset_id(*location, *rotation, raw_fov);
+        {
+            std::scoped_lock _{m_generic_camera_preset_mtx};
+            m_current_game_camera_id = camera_sample.camera_id;
+        }
+
+        m_match_game_fov_generic_camera_tracking_active.store(true, std::memory_order_relaxed);
+    } else if (m_match_game_fov_generic_camera_tracking_active.exchange(false, std::memory_order_relaxed)) {
+        std::scoped_lock _{m_generic_camera_preset_mtx};
+        m_current_game_camera_id.clear();
+    }
+
+    if (location.has_value() && rotation.has_value()) {
+        prospi_camera_id = build_camera_calibration_id(*location, *rotation);
+        {
+            std::scoped_lock _{m_prospi_camera_calibration_mtx};
+            m_prospi_current_camera_id = prospi_camera_id;
+        }
+
+        if (m_match_game_fov_prospi_camera_calibration_auto->value()) {
+            std::scoped_lock _{m_prospi_camera_calibration_mtx};
+            if (const auto it = m_prospi_camera_calibrations.find(prospi_camera_id); it != m_prospi_camera_calibrations.end()) {
+                const auto saved_min_fov = std::clamp(it->second.actual_min_fov, 5.0f, 175.0f);
+                if (is_prospi) {
+                    active_prospi_actual_min_fov = saved_min_fov;
+                } else if (m_match_game_fov_min_enabled->value()) {
+                    projection_min_fov = saved_min_fov;
+                }
+
+                active_fov_multiplier = std::clamp(it->second.projection_multiplier, 0.1f, 3.0f);
+                active_dolly_distance = std::clamp(it->second.dolly_distance, 10.0f, 50000.0f);
+                prospi_calibration_applied = true;
+                prospi_dolly_source = "Calibration";
+            }
+        }
+    } else {
+        std::scoped_lock _{m_prospi_camera_calibration_mtx};
+        m_prospi_current_camera_id.clear();
+    }
+
+    if (is_prospi && location.has_value() && rotation.has_value()) {
+        const auto classified_prospi_preset = classify_prospi_camera_preset(*location, *rotation, raw_fov);
+        prospi_preset = classified_prospi_preset;
+
+        if (m_prospi_sticky_preset_valid &&
+            should_keep_prospi_sticky_preset(
+                (ProSpiCameraPreset)m_prospi_sticky_preset,
+                m_prospi_sticky_location,
+                m_prospi_sticky_rotation,
+                m_prospi_sticky_raw_fov,
+                classified_prospi_preset,
+                *location,
+                *rotation,
+                raw_fov)) {
+            prospi_preset = (ProSpiCameraPreset)m_prospi_sticky_preset;
+        }
+
+        if (!prospi_calibration_applied && m_match_game_fov_dolly->value()) {
+            switch (prospi_preset) {
+            case ProSpiCameraPreset::OpeningAerialTelephoto:
+                if (m_match_game_fov_prospi_opening_aerial_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_opening_aerial_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "OpeningAerialTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::BehindPlateWideTelephoto:
+                if (m_match_game_fov_prospi_behind_plate_wide_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_behind_plate_wide_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "BehindPlateWideTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::HomePlateWaistHighReverse:
+                if (m_match_game_fov_prospi_home_plate_waist_high_reverse_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_home_plate_waist_high_reverse_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "HomePlateWaistHighReverse";
+                }
+                break;
+            case ProSpiCameraPreset::TVBroadcast:
+                if (m_match_game_fov_prospi_tv_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_tv_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_tv_override_applied = true;
+                    prospi_dolly_source = "TVBroadcast";
+                }
+                break;
+            case ProSpiCameraPreset::CenterFieldTelephoto:
+                if (m_match_game_fov_prospi_center_field_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_center_field_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "CenterFieldTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::CenterFieldHighTelephoto:
+                if (m_match_game_fov_prospi_center_field_high_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_center_field_high_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "CenterFieldHighTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::OffsetCenterFieldTelephoto:
+                if (m_match_game_fov_prospi_left_field_corner_wide_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_left_field_corner_wide_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "OffsetCenterFieldTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::DeepOutfieldTelephoto:
+                if (m_match_game_fov_prospi_deep_outfield_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_deep_outfield_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "DeepOutfieldTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::HomePlateSkyAerial:
+                if (m_match_game_fov_prospi_home_plate_sky_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_home_plate_sky_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "HomePlateSkyAerial";
+                }
+                break;
+            case ProSpiCameraPreset::PlateHighTelephoto:
+                if (m_match_game_fov_prospi_plate_high_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_plate_high_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "PlateHighTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::HomePlateOverheadTelephoto:
+                if (m_match_game_fov_prospi_home_plate_overhead_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_home_plate_overhead_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "HomePlateOverheadTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::UpperDeckTelephoto:
+                if (m_match_game_fov_prospi_upper_deck_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_upper_deck_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "UpperDeckTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::UpperDeckHomeSkyTelephoto:
+                if (m_match_game_fov_prospi_home_sky_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_home_sky_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "UpperDeckHomeSkyTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::ThirdBaseTelephoto:
+                if (m_match_game_fov_prospi_third_base_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_third_base_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "ThirdBaseTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::ThirdBaseRelayLow:
+                if (m_match_game_fov_prospi_third_base_relay_low_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_third_base_relay_low_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "ThirdBaseRelayLow";
+                }
+                break;
+            case ProSpiCameraPreset::ThirdBaseCornerLow:
+                if (m_match_game_fov_prospi_third_base_sweep_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_third_base_sweep_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "ThirdBaseCornerLow";
+                }
+                break;
+            case ProSpiCameraPreset::ThirdBaseWideTelephoto:
+                if (m_match_game_fov_prospi_third_base_wide_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_third_base_wide_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "ThirdBaseWideTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::FirstBaseTelephoto:
+                if (m_match_game_fov_prospi_first_base_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_first_base_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "FirstBaseTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::FirstBaseWideTelephoto:
+                if (m_match_game_fov_prospi_first_base_wide_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_first_base_wide_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "FirstBaseWideTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::FirstBaseCornerLow:
+                if (m_match_game_fov_prospi_first_base_corner_low_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_first_base_corner_low_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "FirstBaseCornerLow";
+                }
+                break;
+            case ProSpiCameraPreset::LowInfieldSideCloseUp:
+                if (m_match_game_fov_prospi_low_plate_corner_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_low_plate_corner_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "LowInfieldSideCloseUp";
+                }
+                break;
+            case ProSpiCameraPreset::BackstopHighTelephoto:
+                if (m_match_game_fov_prospi_backstop_high_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_backstop_high_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "BackstopHighTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::RightFieldCornerTelephoto:
+                if (m_match_game_fov_prospi_right_field_corner_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_right_field_corner_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "RightFieldCornerTelephoto";
+                }
+                break;
+            case ProSpiCameraPreset::RightCenterFieldTelephoto:
+                if (m_match_game_fov_prospi_right_center_field_dolly_override->value()) {
+                    active_dolly_distance = std::clamp(m_match_game_fov_prospi_right_center_field_dolly_distance->value(), 10.0f, 50000.0f);
+                    prospi_dolly_source = "RightCenterFieldTelephoto";
+                }
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (is_specific_prospi_preset(prospi_preset)) {
+            m_prospi_sticky_preset_valid = true;
+            m_prospi_sticky_preset = (int32_t)prospi_preset;
+            m_prospi_sticky_location = *location;
+            m_prospi_sticky_rotation = *rotation;
+            m_prospi_sticky_raw_fov = raw_fov;
+            m_prospi_sticky_camera_id = prospi_camera_id;
+        }
+    }
+
+    if (m_match_game_fov_dolly->value() &&
+        m_match_game_fov_prospi_actual_clamp->value() &&
+        is_prospi) {
+        const auto resolve_prospi_actual_min_fov = [&](ProSpiCameraPreset preset) {
+            switch (preset) {
+            case ProSpiCameraPreset::CenterFieldTelephoto:
+            case ProSpiCameraPreset::CenterFieldHighTelephoto:
+            case ProSpiCameraPreset::OffsetCenterFieldTelephoto:
+                return std::clamp(m_match_game_fov_prospi_center_field_actual_min->value(), 5.0f, 175.0f);
+            case ProSpiCameraPreset::UpperDeckTelephoto:
+            case ProSpiCameraPreset::UpperDeckHomeSkyTelephoto:
+                return std::clamp(m_match_game_fov_prospi_upper_deck_actual_min->value(), 5.0f, 175.0f);
+            case ProSpiCameraPreset::PlateHighTelephoto:
+            case ProSpiCameraPreset::HomePlateOverheadTelephoto:
+                return std::clamp(m_match_game_fov_prospi_plate_high_actual_min->value(), 5.0f, 175.0f);
+            case ProSpiCameraPreset::DeepOutfieldTelephoto:
+                return std::clamp(m_match_game_fov_prospi_deep_outfield_actual_min->value(), 5.0f, 175.0f);
+            case ProSpiCameraPreset::ThirdBaseTelephoto:
+            case ProSpiCameraPreset::ThirdBaseRelayLow:
+            case ProSpiCameraPreset::ThirdBaseWideTelephoto:
+            case ProSpiCameraPreset::FirstBaseTelephoto:
+            case ProSpiCameraPreset::FirstBaseWideTelephoto:
+            case ProSpiCameraPreset::GenericTelephoto:
+            case ProSpiCameraPreset::None:
+            default:
+                return prospi_actual_min_fov;
+            }
+        };
+
+        if (!prospi_calibration_applied) {
+            active_prospi_actual_min_fov = resolve_prospi_actual_min_fov(prospi_preset);
+        }
+
+        const auto generic_trigger_min_fov = prospi_calibration_applied ? active_prospi_actual_min_fov : prospi_actual_min_fov;
+
+        if (prospi_preset != ProSpiCameraPreset::None || raw_fov < generic_trigger_min_fov) {
+            if (prospi_preset == ProSpiCameraPreset::None) {
+                prospi_preset = ProSpiCameraPreset::GenericTelephoto;
+                if (!prospi_calibration_applied) {
+                    active_prospi_actual_min_fov = resolve_prospi_actual_min_fov(prospi_preset);
+                }
+            }
+
+            game_fov_for_matching = std::clamp(raw_fov, active_prospi_actual_min_fov, 175.0f);
+            if (std::abs(game_fov_for_matching - raw_fov) > 0.01f) {
+                wants_game_fov_write = true;
+                deferred_game_fov_write = game_fov_for_matching;
+            }
+        }
+    }
+
+    if (generic_camera_presets_apply_enabled && camera_sample.valid) {
+        std::optional<GenericCameraPreset> preset{};
+        {
+            std::scoped_lock _{m_generic_camera_preset_mtx};
+            if (const auto it = m_generic_camera_presets.find(camera_sample.camera_id); it != m_generic_camera_presets.end()) {
+                preset = it->second;
+                m_active_generic_camera_preset = it->second;
+            } else {
+                m_active_generic_camera_preset = {};
+            }
+        }
+
+        if (preset.has_value()) {
+            generic_camera_preset_applied = true;
+            active_fov_multiplier = std::clamp(preset->projection_multiplier, 0.1f, 3.0f);
+            active_dolly_distance = std::clamp(preset->dolly_distance, 10.0f, 50000.0f);
+            projection_min_fov = std::max(projection_min_fov, std::clamp(preset->min_fov, 5.0f, 175.0f));
+            game_fov_for_matching = std::clamp(game_fov_for_matching, projection_min_fov, 175.0f);
+            read_only_camera_for_frame = read_only_camera_for_frame || preset->read_only_camera;
+        }
+    } else {
+        std::scoped_lock _{m_generic_camera_preset_mtx};
+        m_active_generic_camera_preset = {};
+    }
+
+    effective_fov = game_fov_for_matching * active_fov_multiplier;
+    effective_fov = std::clamp(effective_fov, projection_min_fov, 175.0f);
+
+    bool camera_cut_stabilizer_blocked_write = false;
+    if (!camera_cut_stabilizer_enabled) {
+        if (m_camera_cut_state.stabilizing) {
+            spdlog::info("[CAMERA_STABILIZER] active=false reason=disabled");
+        }
+
+        m_camera_cut_state = {};
+        m_match_game_fov_camera_cut_stabilizer_active.store(false, std::memory_order_relaxed);
+        m_match_game_fov_camera_cut_stabilizer_remaining_ms.store(0, std::memory_order_relaxed);
+    } else if (camera_sample.valid) {
+        auto output = GameCameraProjectionState{
+            .valid = true,
+            .game_fov_for_matching = game_fov_for_matching,
+            .effective_fov = effective_fov,
+            .active_dolly_distance = active_dolly_distance,
+            .active_fov_multiplier = active_fov_multiplier
+        };
+
+        const auto now = camera_sample.timestamp;
+        const auto duration_ms = std::clamp(m_match_game_fov_camera_cut_stabilizer_duration_ms->value(), 100.0f, 1500.0f);
+        const auto fov_threshold = std::clamp(m_match_game_fov_camera_cut_stabilizer_fov_delta->value(), 1.0f, 45.0f);
+        const auto rotation_threshold = std::clamp(m_match_game_fov_camera_cut_stabilizer_rotation_delta->value(), 1.0f, 90.0f);
+        const auto location_threshold = std::clamp(m_match_game_fov_camera_cut_stabilizer_location_delta->value(), 25.0f, 10000.0f);
+
+        bool detected_cut = false;
+        float location_delta = 0.0f;
+        float rotation_delta = 0.0f;
+        float fov_delta = 0.0f;
+        bool camera_id_changed = false;
+        bool pcm_changed = false;
+
+        if (m_camera_cut_state.has_previous_sample) {
+            const auto& previous = m_camera_cut_state.previous_sample;
+            location_delta = glm::distance(camera_sample.location, previous.location);
+            const auto pitch_delta = normalize_angle_delta(camera_sample.rotation.x, previous.rotation.x);
+            const auto yaw_delta = normalize_angle_delta(camera_sample.rotation.y, previous.rotation.y);
+            const auto roll_delta = normalize_angle_delta(camera_sample.rotation.z, previous.rotation.z);
+            rotation_delta = (std::max)(pitch_delta, (std::max)(yaw_delta, roll_delta));
+            fov_delta = std::abs(camera_sample.raw_fov - previous.raw_fov);
+            camera_id_changed = camera_sample.camera_id != previous.camera_id;
+            pcm_changed = camera_sample.player_camera_manager != previous.player_camera_manager;
+
+            detected_cut =
+                camera_id_changed ||
+                pcm_changed ||
+                fov_delta >= fov_threshold ||
+                rotation_delta >= rotation_threshold ||
+                location_delta >= location_threshold;
+        }
+
+        if (detected_cut && m_camera_cut_state.has_last_output) {
+            m_camera_cut_state.stabilizing = true;
+            m_camera_cut_state.cut_time = now;
+            m_camera_cut_state.stabilize_until = now + std::chrono::milliseconds((int64_t)std::lround(duration_ms));
+            m_camera_cut_state.blend_from = m_camera_cut_state.last_output;
+            m_camera_cut_state.blend_to = output;
+            m_camera_cut_state.last_cut_from = m_camera_cut_state.previous_sample;
+            m_camera_cut_state.last_cut_to = camera_sample;
+
+            spdlog::info(
+                "[CAMERA_CUT] from={} to={} id_changed={} pcm_changed={} loc_delta={:.1f} rot_delta={:.1f} fov_delta={:.1f} stabilize_ms={:.0f}",
+                m_camera_cut_state.last_cut_from.camera_id.empty() ? "None" : m_camera_cut_state.last_cut_from.camera_id,
+                camera_sample.camera_id.empty() ? "None" : camera_sample.camera_id,
+                camera_id_changed,
+                pcm_changed,
+                location_delta,
+                rotation_delta,
+                fov_delta,
+                duration_ms);
+        }
+
+        if (m_camera_cut_state.stabilizing) {
+            m_camera_cut_state.blend_to = output;
+
+            if (now < m_camera_cut_state.stabilize_until) {
+                const auto elapsed_ms = (float)std::chrono::duration_cast<std::chrono::milliseconds>(now - m_camera_cut_state.cut_time).count();
+                const auto freeze_ms = duration_ms * 0.4f;
+                const auto blend_ms = (std::max)(1.0f, duration_ms - freeze_ms);
+                const auto t = elapsed_ms <= freeze_ms ? 0.0f : smoothstep01((elapsed_ms - freeze_ms) / blend_ms);
+                const auto& from = m_camera_cut_state.blend_from;
+                const auto& to = m_camera_cut_state.blend_to;
+
+                game_fov_for_matching = lerp_float(from.game_fov_for_matching, to.game_fov_for_matching, t);
+                effective_fov = std::clamp(lerp_float(from.effective_fov, to.effective_fov, t), projection_min_fov, 175.0f);
+                active_dolly_distance = lerp_float(from.active_dolly_distance, to.active_dolly_distance, t);
+                active_fov_multiplier = lerp_float(from.active_fov_multiplier, to.active_fov_multiplier, t);
+                camera_cut_stabilizer_blocked_write = true;
+
+                const auto remaining_ms =
+                    (int32_t)std::chrono::duration_cast<std::chrono::milliseconds>(m_camera_cut_state.stabilize_until - now).count();
+                m_match_game_fov_camera_cut_stabilizer_active.store(true, std::memory_order_relaxed);
+                m_match_game_fov_camera_cut_stabilizer_remaining_ms.store((std::max)(0, remaining_ms), std::memory_order_relaxed);
+            } else {
+                m_camera_cut_state.stabilizing = false;
+                m_match_game_fov_camera_cut_stabilizer_active.store(false, std::memory_order_relaxed);
+                m_match_game_fov_camera_cut_stabilizer_remaining_ms.store(0, std::memory_order_relaxed);
+                spdlog::info("[CAMERA_STABILIZER] active=false reason=complete");
+            }
+        } else {
+            m_match_game_fov_camera_cut_stabilizer_active.store(false, std::memory_order_relaxed);
+            m_match_game_fov_camera_cut_stabilizer_remaining_ms.store(0, std::memory_order_relaxed);
+        }
+
+        m_camera_cut_state.previous_sample = camera_sample;
+        m_camera_cut_state.has_previous_sample = true;
+        m_camera_cut_state.last_output = GameCameraProjectionState{
+            .valid = true,
+            .game_fov_for_matching = game_fov_for_matching,
+            .effective_fov = effective_fov,
+            .active_dolly_distance = active_dolly_distance,
+            .active_fov_multiplier = active_fov_multiplier
+        };
+        m_camera_cut_state.has_last_output = true;
+    } else {
+        m_camera_cut_state = {};
+        m_match_game_fov_camera_cut_stabilizer_active.store(false, std::memory_order_relaxed);
+        m_match_game_fov_camera_cut_stabilizer_remaining_ms.store(0, std::memory_order_relaxed);
+    }
+
+    const auto block_game_fov_write = read_only_camera_for_frame || camera_cut_stabilizer_blocked_write;
+    if (wants_game_fov_write) {
+        if (block_game_fov_write) {
+            m_match_game_fov_would_write_game_camera.store(true, std::memory_order_relaxed);
+        } else {
+            wrote_prospi_fov = write_game_fov(pcm, deferred_game_fov_write);
+            m_match_game_fov_would_write_game_camera.store(!wrote_prospi_fov, std::memory_order_relaxed);
+        }
+    } else {
+        m_match_game_fov_would_write_game_camera.store(false, std::memory_order_relaxed);
+    }
+
+    m_match_game_fov_read_only_camera_active.store(block_game_fov_write, std::memory_order_relaxed);
+    m_match_game_fov_generic_camera_preset_applied.store(generic_camera_preset_applied, std::memory_order_relaxed);
+
+    const auto telephoto_perf_trigger_fov = std::clamp(m_match_game_fov_prospi_telephoto_perf_trigger_fov->value(), 10.0f, 40.0f);
+    const auto telephoto_perf_should_apply =
+        is_prospi &&
+        m_match_game_fov_prospi_telephoto_perf_override->value() &&
+        !is_prospi_nontelephoto_preset(prospi_preset) &&
+        (raw_fov <= telephoto_perf_trigger_fov || game_fov_for_matching <= telephoto_perf_trigger_fov);
+    update_prospi_telephoto_perf_override(telephoto_perf_should_apply);
+
+    m_match_game_fov_prospi_preset.store((int32_t)prospi_preset, std::memory_order_relaxed);
+    m_match_game_fov_prospi_actual_min_active.store(active_prospi_actual_min_fov, std::memory_order_relaxed);
+    m_match_game_fov_prospi_calibration_applied.store(prospi_calibration_applied, std::memory_order_relaxed);
+    m_match_game_fov_prospi_calibration_dolly_distance_active.store(active_dolly_distance, std::memory_order_relaxed);
+    m_match_game_fov_prospi_calibration_multiplier_active.store(active_fov_multiplier, std::memory_order_relaxed);
+    m_match_game_fov_prospi_calibration_actual_min_active.store(prospi_calibration_applied ? active_prospi_actual_min_fov : 0.0f, std::memory_order_relaxed);
+    m_match_game_fov_prospi_tv_override_active.store(prospi_tv_override_applied, std::memory_order_relaxed);
+    m_match_game_fov_prospi_auto_dolly_distance_active.store(prospi_dolly_source == std::string_view{"Base"} ? 0.0f : active_dolly_distance, std::memory_order_relaxed);
+    m_game_fov.store(effective_fov, std::memory_order_relaxed);
+    m_game_fov_valid.store(true, std::memory_order_relaxed);
+
+    if (is_prospi_executable() && m_match_game_fov_prospi_actual_clamp->value()) {
+        static auto last_logged_preset = ProSpiCameraPreset::None;
+        static auto last_logged_raw_fov = 0.0f;
+        static auto last_logged_min_fov = 0.0f;
+        static auto last_logged_written_fov = 0.0f;
+        static auto last_logged_effective_fov = 0.0f;
+        static auto last_logged_write_state = false;
+        static auto last_logged_calibration_state = false;
+        static auto last_logged_tv_override_state = false;
+        static auto last_logged_telephoto_perf_state = false;
+        static auto last_logged_multiplier = 1.0f;
+        static auto last_logged_dolly_distance = 0.0f;
+        static std::string last_logged_dolly_source{"Base"};
+        static std::string last_logged_camera_id{};
+
+        if (prospi_preset != last_logged_preset ||
+            wrote_prospi_fov != last_logged_write_state ||
+            prospi_calibration_applied != last_logged_calibration_state ||
+            prospi_tv_override_applied != last_logged_tv_override_state ||
+            telephoto_perf_should_apply != last_logged_telephoto_perf_state ||
+            prospi_dolly_source != last_logged_dolly_source ||
+            prospi_camera_id != last_logged_camera_id ||
+            std::abs(raw_fov - last_logged_raw_fov) > 0.25f ||
+            std::abs(active_prospi_actual_min_fov - last_logged_min_fov) > 0.01f ||
+            std::abs(active_fov_multiplier - last_logged_multiplier) > 0.01f ||
+            std::abs(active_dolly_distance - last_logged_dolly_distance) > 0.25f ||
+            std::abs(game_fov_for_matching - last_logged_written_fov) > 0.25f ||
+            std::abs(effective_fov - last_logged_effective_fov) > 0.25f) {
+            spdlog::info(
+                "[PROSPI_FOV] preset={} camera={} calibrated={} tv_override={} telephoto_perf={} dolly_source={} raw={:.2f} min={:.2f} mult={:.2f} dolly={:.2f} written={:.2f} effective={:.2f} wrote={}",
+                get_prospi_camera_preset_name(prospi_preset),
+                prospi_camera_id.empty() ? "None" : prospi_camera_id,
+                prospi_calibration_applied,
+                prospi_tv_override_applied,
+                telephoto_perf_should_apply,
+                prospi_dolly_source,
+                raw_fov,
+                active_prospi_actual_min_fov,
+                active_fov_multiplier,
+                active_dolly_distance,
+                game_fov_for_matching,
+                effective_fov,
+                wrote_prospi_fov
+            );
+
+            last_logged_preset = prospi_preset;
+            last_logged_raw_fov = raw_fov;
+            last_logged_min_fov = active_prospi_actual_min_fov;
+            last_logged_multiplier = active_fov_multiplier;
+            last_logged_dolly_distance = active_dolly_distance;
+            last_logged_written_fov = game_fov_for_matching;
+            last_logged_effective_fov = effective_fov;
+            last_logged_write_state = wrote_prospi_fov;
+            last_logged_calibration_state = prospi_calibration_applied;
+            last_logged_tv_override_state = prospi_tv_override_applied;
+            last_logged_telephoto_perf_state = telephoto_perf_should_apply;
+            last_logged_dolly_source = prospi_dolly_source;
+            last_logged_camera_id = prospi_camera_id;
+        }
+    }
+
+    if (m_match_game_fov_dolly->value()) {
+        auto base_fov = read_default_fov(pcm).value_or(m_game_fov_base.load(std::memory_order_relaxed));
+        if (!std::isfinite(base_fov) || base_fov <= 1.0f || base_fov >= 179.0f) {
+            base_fov = game_fov_for_matching;
+        }
+
+        m_game_fov_base.store(base_fov, std::memory_order_relaxed);
+        base_fov = std::clamp(base_fov, 5.0f, 175.0f);
+
+        const auto current_half = glm::radians(effective_fov) * 0.5f;
+        const auto base_half = glm::radians(base_fov) * 0.5f;
+        const auto base_tan = std::tan(base_half);
+        const auto current_tan = std::tan(current_half);
+
+        if (base_tan <= 0.0f || current_tan <= 0.0f) {
+            m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+            return;
+        }
+
+        const auto scale = current_tan / base_tan;
+        const auto focus_distance = active_dolly_distance;
+        auto dolly_offset = focus_distance * (1.0f - scale);
+        const auto max_offset = focus_distance * 2.0f;
+        dolly_offset = std::clamp(dolly_offset, -max_offset, max_offset);
+
+        if (!std::isfinite(dolly_offset)) {
+            m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+            return;
+        }
+
+        m_game_fov_dolly_offset.store(dolly_offset, std::memory_order_relaxed);
+    } else {
+        m_game_fov_dolly_offset.store(0.0f, std::memory_order_relaxed);
+    }
+}
+
+float VR::get_game_fov() const {
+    return m_game_fov.load(std::memory_order_relaxed);
+}
+
+float VR::get_game_fov_scale(float base_half_fov) const {
+    if (!m_game_fov_valid.load(std::memory_order_relaxed)) {
+        return 1.0f;
+    }
+
+    if (m_match_game_fov_dolly->value()) {
+        return 1.0f;
+    }
+
+    auto game_fov = get_game_fov();
+
+    if (!std::isfinite(game_fov)) {
+        return 1.0f;
+    }
+
+    game_fov = std::clamp(game_fov, 5.0f, 175.0f);
+
+    const auto desired_half = glm::radians(game_fov) * 0.5f;
+    const auto base_tan = std::tan(base_half_fov);
+    const auto desired_tan = std::tan(desired_half);
+
+    if (base_tan <= 0.0f || desired_tan <= 0.0f) {
+        return 1.0f;
+    }
+
+    const auto scale = base_tan / desired_tan;
+    if (!std::isfinite(scale) || scale <= 0.01f || scale >= 100.0f) {
+        return 1.0f;
+    }
+
+    return scale;
+}
+
+float VR::get_game_fov_dolly_offset() const {
+    return m_game_fov_dolly_offset.load(std::memory_order_relaxed);
 }
 
 void VR::on_pre_calculate_stereo_view_offset(void* stereo_device, const int32_t view_index, Rotator<float>* view_rotation, 
@@ -1924,6 +4388,41 @@ void VR::on_pre_viewport_client_draw(void* viewport_client, void* viewport, void
     }
 }
 
+float VR::flat3d_effective_nearz() {
+    // Custom Z Near is an explicit user override written into the SDK's cell by
+    // on_pre_viewport_client_draw — honor it exactly, whatever value they pick.
+    if (m_custom_z_near_enabled->value()) {
+        return sdk::globals::get_near_clipping_plane();
+    }
+
+    const float nz = sdk::globals::get_near_clipping_plane();
+    // A successful scan yields the game's real plane (UE default ~10 uu). The
+    // SDK returns a 1.0 dummy when the scan fails; treat <=1.0 as "no value".
+    if (std::isfinite(nz) && nz > 1.0f) {
+        return nz;
+    }
+
+    // Failed-scan fallback (kept out of the pristine UESDK submodule): use the
+    // game's r.SetNearClipPlane cvar if it set one, else UE's own default of 10
+    // (a far closer approximation than the SDK's 1.0 dummy). r.SetNearClipPlane
+    // is 0 until set, so only adopt a positive value.
+    try {
+        if (auto data = sdk::find_cvar_data_cached(L"Engine", L"r.SetNearClipPlane"); data) {
+            // Only adopt a PLAUSIBLE near plane (UE units; default is 10).
+            // FF7 Rebirth's cvar read produced a tiny-positive garbage value —
+            // it passed a bare >0 check and poisoned the depth->world
+            // conversion (game_nearz ~0 → every sample classified far).
+            if (auto* cv = data->get<float>(); cv != nullptr && cv->get() >= 1.0f && cv->get() <= 1000.0f) {
+                SPDLOG_INFO_ONCE("[Flat3D] near plane fallback via r.SetNearClipPlane cvar");
+                return cv->get();
+            }
+        }
+    } catch (...) {
+    }
+
+    return 10.0f;
+}
+
 void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     ZoneScopedN(__FUNCTION__);
 
@@ -1931,7 +4430,10 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
     auto runtime = get_runtime();
     if (m_uncap_framerate->value()) {
-        sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
+        // The 3D Display 2x-refresh cap owns t.MaxFPS while active.
+        if (!(is_using_flat3d() && m_flat3d_vsync->value() == 3)) {
+            sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
+        }
     }
 
     // Allows games running in HDR mode to not have a black UI overlay
@@ -1976,11 +4478,16 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
             const auto now_frame = frame_count % runtimes::OpenXR::QUEUE_SIZE;
             m_openxr->pipeline_states[now_frame] = m_openxr->pipeline_states[last_frame];
             m_openxr->pipeline_states[now_frame].frame_count = now_frame;
-        } else {
+        } else if (runtime->is_openvr()) {
+            // Keep AFW's simpler OpenXR clone (Dead Island 2's synced-token fix is
+            // joeyhodge work this branch deliberately does not carry), but the
+            // else MUST stay guarded: Flat3D is a third runtime and a bare else
+            // would static_cast it to runtimes::OpenVR* and walk pose_queue.
             const auto last_frame = (frame_count - 1) % m_openvr->pose_queue.size();
             const auto now_frame = frame_count % m_openvr->pose_queue.size();
             m_openvr->pose_queue[now_frame] = m_openvr->pose_queue[last_frame];
         }
+        // Flat3D: no compositor pose queue to clone.
 
         // Forcefully disable motion blur because it freaks out with AFR
         sdk::set_cvar_data_int(L"Engine", L"r.DefaultFeature.MotionBlur", 0);
@@ -2368,6 +4875,10 @@ void VR::handle_keybinds() {
     if (m_keybind_toggle_gui->is_key_down_once()) {
         m_enable_gui->toggle();
     }
+
+    if (is_using_flat3d()) {
+        handle_flat3d_keybinds();
+    }
 }
 
 void VR::on_frame() {
@@ -2375,6 +4886,10 @@ void VR::on_frame() {
 
     m_cvar_manager->on_frame();
     handle_keybinds();
+
+    if (is_using_flat3d()) {
+        update_flat3d_params();
+    }
 
     if (!get_runtime()->ready()) {
         return;
@@ -2889,6 +5404,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         PAGE_INPUT,
         PAGE_CAMERA,
         PAGE_KEYBINDS,
+        PAGE_MONITOR3D,
         PAGE_CONSOLE,
         PAGE_COMPATIBILITY,
         PAGE_DEBUG,
@@ -2949,6 +5465,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
     case "Keybinds"_fnv:
         selected_page = PAGE_KEYBINDS;
         break;
+    case "3D Display"_fnv:
+        selected_page = PAGE_MONITOR3D;
+        break;
     case "Console/CVars"_fnv:
         selected_page = PAGE_CONSOLE;
         break;
@@ -2980,9 +5499,17 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         ImGui::Text((std::string{"Runtime Information ("} + get_runtime()->name().data() + ")").c_str());
 
-        m_desktop_fix->draw("Desktop Spectator View");
-        ImGui::SameLine();
-        m_2d_screen_mode->draw("2D Screen Mode");
+        // No-ops under 3D Display mode: the flat3d compositor owns the real
+        // backbuffer (no desktop mirror) and 2D-screen is mutually exclusive.
+        if (!is_using_flat3d()) {
+            m_desktop_fix->draw("Desktop Spectator View");
+
+            if (m_desktop_fix->value()) {
+                m_desktop_mirror_mode->draw("Desktop Spectator View Mode");
+            }
+
+            m_2d_screen_mode->draw("2D Screen Mode");
+        }
 
         ImGui::TextWrapped("Render Resolution (per-eye): %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
         ImGui::TextWrapped("Total Render Resolution: %d x %d", get_runtime()->get_width() * 2, get_runtime()->get_height());
@@ -2993,7 +5520,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
         get_runtime()->on_draw_ui();
 
-        m_overlay_component.on_draw_ui();
+        if (!is_using_flat3d()) {
+            // VR-compositor overlay options — inert without a VR compositor.
+            m_overlay_component.on_draw_ui();
+        }
 
         ImGui::TreePop();
     }
@@ -3065,7 +5595,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_disable_blur_widgets->draw("Disable Blur Widgets");
         m_uncap_framerate->draw("Uncap Framerate");
         m_enable_gui->draw("Enable GUI");
-        m_enable_depth->draw("Enable Depth-based Latency Reduction");
+
+        if (!is_using_flat3d()) {
+            // Depth submission to the VR compositor — no compositor here.
+            m_enable_depth->draw("Enable Depth-based Latency Reduction");
+        }
         m_load_blueprint_code->draw("Load Blueprint Code");
         m_ghosting_fix->draw("Ghosting Fix");
 
@@ -3092,7 +5626,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
     }
 
-    if (selected_page == PAGE_INPUT) {
+    if (selected_page == PAGE_INPUT && is_using_flat3d()) {
+        ImGui::TextWrapped("Motion-controller input options are not applicable in 3D Display mode\n"
+                           "(no VR controllers). Keyboard/mouse hotkeys are on the Keybinds and\n"
+                           "3D Display pages.");
+    } else if (selected_page == PAGE_INPUT) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Controller")) {
             m_joystick_deadzone->draw("VR Joystick Deadzone");
@@ -3206,8 +5744,275 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TreePop();
         }
 
-        ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
-        if (ImGui::TreeNode("Camera Lerp")) {
+        // No-op under 3D Display mode: the flat3d projection is rebuilt from the
+        // game's own live FoV every frame (see the 3D Display page's Camera FoV
+        // Axis / FoV Multiplier), so there is no HMD FoV to match it to.
+        const bool show_game_fov = !is_using_flat3d();
+
+        if (show_game_fov) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+        }
+
+        if (show_game_fov && ImGui::TreeNode("Game FOV")) {
+            m_match_game_fov->draw("Match Game FOV");
+
+            if (m_match_game_fov->value()) {
+                if (ImGui::CollapsingHeader("General", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    m_match_game_fov_dolly->draw("Use Dolly Instead of FOV");
+                    m_match_game_fov_multiplier->draw("FOV Multiplier");
+                    m_match_game_fov_min_enabled->draw("Clamp Minimum FOV");
+                    if (m_match_game_fov_min_enabled->value()) {
+                        m_match_game_fov_min->draw("Minimum FOV");
+                    }
+                    m_match_game_fov_read_only_camera->draw("Read Game Camera Only (No FOV Writes)");
+
+                    if (m_match_game_fov_dolly->value()) {
+                        m_match_game_fov_dolly_distance->draw_drag("Dolly Focus Distance", 10.0f, "%.0f");
+                        ImGui::Text("Dolly Offset: %.2f", get_game_fov_dolly_offset());
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Camera Cut Stabilizer")) {
+                    m_match_game_fov_camera_cut_stabilizer->draw("Enable Camera Cut Stabilizer");
+                    if (m_match_game_fov_camera_cut_stabilizer->value()) {
+                        m_match_game_fov_camera_cut_stabilizer_duration_ms->draw("Stabilizer Duration (ms)");
+                        m_match_game_fov_camera_cut_stabilizer_fov_delta->draw("Cut FOV Delta Threshold");
+                        m_match_game_fov_camera_cut_stabilizer_rotation_delta->draw("Cut Rotation Delta Threshold");
+                        m_match_game_fov_camera_cut_stabilizer_location_delta->draw("Cut Location Delta Threshold");
+                    }
+                }
+
+                if (m_match_game_fov_dolly->value() &&
+                    ImGui::CollapsingHeader("Generic Camera Presets")) {
+                    m_match_game_fov_generic_camera_presets->draw("Enable Generic Camera Presets");
+                    if (m_match_game_fov_generic_camera_presets->value()) {
+                        m_match_game_fov_generic_camera_presets_auto_apply->draw("Auto Apply Saved Camera Presets");
+
+                        if (ImGui::Button("Save Current Generic Camera Preset")) {
+                            save_current_generic_camera_preset();
+                        }
+
+                        ImGui::SameLine();
+
+                        if (ImGui::Button("Clear Current Generic Camera Preset")) {
+                            clear_current_generic_camera_preset();
+                        }
+                    }
+                }
+
+                if (is_prospi_executable() && m_match_game_fov_dolly->value() &&
+                    ImGui::CollapsingHeader("ProSpi Actual FOV Clamp", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    m_match_game_fov_prospi_actual_clamp->draw("Clamp Actual Game FOV (ProSpi)");
+                    if (m_match_game_fov_prospi_actual_clamp->value()) {
+                        m_match_game_fov_prospi_actual_min->draw("Default ProSpi Actual Minimum FOV");
+                        m_match_game_fov_prospi_center_field_actual_min->draw("Center Field Minimum FOV");
+                        m_match_game_fov_prospi_upper_deck_actual_min->draw("Upper Deck Minimum FOV");
+                        m_match_game_fov_prospi_plate_high_actual_min->draw("High Plate Minimum FOV");
+                        m_match_game_fov_prospi_deep_outfield_actual_min->draw("Deep Outfield Minimum FOV");
+                    }
+                }
+
+                if (is_prospi_executable() &&
+                    ImGui::CollapsingHeader("ProSpi Telephoto Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    m_match_game_fov_prospi_telephoto_perf_override->draw("Enable Telephoto Performance Override");
+                    if (m_match_game_fov_prospi_telephoto_perf_override->value()) {
+                        m_match_game_fov_prospi_telephoto_perf_trigger_fov->draw("Telephoto Trigger FOV");
+                        m_match_game_fov_prospi_telephoto_perf_view_distance_scale->draw("Telephoto View Distance Scale");
+                        m_match_game_fov_prospi_telephoto_perf_static_mesh_lod_distance_scale->draw("Telephoto Static Mesh LOD Distance Scale");
+                        m_match_game_fov_prospi_telephoto_perf_skeletal_mesh_lod_bias->draw("Telephoto Skeletal Mesh LOD Bias");
+                    }
+                }
+
+                if (is_prospi_executable() && m_match_game_fov_dolly->value() &&
+                    ImGui::CollapsingHeader("ProSpi Dolly Overrides", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    m_match_game_fov_prospi_tv_dolly_override->draw("Auto Override TV View Dolly");
+                    if (m_match_game_fov_prospi_tv_dolly_override->value()) {
+                        m_match_game_fov_prospi_tv_dolly_distance->draw_drag("TV View Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_opening_aerial_dolly_override->draw("Auto Override Opening Aerial Dolly");
+                    if (m_match_game_fov_prospi_opening_aerial_dolly_override->value()) {
+                        m_match_game_fov_prospi_opening_aerial_dolly_distance->draw_drag("Opening Aerial Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_behind_plate_wide_dolly_override->draw("Auto Override Behind Plate Wide Dolly");
+                    if (m_match_game_fov_prospi_behind_plate_wide_dolly_override->value()) {
+                        m_match_game_fov_prospi_behind_plate_wide_dolly_distance->draw_drag("Behind Plate Wide Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_home_plate_waist_high_reverse_dolly_override->draw("Auto Override Waist High Reverse Dolly");
+                    if (m_match_game_fov_prospi_home_plate_waist_high_reverse_dolly_override->value()) {
+                        m_match_game_fov_prospi_home_plate_waist_high_reverse_dolly_distance->draw_drag("Waist High Reverse Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_low_plate_corner_dolly_override->draw("Auto Override Low Infield Close-Up Dolly");
+                    if (m_match_game_fov_prospi_low_plate_corner_dolly_override->value()) {
+                        m_match_game_fov_prospi_low_plate_corner_dolly_distance->draw_drag("Low Infield Close-Up Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_center_field_dolly_override->draw("Auto Override Center Field Dolly");
+                    if (m_match_game_fov_prospi_center_field_dolly_override->value()) {
+                        m_match_game_fov_prospi_center_field_dolly_distance->draw_drag("Center Field Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_center_field_high_dolly_override->draw("Auto Override Center Field High Dolly");
+                    if (m_match_game_fov_prospi_center_field_high_dolly_override->value()) {
+                        m_match_game_fov_prospi_center_field_high_dolly_distance->draw_drag("Center Field High Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_left_field_corner_wide_dolly_override->draw("Auto Override Offset Center Field Dolly");
+                    if (m_match_game_fov_prospi_left_field_corner_wide_dolly_override->value()) {
+                        m_match_game_fov_prospi_left_field_corner_wide_dolly_distance->draw_drag("Offset Center Field Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_deep_outfield_dolly_override->draw("Auto Override Deep Outfield Dolly");
+                    if (m_match_game_fov_prospi_deep_outfield_dolly_override->value()) {
+                        m_match_game_fov_prospi_deep_outfield_dolly_distance->draw_drag("Deep Outfield Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_home_plate_sky_dolly_override->draw("Auto Override Home Plate Sky Dolly");
+                    if (m_match_game_fov_prospi_home_plate_sky_dolly_override->value()) {
+                        m_match_game_fov_prospi_home_plate_sky_dolly_distance->draw_drag("Home Plate Sky Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_upper_deck_dolly_override->draw("Auto Override Upper Deck 3B Dolly");
+                    if (m_match_game_fov_prospi_upper_deck_dolly_override->value()) {
+                        m_match_game_fov_prospi_upper_deck_dolly_distance->draw_drag("Upper Deck 3B Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_home_sky_dolly_override->draw("Auto Override Home Sky Dolly");
+                    if (m_match_game_fov_prospi_home_sky_dolly_override->value()) {
+                        m_match_game_fov_prospi_home_sky_dolly_distance->draw_drag("Home Sky Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_third_base_dolly_override->draw("Auto Override Third Base Line Dolly");
+                    if (m_match_game_fov_prospi_third_base_dolly_override->value()) {
+                        m_match_game_fov_prospi_third_base_dolly_distance->draw_drag("Third Base Line Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_third_base_relay_low_dolly_override->draw("Auto Override Third Base Relay Low Dolly");
+                    if (m_match_game_fov_prospi_third_base_relay_low_dolly_override->value()) {
+                        m_match_game_fov_prospi_third_base_relay_low_dolly_distance->draw_drag("Third Base Relay Low Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_third_base_sweep_dolly_override->draw("Auto Override Third Base Corner Low Dolly");
+                    if (m_match_game_fov_prospi_third_base_sweep_dolly_override->value()) {
+                        m_match_game_fov_prospi_third_base_sweep_dolly_distance->draw_drag("Third Base Corner Low Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_third_base_wide_dolly_override->draw("Auto Override Third Base Wide Dolly");
+                    if (m_match_game_fov_prospi_third_base_wide_dolly_override->value()) {
+                        m_match_game_fov_prospi_third_base_wide_dolly_distance->draw_drag("Third Base Wide Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_first_base_dolly_override->draw("Auto Override First Base Line Dolly");
+                    if (m_match_game_fov_prospi_first_base_dolly_override->value()) {
+                        m_match_game_fov_prospi_first_base_dolly_distance->draw_drag("First Base Line Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_first_base_wide_dolly_override->draw("Auto Override First Base Wide Dolly");
+                    if (m_match_game_fov_prospi_first_base_wide_dolly_override->value()) {
+                        m_match_game_fov_prospi_first_base_wide_dolly_distance->draw_drag("First Base Wide Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_first_base_corner_low_dolly_override->draw("Auto Override First Base Corner Low Dolly");
+                    if (m_match_game_fov_prospi_first_base_corner_low_dolly_override->value()) {
+                        m_match_game_fov_prospi_first_base_corner_low_dolly_distance->draw_drag("First Base Corner Low Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_backstop_high_dolly_override->draw("Auto Override Backstop High Dolly");
+                    if (m_match_game_fov_prospi_backstop_high_dolly_override->value()) {
+                        m_match_game_fov_prospi_backstop_high_dolly_distance->draw_drag("Backstop High Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_right_field_corner_dolly_override->draw("Auto Override Right Field Corner Dolly");
+                    if (m_match_game_fov_prospi_right_field_corner_dolly_override->value()) {
+                        m_match_game_fov_prospi_right_field_corner_dolly_distance->draw_drag("Right Field Corner Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_right_center_field_dolly_override->draw("Auto Override Right Center Field Dolly");
+                    if (m_match_game_fov_prospi_right_center_field_dolly_override->value()) {
+                        m_match_game_fov_prospi_right_center_field_dolly_distance->draw_drag("Right Center Field Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_plate_high_dolly_override->draw("Auto Override High Plate Dolly");
+                    if (m_match_game_fov_prospi_plate_high_dolly_override->value()) {
+                        m_match_game_fov_prospi_plate_high_dolly_distance->draw_drag("High Plate Dolly Distance", 10.0f, "%.0f");
+                    }
+                    m_match_game_fov_prospi_home_plate_overhead_dolly_override->draw("Auto Override Home Plate Overhead Dolly");
+                    if (m_match_game_fov_prospi_home_plate_overhead_dolly_override->value()) {
+                        m_match_game_fov_prospi_home_plate_overhead_dolly_distance->draw_drag("Home Plate Overhead Dolly Distance", 10.0f, "%.0f");
+                    }
+                }
+
+                if (m_match_game_fov_dolly->value() &&
+                    ImGui::CollapsingHeader("Camera Calibration", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    m_match_game_fov_prospi_camera_calibration_auto->draw("Auto Apply Camera Calibration");
+                    if (ImGui::Button("Save Current Camera Calibration")) {
+                        save_current_prospi_camera_calibration();
+                    }
+
+                    ImGui::SameLine();
+
+                    if (ImGui::Button("Clear Current Camera Calibration")) {
+                        clear_current_prospi_camera_calibration();
+                    }
+
+                    if (is_prospi_executable()) {
+                        ImGui::SameLine();
+
+                        if (ImGui::Button("Clear Current Preset Calibrations")) {
+                            clear_current_prospi_preset_calibrations();
+                        }
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Live Status", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const auto fov = get_game_fov();
+                    const auto raw_fov = m_game_fov_raw.load(std::memory_order_relaxed);
+                    const bool fov_valid = m_game_fov_valid.load(std::memory_order_relaxed);
+                    const auto current_camera_id = get_current_game_camera_id();
+                    const auto calibration_applied = m_match_game_fov_prospi_calibration_applied.load(std::memory_order_relaxed);
+                    const auto calibration_multiplier = m_match_game_fov_prospi_calibration_multiplier_active.load(std::memory_order_relaxed);
+                    const auto calibration_dolly_distance = m_match_game_fov_prospi_calibration_dolly_distance_active.load(std::memory_order_relaxed);
+                    const auto read_only_active = m_match_game_fov_read_only_camera_active.load(std::memory_order_relaxed);
+                    const auto would_write = m_match_game_fov_would_write_game_camera.load(std::memory_order_relaxed);
+                    const auto stabilizer_active = m_match_game_fov_camera_cut_stabilizer_active.load(std::memory_order_relaxed);
+                    const auto stabilizer_remaining_ms = m_match_game_fov_camera_cut_stabilizer_remaining_ms.load(std::memory_order_relaxed);
+                    const auto generic_preset_applied = m_match_game_fov_generic_camera_preset_applied.load(std::memory_order_relaxed);
+                    ImGui::Text("Current Game FOV: %.2f (%s)", fov, fov_valid ? "valid" : "invalid");
+                    ImGui::Text("Raw Game FOV: %.2f", raw_fov);
+                    ImGui::Text("Current Camera ID: %s", current_camera_id.empty() ? "None" : current_camera_id.c_str());
+                    ImGui::Text("Read-Only Camera Active: %s", read_only_active ? "yes" : "no");
+                    ImGui::Text("Blocked Game FOV Write Pending: %s", would_write ? "yes" : "no");
+                    ImGui::Text("Camera Cut Stabilizer: %s (%dms)", stabilizer_active ? "active" : "inactive", stabilizer_remaining_ms);
+                    ImGui::Text("Generic Camera Preset Applied: %s", generic_preset_applied ? "yes" : "no");
+                    ImGui::Text("Camera Calibration Applied: %s", calibration_applied ? "yes" : "no");
+                    if (calibration_applied) {
+                        ImGui::Text("Calibration Multiplier: %.2f", calibration_multiplier);
+                        ImGui::Text("Calibration Dolly Distance: %.2f", calibration_dolly_distance);
+                    }
+                }
+
+                if (is_prospi_executable() && m_match_game_fov_dolly->value() &&
+                    ImGui::CollapsingHeader("ProSpi Live Status", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const auto preset = (ProSpiCameraPreset)m_match_game_fov_prospi_preset.load(std::memory_order_relaxed);
+                    const auto active_min = m_match_game_fov_prospi_actual_min_active.load(std::memory_order_relaxed);
+                    const auto calibration_applied = m_match_game_fov_prospi_calibration_applied.load(std::memory_order_relaxed);
+                    const auto calibration_min = m_match_game_fov_prospi_calibration_actual_min_active.load(std::memory_order_relaxed);
+                    const auto calibration_multiplier = m_match_game_fov_prospi_calibration_multiplier_active.load(std::memory_order_relaxed);
+                    const auto calibration_dolly_distance = m_match_game_fov_prospi_calibration_dolly_distance_active.load(std::memory_order_relaxed);
+                    const auto tv_override_applied = m_match_game_fov_prospi_tv_override_active.load(std::memory_order_relaxed);
+                    const auto auto_dolly_distance = m_match_game_fov_prospi_auto_dolly_distance_active.load(std::memory_order_relaxed);
+                    const auto telephoto_perf_active = m_match_game_fov_prospi_telephoto_perf_active.load(std::memory_order_relaxed);
+                    const auto current_camera_id = get_current_prospi_camera_id();
+                    ImGui::Text("Active ProSpi Preset: %s", get_prospi_camera_preset_name(preset));
+                    if (m_match_game_fov_prospi_actual_clamp->value()) {
+                        ImGui::Text("Active ProSpi Minimum FOV: %.2f", active_min);
+                    }
+                    ImGui::Text("Current ProSpi Camera ID: %s", current_camera_id.empty() ? "None" : current_camera_id.c_str());
+                    ImGui::Text("Calibration Applied: %s", calibration_applied ? "yes" : "no");
+                    ImGui::Text("TV Override Active: %s", tv_override_applied ? "yes" : "no");
+                    ImGui::Text("Telephoto Performance Override: %s", telephoto_perf_active ? "yes" : "no");
+                    ImGui::Text("Auto Dolly Override Distance: %.2f", auto_dolly_distance);
+                    if (calibration_applied) {
+                        ImGui::Text("Calibration Minimum FOV: %.2f", calibration_min);
+                        ImGui::Text("Calibration Multiplier: %.2f", calibration_multiplier);
+                        ImGui::Text("Calibration Dolly Distance: %.2f", calibration_dolly_distance);
+                    }
+                }
+            }
+
+            ImGui::TreePop();
+        }
+
+        // No-op under 3D Display mode: lerping smooths the HMD pose against the
+        // game camera, and flat3d has no headset pose to smooth.
+        const bool show_camera_lerp = !is_using_flat3d();
+
+        if (show_camera_lerp) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+        }
+
+        if (show_camera_lerp && ImGui::TreeNode("Camera Lerp")) {
             m_lerp_camera_pitch->draw("Lerp Pitch");
             ImGui::SameLine();
             m_lerp_camera_yaw->draw("Lerp Yaw");
@@ -3256,6 +6061,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         }
     }
 
+    if (selected_page == PAGE_MONITOR3D) {
+        on_draw_sidebar_flat3d();
+    }
+
     if (selected_page == PAGE_CONSOLE) {
         m_cvar_manager->on_draw_ui();
     }
@@ -3264,9 +6073,30 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
         if (ImGui::TreeNode("Compatibility Options")) {
             m_compatibility_ahud->draw("AHUD UI Compatibility");
+            m_overlay_component.draw_ui_invert_alpha("UI Invert Alpha");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Inverts/blends the game UI's alpha so it composites correctly\n"
+                                  "(0 = off). Needed by some titles for HUD/UI visibility.");
+            }
+            m_flat3d_ui_color_gate->draw("UI Color Gate");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Zeroes the game UI's alpha where it has (almost) no color. Fixes the\n"
+                                  "dark film over the whole scene when using UI Invert Alpha 0.5 (that\n"
+                                  "collapses every pixel's alpha to a flat 0.5, including the empty\n"
+                                  "screen): drawn UI has color, empty screen doesn't. Also keeps the\n"
+                                  "full-screen-menu detector and the adaptive-HUD classifier working\n"
+                                  "under a partial invert. Try 0.03-0.08; 0 = off. Side effect: pure-\n"
+                                  "black opaque UI (dark panels) turns transparent - keep the gate low.");
+            }
             m_compatibility_skip_uobjectarray_init->draw("Skip UObjectArray Init");
             m_compatibility_skip_pip->draw("Skip PostInitProperties");
             m_sceneview_compatibility_mode->draw("SceneView Compatibility Mode");
+            m_compatibility_single_view_render_target->draw("Single-View Render Target (3D Display, AFR)");
+            if (m_compatibility_single_view_render_target->value()) {
+                ImGui::TextWrapped(
+                    "Advertises a single-eye render target instead of the double-wide. Fixes AFR modes that "
+                    "draw only the left half of the frame (Fantasy Life i).");
+            }
             m_extreme_compat_mode->draw("Extreme Compatibility Mode");
 
             // changes to any of these options should trigger a regeneration of the eye projection matrices
@@ -3385,30 +6215,34 @@ void VR::on_draw_ui() {
         return;
     }
 
-    if (ImGui::Button("Set Standing Height")) {
-        m_standing_origin.y = get_position(0).y;
-    }
+    // These are HMD-runtime controls (tracked standing origin / recenter /
+    // reinitialize) — meaningless in Flat3D (3D Display) mode, so hide the row.
+    if (!is_using_flat3d()) {
+        if (ImGui::Button("Set Standing Height")) {
+            m_standing_origin.y = get_position(0).y;
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Set Standing Origin")) {
-        m_standing_origin = get_position(0);
-    }
+        if (ImGui::Button("Set Standing Origin")) {
+            m_standing_origin = get_position(0);
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Recenter View")) {
-        recenter_view();
-    }
+        if (ImGui::Button("Recenter View")) {
+            recenter_view();
+        }
 
-    ImGui::SameLine();
+        ImGui::SameLine();
 
-    if (ImGui::Button("Recenter Horizon")) {
-        recenter_horizon();
-    }
+        if (ImGui::Button("Recenter Horizon")) {
+            recenter_horizon();
+        }
 
-    if (ImGui::Button("Reinitialize Runtime")) {
-        get_runtime()->wants_reinitialize = true;
+        if (ImGui::Button("Reinitialize Runtime")) {
+            get_runtime()->wants_reinitialize = true;
+        }
     }
 }
 

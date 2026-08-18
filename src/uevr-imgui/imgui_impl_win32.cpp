@@ -362,7 +362,11 @@ void    ImGui_ImplWin32_NewFrame()
 
     IM_ASSERT(io.Fonts->IsBuilt() && "Font atlas not built! It is generally built by the renderer backend. Missing call to renderer _NewFrame() function? e.g. ImGui_ImplOpenGL3_NewFrame().");
 
-    // Setup display size (every frame to accommodate for window resizing)
+    // Setup display size (every frame to accommodate for window resizing).
+    // NOTE: under Flat3D's Native Render + Upscale mode the client rect is
+    // spoofed half-width, so the menu lays out into the top-left half of its
+    // (full-width) target — the compositor's half_stretch left-crop samples
+    // exactly that region back out, so the menu lands correct in each eye.
     RECT rect = { 0, 0, 0, 0 };
     ::GetClientRect(g_hWnd, &rect);
     io.DisplaySize = ImVec2((float)(rect.right - rect.left), (float)(rect.bottom - rect.top));

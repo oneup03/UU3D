@@ -337,8 +337,12 @@ void CommandContext::execute() {
     std::scoped_lock _{this->mtx};
     
     if (this->has_commands) {
-        if (FAILED(this->cmd_list->Close())) {
-            spdlog::error("[VR] Failed to close command list. ({})", utility::narrow(this->internal_name));
+        const auto close_result = this->cmd_list->Close();
+        this->last_close_failed = FAILED(close_result); // consumed by the Flat3D compositor
+
+        if (FAILED(close_result)) {
+            spdlog::error("[VR] Failed to close command list. ({} hr=0x{:08x})",
+                          utility::narrow(this->internal_name), static_cast<uint32_t>(close_result));
             return;
         }
         

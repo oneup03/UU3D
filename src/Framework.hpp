@@ -175,6 +175,11 @@ public:
 
     auto get_font_size() const { return m_font_size; }
 
+    // 3D Display mode: the flat3d compositor consumed the IMGUI render
+    // target as an in-eye layer this frame — the flat backbuffer menu draw
+    // is skipped for that frame (re-asserted every frame during on_present).
+    void set_flat3d_menu_composited(bool v) { m_flat3d_menu_composited = v; }
+
     int add_font(const std::filesystem::path& filepath, int size, const std::vector<ImWchar>& ranges = {});
 
     ImFont* get_font(int index) const {
@@ -305,8 +310,11 @@ private:
     };
 
     bool m_fonts_need_updating{true};
-    int m_font_size{16};
+    int m_font_size{24};
     std::vector<AdditionalFont> m_additional_fonts{};
+
+    // See set_flat3d_menu_composited.
+    bool m_flat3d_menu_composited{false};
 
     std::recursive_mutex m_input_mutex{};
     std::recursive_mutex m_config_mtx{};

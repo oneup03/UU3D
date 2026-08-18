@@ -9,6 +9,7 @@
 
 #include "vr/runtimes/OpenVR.hpp"
 #include "vr/runtimes/OpenXR.hpp"
+#include "vr/runtimes/Flat3D.hpp"
 
 #include "vr/D3D11Component.hpp"
 #include "vr/D3D12Component.hpp"
@@ -32,6 +33,18 @@ public:
     CameraData cameraData[2];
     CameraDataMVCorrection cameraDataForMV[2];
     D3D12RendererAPI* d3d12Renderer = nullptr;
+    // AFW init is retried until it succeeds: the plugin device + raw D3D12 hooks
+    // once (m_framewarp_device_initialized), and the DLSS/NGX hooks once nvngx.dll
+    // has loaded (m_ngx_hooks_installed — it loads lazily when the game first uses
+    // DLSS, which can be well after the VR mod initializes).
+    bool m_framewarp_device_initialized = false;
+    bool m_ngx_hooks_installed = false;
+
+    // Plugin-free capture of the DLSS input depth for the Flat3D "DLSS Depth"
+    // source: an owned per-eye copy made with our OWN D3D12 (game device +
+    // CopyResource on the game's command list), independent of PDAFWPlugin.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_dlss_depth[2]{};
+    std::mutex m_dlss_depth_mutex{};
 
     ID3D12Resource* rawDepthTex = NULL;
     ID3D12Resource* rawMotionVectorsTex = NULL;
@@ -84,6 +97,9 @@ public:
     float get_sharpness() { return m_sharpness->value(); };
 
     float get_ignore_motion_threshold() { return m_ignore_motion_threshold->value(); };
+
+    bool is_left_eye() { return m_frame_count % 2 == m_left_eye_interval; };
+    uint8_t get_left_eye_interval() const { return m_left_eye_interval; };
 
     bool is_use_uint64() { return m_use_uint64->value(); };
     bool is_fix_object_motion_vector() { return m_fix_object_motion_vector->value(); };
@@ -207,6 +223,20 @@ public:
         return clean_initialize();
     }
 
+    // AFW (Async Frame Warp) plugin + DLSS/NGX hook init. Idempotent and retryable:
+    // runs for every runtime (incl. Flat3D) and re-attempts the NGX hooks each frame
+    // until nvngx.dll is present. Safe when the plugin is the no-op dummy (InitDevice
+    // returns null -> AFW stays disabled instead of crashing).
+    void init_framewarp_module();
+
+    // Snapshot the DLSS input depth into m_dlss_depth[eye] using our own D3D12
+    // (no plugin), recorded onto the game's command list. Called from the NGX
+    // EvaluateFeature hook when the Flat3D "DLSS Depth" source is selected.
+    void capture_dlss_depth_copy(ID3D12GraphicsCommandList* cmd_list, ID3D12Resource* depth, int eye);
+    // The owned copy for a given eye (AddRef'd under the lock), or null. In
+    // D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.
+    Microsoft::WRL::ComPtr<ID3D12Resource> get_dlss_depth_copy(int eye);
+
     std::vector<SidebarEntryInfo> get_sidebar_entries() override {
         return {
             {"Runtime", false},
@@ -214,6 +244,7 @@ public:
             {"Input", false},
             {"Camera", false},
             {"Keybinds", false},
+            {"3D Display", false},
             {"Console/CVars", true},
             {"Compatibility", true},
             {"Debug", true},
@@ -243,6 +274,14 @@ public:
 
         if (m_fake_stereo_hook != nullptr) {
             m_fake_stereo_hook->on_device_reset();
+        }
+
+        // Drop our owned DLSS depth copies; they're lazily re-created on the next
+        // capture (also self-heals on a resolution change via the size check).
+        {
+            std::scoped_lock lock(m_dlss_depth_mutex);
+            m_dlss_depth[0].Reset();
+            m_dlss_depth[1].Reset();
         }
 
         if (m_is_d3d12) {
@@ -361,6 +400,21 @@ public:
     runtimes::OpenVR* get_openvr_runtime() const {
         return m_openvr.get();
     }
+
+    runtimes::Flat3D* get_flat3d_runtime() const {
+        return m_flat3d.get();
+    }
+
+    bool is_using_flat3d() const {
+        return m_runtime != nullptr && m_runtime->is_flat3d();
+    }
+
+    // Queues a 3D screenshot of the next composited stereo frame (Ctrl+F12 /
+    // the menu-header button drawn by Framework).
+    void request_flat3d_screenshot();
+
+    float get_flat3d_opentrack_rot_scale() const { return m_flat3d_opentrack_rot_scale->value(); }
+    float get_flat3d_opentrack_pos_scale() const { return m_flat3d_opentrack_pos_scale->value(); }
 
     bool is_hmd_active() const {
         if (m_disable_vr) {
@@ -558,8 +612,91 @@ public:
         return m_depth_scale->value();
     }
 
+    // Resolve the effective near clipping plane for the Flat3D stereo/depth
+    // path. Wraps the SDK's GNearClippingPlane scan so the UESDK submodule can
+    // stay pristine: on obfuscated/inlined builds where the scan fails (e.g.
+    // Expedition 33) the SDK returns its 1.0 dummy, so we substitute the game's
+    // r.SetNearClipPlane cvar (if it set one) or UE's own default of 10.
+    // An explicit Custom Z Near override is always honored verbatim.
+    float flat3d_effective_nearz();
+
     bool is_depth_enabled() const {
         return m_enable_depth->value();
+    }
+
+    // Flat3D scene-depth source for the Adaptive Crosshair / HUD-depth /
+    // Auto-Convergence features.
+    enum Flat3DDepthSource : int32_t {
+        FLAT3D_DEPTH_PER_DRAW = 0,     // API-level per-draw capture (safe default)
+        FLAT3D_DEPTH_ENGINE_POOL = 1,  // UE render-target pool SceneDepthZ (engine hook)
+        FLAT3D_DEPTH_DSV_OBSERVER = 2, // D3D12Hook DSV/barrier observer snapshot (no engine hook)
+        FLAT3D_DEPTH_DLSS = 3,         // our own copy of the game's DLSS input depth (any mode)
+    };
+
+    int32_t flat3d_depth_source() const {
+        const auto v = m_flat3d_depth_source->value();
+
+        // Legacy promotion: configs saved before the combo existed used the
+        // Flat3D_UseEngineDepth toggle. Honor it while the combo still sits at
+        // its default; the UI mirrors the toggle on any explicit combo change.
+        if (v == FLAT3D_DEPTH_PER_DRAW && m_flat3d_use_engine_depth->value()) {
+            return FLAT3D_DEPTH_ENGINE_POOL;
+        }
+
+        return v;
+    }
+
+    bool flat3d_use_engine_depth() const {
+        return flat3d_depth_source() == FLAT3D_DEPTH_ENGINE_POOL;
+    }
+
+    // Multiplier applied to the game's live FoV when the render frustum is
+    // rebuilt. 1.0 = use the game camera's FoV unchanged.
+    float flat3d_fov_multiplier() const {
+        const auto v = m_flat3d_fov_multiplier->value();
+        return (std::isfinite(v) && v > 0.05f) ? v : 1.0f;
+    }
+
+    // 3D render resolution as a fraction of native, applied through
+    // r.ScreenPercentage (see flat3d_apply_screen_percentage) — it does NOT size
+    // the stereo target. 0 = Auto: leave the engine's screen percentage alone.
+    float flat3d_render_scale() const {
+        const auto v = (size_t)m_flat3d_render_scale->value();
+        return v < s_flat3d_render_scale_values.size() ? s_flat3d_render_scale_values[v] : 0.0f;
+    }
+
+    // Raw Flat3D output mode (vrmod::flat3d::Flat3DOutputMode). Returned as int
+    // to avoid pulling the compositor header into VR.hpp; callers classify it.
+    int32_t flat3d_output_mode_value() const {
+        return (int32_t)m_flat3d_output_mode->value();
+    }
+
+    // The 3D output always holds on the PRIMARY display (3D users keep the 3D
+    // panel primary); this makes the native-output hold deterministic.
+    bool flat3d_output_on_primary() const {
+        return true;
+    }
+
+    // True when we detected a real full-SbS double-wide panel (drives Native
+    // Render + Upscale automatically).
+    bool flat3d_is_full_sbs() const {
+        return m_flat3d_full_sbs.load(std::memory_order_acquire);
+    }
+
+
+    // The DSV-observer depth source is D3D12-only. It installs no engine hook
+    // (unlike the pool path) and sees depth allocated at any time (unlike the
+    // per-draw path).
+    bool flat3d_wants_dsv_depth() const {
+        return flat3d_depth_source() == FLAT3D_DEPTH_DSV_OBSERVER && m_is_d3d12;
+    }
+
+    // The "DLSS Depth" source snapshots the game's DLSS input depth into our own
+    // per-eye copy (m_dlss_depth[], via capture_dlss_depth_copy in the NGX hook) —
+    // the exact render-res scene depth the game feeds DLSS. Plugin-free and works
+    // in any rendering method (not just AFW). D3D12-only; needs DLSS active in-game.
+    bool flat3d_wants_dlss_depth() const {
+        return flat3d_depth_source() == FLAT3D_DEPTH_DLSS && m_is_d3d12;
     }
 
     bool is_decoupled_pitch_enabled() const {
@@ -652,6 +789,50 @@ public:
         return m_splitscreen_view_index->value();
     }
 
+    // Flat3D single-view render target. In AFR/Synced/AFW the engine renders ONE
+    // view per frame, and it sizes that view's VIEWPORT from the whole stereo
+    // target: with a 2W surface it spans 2W while only the left half is covered,
+    // so we read the left portion of a frame cut at the halfway line (widening
+    // the FoV rescales inside the cut instead of revealing the right side —
+    // Fantasy Life i). Advertising a single-eye surface makes viewport == eye
+    // rect. NOT for Native Stereo Fix: that still builds two views (the second is
+    // redirected to the scene capture) and a half-width surface renders nothing.
+    // Pair with 3D Render Resolution = 100%, or the surface still disagrees with
+    // the scale the engine lays the scene out at.
+    // One view per frame owns the WHOLE stereo surface (Alternating, Synced
+    // Sequential, AFW, and Extreme Compatibility, which reads one backbuffer at
+    // a time) — so a double-wide target leaves the engine's viewport spanning 2W
+    // with only the left half covered. Native Stereo renders both views into the
+    // double-wide and must keep it.
+    //
+    // The Native Stereo Fix checkbox is deliberately NOT consulted: NSF only
+    // does anything in Native Stereo, so testing it here would silently disable
+    // single-view for an AFR run just because the box was left ticked.
+    bool flat3d_single_view_target() const {
+        return m_compatibility_single_view_render_target->value() &&
+               is_using_flat3d() && is_using_afr();
+    }
+
+    // Drives the screen percentage from the 3D Render Resolution combo.
+    void flat3d_apply_screen_percentage();
+
+    // Which stage the render resolution drives: 0 = primary (r.ScreenPercentage,
+    // the upscaler's own input resolution), 1 = secondary (a separate pass after
+    // the temporal upscale, so it stacks with DLSS instead of fighting it),
+    // 2 = shrink our stereo render target directly (legacy).
+    int32_t flat3d_render_scale_stage() const {
+        return (int32_t)m_flat3d_render_scale_stage->value();
+    }
+
+    // Legacy stage: size the stereo target by the percentage instead of asking
+    // the engine to render less. Kept because some titles honour neither screen
+    // percentage cvar (Jedi Survivor), but it can leave the frame a top-left
+    // corner of a full-size render when the engine sizes scene work from its
+    // viewport rather than from the target we hand it.
+    bool flat3d_render_scale_sizes_target() const {
+        return flat3d_render_scale_stage() == 2 && flat3d_render_scale() > 0.0f;
+    }
+
     bool is_sceneview_compatibility_enabled() const {
         return m_sceneview_compatibility_mode->value();
     }
@@ -687,7 +868,9 @@ public:
     }
 
     bool is_using_2d_screen() const {
-        return m_2d_screen_mode->value();
+        // Mutually exclusive with 3D Display mode (which reuses its view-path
+        // neutralization but owns the projection and presentation).
+        return m_2d_screen_mode->value() && !is_using_flat3d();
     }
 
     bool is_roomscale_enabled() const {
@@ -746,6 +929,11 @@ public:
         return m_vertical_projection_override->value();
     }
 
+    // World-marker HUD: post-hook body for the projection UFunction hooks
+    // (the raw callback is a free function in VR_Flat3D.cpp; this needs
+    // member access). ufunction is an sdk::UFunction*.
+    void flat3d_marker_hook_post(void* ufunction, void* params);
+
     bool should_grow_rectangle_for_projection_cropping() const {
         return m_grow_rectangle_for_projection_cropping->value();
     }
@@ -773,6 +961,38 @@ private:
     std::optional<std::string> initialize_openxr();
     std::optional<std::string> initialize_openxr_input();
     std::optional<std::string> initialize_openxr_swapchains();
+
+    // Flat 3D monitor mode (implemented in VR_Flat3D.cpp)
+    std::optional<std::string> initialize_flat3d();
+    void on_draw_sidebar_flat3d();
+    void handle_flat3d_keybinds();
+    void update_flat3d_params(); // per-frame effective separation/convergence
+    void update_flat3d_ensure_windowed(); // Katanga: force the game into a normal window
+    // Samples the game camera's live FoV (deg, horizontal) via
+    // APlayerCameraManager::GetFOVAngle. Game thread only (ProcessEvent);
+    // returns fallback_deg when no world/camera is available yet.
+    float sample_flat3d_game_fov(float fallback_deg);
+    // Reads APlayerController::bShowMouseCursor (drives the stereo cursor).
+    // Game thread only; returns fallback when no world/controller yet.
+    bool sample_flat3d_show_cursor(bool fallback);
+    bool sample_flat3d_fov_is_vertical(bool fallback);
+    std::optional<bool> camera_component_fov_is_vertical();
+
+    // Screen-percentage state: the value we last wrote (0 = we are not managing
+    // it, so Auto leaves whatever the game does alone) and the stage we wrote it
+    // to, so a stage switch can hand the previous one back first.
+    int32_t m_flat3d_screen_percentage_applied{0};
+    int32_t m_flat3d_screen_percentage_mode{0};
+    bool sample_flat3d_game_paused(bool fallback);
+    // Samples the camera position/forward and publishes the HUD marker
+    // anchors collected this frame. Game thread only.
+    void sample_flat3d_camera_and_publish_anchors();
+    // Installs the ProjectWorldLocationToScreen / ProjectWorldToScreen
+    // UFunction hooks that feed the world-marker HUD mode. Idempotent.
+    void setup_flat3d_marker_hooks();
+    // Per-frame parameter block for the D3D compositors (UI/crosshair shifts,
+    // HDR colorspace comes from the component side).
+    vrmod::flat3d::Flat3DFrameParams build_flat3d_frame_params(uint32_t eye_w, uint32_t eye_h);
 
     bool detect_controllers();
     bool is_any_action_down();
@@ -844,6 +1064,7 @@ private:
     std::shared_ptr<VRRuntime> m_runtime{std::make_shared<VRRuntime>()}; // will point to the real runtime if it exists
     std::shared_ptr<runtimes::OpenVR> m_openvr{std::make_shared<runtimes::OpenVR>()};
     std::shared_ptr<runtimes::OpenXR> m_openxr{std::make_shared<runtimes::OpenXR>()};
+    std::shared_ptr<runtimes::Flat3D> m_flat3d{std::make_shared<runtimes::Flat3D>()};
 
     mutable TracyLockable(std::recursive_mutex, m_openvr_mtx);
     mutable TracyLockable(std::recursive_mutex, m_reinitialize_mtx);
@@ -995,7 +1216,29 @@ private:
         "Matched",
     };
 
-    const ModCombo::Ptr m_rendering_method{ ModCombo::create(generate_name("RenderingMethod"), s_rendering_method_names, RenderingMethod::ALTERNATE_FRAMEWARP) };
+    enum DesktopMirrorMode : int32_t {
+        DESKTOP_MIRROR_FULL = 0,
+        DESKTOP_MIRROR_SCENE_ONLY = 1,
+    };
+
+    static const inline std::vector<std::string> s_desktop_mirror_mode_names{
+        "Full",
+        "Scene Only",
+    };
+
+    enum Subnautica2NativeWaterMode : int32_t {
+        SUBNAUTICA2_NATIVE_WATER_SAFE_REFLECTIONS = 0,
+        SUBNAUTICA2_NATIVE_WATER_NO_REFLECTIONS = 1,
+        SUBNAUTICA2_NATIVE_WATER_DISABLE_SINGLE_LAYER = 2,
+    };
+
+    static const inline std::vector<std::string> s_subnautica2_native_water_mode_names{
+        "Native Water Safe Reflections",
+        "Native Water No Reflections",
+        "Disable SingleLayerWater Fallback",
+    };
+
+    const ModCombo::Ptr m_rendering_method{ ModCombo::create(generate_name("RenderingMethod"), s_rendering_method_names, RenderingMethod::NATIVE_STEREO) };
     const ModCombo::Ptr m_synced_afr_method{ ModCombo::create(generate_name("SyncedSequentialMethod"), s_synced_afr_method_names, 1) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
@@ -1111,6 +1354,7 @@ private:
     const ModInt32::Ptr m_splitscreen_view_index{ ModInt32::create(generate_name("SplitscreenViewIndex"), 0, true) };
 
     const ModToggle::Ptr m_sceneview_compatibility_mode{ ModToggle::create(generate_name("Compatibility_SceneView"), false, true) };
+    const ModToggle::Ptr m_compatibility_single_view_render_target{ ModToggle::create(generate_name("Compatibility_SingleViewRenderTarget"), false, true) };
 
     const ModToggle::Ptr m_compatibility_skip_pip{ ModToggle::create(generate_name("Compatibility_SkipPostInitProperties"), false, true) };
     const ModToggle::Ptr m_compatibility_skip_uobjectarray_init{ ModToggle::create(generate_name("Compatibility_SkipUObjectArrayInit"), false, true) };
@@ -1138,6 +1382,279 @@ private:
     const ModToggle::Ptr m_lerp_camera_yaw{ ModToggle::create(generate_name("LerpCameraYaw"), false) };
     const ModToggle::Ptr m_lerp_camera_roll{ ModToggle::create(generate_name("LerpCameraRoll"), false) };
     const ModSlider::Ptr m_lerp_camera_speed{ ModSlider::create(generate_name("LerpCameraSpeed"), 0.01f, 10.0f, 1.0f) };
+
+    // ------------------------------------------------------------------------
+    // Flat 3D monitor mode (FLAT3D runtime) settings. Kept as one contiguous
+    // block for upstream-rebase friendliness. Depth/Convergence/ReferenceFoV
+    // form one calibrated triple: depth & convergence are defined AT the
+    // reference FoV; separation is auto-scaled by tan(gameFov/2)/tan(refFov/2)
+    // every frame (always on).
+    static const inline std::vector<std::string> s_flat3d_output_mode_names{
+        "Side by Side",
+        "Top and Bottom",
+        "Row Interlaced",
+        "Column Interlaced",
+        "Checkerboard",
+        "LeiaSR (SR display)",
+        "Frame Packed 720p60",
+        "Frame Packed 1080p24",
+        "Frame Packed 1080p60",
+        "Dual Display",
+        "Dual Display (Flip)",
+        "Katanga (VR shared texture)",
+        "Anaglyph Red/Cyan",
+        "Anaglyph Red/Cyan (Dubois)",
+        "Anaglyph Red/Cyan (Deghosted)",
+        "Anaglyph Red/Cyan (Compromise)",
+        "Anaglyph Green/Magenta",
+        "Anaglyph Green/Magenta (Dubois)",
+        "Anaglyph Green/Magenta (Deghosted)",
+        "Anaglyph Blue/Amber",
+    };
+    static const inline std::vector<std::string> s_flat3d_crosshair_mode_names{
+        "Off",
+        "Game Crosshair",
+        "Laser Sight",
+    };
+    static const inline std::vector<std::string> s_flat3d_vsync_names{
+        "Use In-Game Setting",
+        "Force On",
+        "No-Tear Fast",
+    };
+    static const inline std::vector<std::string> s_flat3d_hud_depth_names{
+        "Flat (GUI Depth)",
+        "Depth-Adaptive (Auto-Classified)",
+        "World Markers (Auto-Detected)",
+    };
+
+    static const inline std::vector<std::string> s_flat3d_cursor_mode_names{
+        "None",
+        "GUI Depth",
+        "Geometry (Under Cursor)",
+    };
+
+    // Full-SbS UI aspect handling. Only engages when the game's UI target is a
+    // different aspect than the per-eye slice (the double-wide 32:9 case); on a
+    // normal 16:9 / half-SbS output every mode is a no-op.
+    //   Crop    - cover: sample the central per-eye-aspect slice, fill the eye
+    //             (correct for games that CONSTRAIN their HUD centrally, e.g. SMT5V)
+    //   Fit     - contain: scale the whole UI to fit, letterboxed (shows the FULL
+    //             menu at correct aspect for games that SPREAD it full-width)
+    //   Stretch - no crop: sample 1:1, accept the squish (full coverage)
+    static const inline std::vector<std::string> s_flat3d_ui_aspect_names{
+        "Crop to Center",
+        "Fit (Letterbox)",
+        "Stretch to Fill",
+    };
+
+
+    // Per-eye 3D render resolution as a fraction of the native output size.
+    // Auto preserves the game's own requested resolution (pre-rewrite) — but a
+    // game that boots already at native (or persists native after our
+    // borderless/native hold) never issues a sub-native request, so Auto
+    // degrades to native-per-eye. The explicit fractions override everything.
+    static const inline std::vector<std::string> s_flat3d_render_scale_names{
+        "Auto (In-Game Resolution)",
+        "100% of Display",
+        "75% of Display",
+        "67% of Display",
+        "50% of Display",
+        "33% of Display",
+    };
+    static constexpr inline std::array<float, 6> s_flat3d_render_scale_values{
+        0.0f, 1.0f, 0.75f, 2.0f / 3.0f, 0.5f, 1.0f / 3.0f,
+    };
+
+    const ModCombo::Ptr m_flat3d_output_mode{ ModCombo::create(generate_name("Flat3D_OutputMode"), s_flat3d_output_mode_names) };
+    const ModCombo::Ptr m_flat3d_render_scale{ ModCombo::create(generate_name("Flat3D_RenderResolution"), s_flat3d_render_scale_names, 0) };
+    static const inline std::vector<std::string> s_flat3d_render_scale_stage_names{
+        "Primary (r.ScreenPercentage)",
+        "Secondary (stacks with DLSS/TSR)",
+        "Stereo Render Target (legacy)",
+    };
+    const ModCombo::Ptr m_flat3d_render_scale_stage{ ModCombo::create(generate_name("Flat3D_RenderResolutionStage"), s_flat3d_render_scale_stage_names, 0) };
+    // Auto-detected each frame in the native-output block: true when the output
+    // is a real full-SbS double-wide panel (SbS mode on a ~32:9 display). Drives
+    // Native Render + Upscale automatically (spoof the engine to render native
+    // per-eye + top-left UI crop); no user toggle. False on 16:9 / half-SbS.
+    std::atomic<bool> m_flat3d_full_sbs{ false };
+    const ModToggle::Ptr m_flat3d_eye_swap{ ModToggle::create(generate_name("Flat3D_EyeSwap"), false) };
+    // Present-interval override. The 2x mode disables vsync AND caps the game
+    // at twice the display refresh so AFR/Synced Sequential update each eye
+    // at the full refresh rate.
+    // Default: No-Tear Fast (2) — on flip-model swapchains (all DX12, i.e. the
+    // common case) it is tear-free AND presents both AFR eye frames per
+    // refresh (t.MaxFPS auto-caps at 2x refresh under AFR, 1x under native).
+    // Force On stays for DX11 blit-model exclusive fullscreen, which tears at
+    // interval 0 no matter the flags.
+    const ModCombo::Ptr m_flat3d_vsync{ ModCombo::create(generate_name("Flat3D_VSyncOverride"), s_flat3d_vsync_names, 2) };
+    // HDR swapchains (PQ/scRGB) wash out the SDR-defined 3D output modes and
+    // color correction — ask the engine to switch HDR output off while on.
+    const ModToggle::Ptr m_flat3d_force_sdr{ ModToggle::create(generate_name("Flat3D_ForceSDR"), true) };
+    // Scales the Flat3D render FoV. The projection is rebuilt each frame from the
+    // GAME's live FoV (APlayerCameraManager::GetFOVAngle, so ADS zoom and cine
+    // cameras still drive it); this multiplies that, it does not replace it.
+    // 1.0 = untouched. Scales the HORIZONTAL tangent, and the vertical follows
+    // through the per-eye aspect, so it is a symmetric zoom with no stretch.
+    // NOTE: it is a tangent scale, not a degree scale — at a 90 deg hFoV, 2.0
+    // gives ~127 deg, not 180.
+    // Which axis APlayerCameraManager::GetFOVAngle refers to. Auto reads UE's own
+    // EAspectRatioAxisConstraint; the forced options are the escape hatch for
+    // games that override it per camera component.
+    static const inline std::vector<std::string> s_flat3d_fov_axis_names{
+        "Auto (engine constraint)",
+        "Horizontal",
+        "Vertical",
+    };
+    const ModCombo::Ptr m_flat3d_fov_axis{ ModCombo::create(generate_name("Flat3D_FOVAxis"), s_flat3d_fov_axis_names, 0) };
+    const ModSlider::Ptr m_flat3d_fov_multiplier{ ModSlider::create(generate_name("Flat3D_FOVMultiplier"), 0.5f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 0.5f, 0.1f) };
+    const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_reference_fov{ ModSlider::create(generate_name("Flat3D_ReferenceFOV"), 40.0f, 140.0f, 90.0f) };
+    const ModToggle::Ptr m_flat3d_autoconv_enabled{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
+    const ModSlider::Ptr m_flat3d_autoconv_target_disparity{ ModSlider::create(generate_name("Flat3D_AutoConvTargetDisparity"), 0.001f, 0.03f, 0.005f) };
+    const ModSlider::Ptr m_flat3d_autoconv_smoothing{ ModSlider::create(generate_name("Flat3D_AutoConvSmoothing"), 0.005f, 0.25f, 0.08f) };
+    // Floor for the AUTO convergence pull-in only (the manual slider is not
+    // clamped by this) — stops single close-flyby objects from dragging the
+    // screen plane absurdly close.
+    const ModSlider::Ptr m_flat3d_autoconv_min_conv{ ModSlider::create(generate_name("Flat3D_AutoConvMinConvergence"), 0.05f, 10.0f, 0.5f) };
+    const ModToggle::Ptr m_flat3d_autoconv_logging{ ModToggle::create(generate_name("Flat3D_AutoConvLogging"), false, true) };
+    const ModCombo::Ptr m_flat3d_crosshair_mode{ ModCombo::create(generate_name("Flat3D_CrosshairMode"), s_flat3d_crosshair_mode_names, 1) };
+    const ModToggle::Ptr m_flat3d_crosshair_adaptive{ ModToggle::create(generate_name("Flat3D_CrosshairAdaptive"), true) };
+    const ModSlider::Ptr m_flat3d_crosshair_region_radius{ ModSlider::create(generate_name("Flat3D_CrosshairRegionRadius"), 0.01f, 0.15f, 0.04f) };
+    // Vertical center of the game-crosshair region in output UV (0 = top, 0.5 = screen center, 1 = bottom).
+    const ModSlider::Ptr m_flat3d_crosshair_region_center_y{ ModSlider::create(generate_name("Flat3D_CrosshairRegionCenterY"), 0.0f, 1.0f, 0.5f) };
+    const ModInt32::Ptr m_flat3d_crosshair_size{ ModSliderInt32::create(generate_name("Flat3D_CrosshairSize"), 4, 64, 8) };
+    const ModInt32::Ptr m_flat3d_crosshair_color{ ModInt32::create(generate_name("Flat3D_CrosshairColorARGB"), (int32_t)0xFFFFFFFF, true) };
+    const ModSlider::Ptr m_flat3d_crosshair_static_depth{ ModSlider::create(generate_name("Flat3D_CrosshairStaticDepth"), 0.1f, 100.0f, 2.0f) };
+    // Replaces the system cursor with a per-eye cursor at GUI depth while
+    // the game shows a mouse cursor (the hardware cursor is composited flat
+    // by the OS — one copy at screen depth — which breaks in stereo).
+    const ModCombo::Ptr m_flat3d_cursor_mode{ ModCombo::create(generate_name("Flat3D_CursorMode"), s_flat3d_cursor_mode_names, 0) };
+    const ModInt32::Ptr m_flat3d_cursor_size{ ModSliderInt32::create(generate_name("Flat3D_CursorSize"), 8, 96, 32) };
+    // HUD depth mode: flat plane at GUI depth, per-pixel depth-adaptive
+    // (SceneDepthZ sampled below each pixel), or world-marker anchors from
+    // hooked engine projection calls. Non-flat modes fall back to flat while
+    // the game shows a mouse cursor (menus).
+    const ModCombo::Ptr m_flat3d_hud_depth_mode{ ModCombo::create(generate_name("Flat3D_HUDDepthMode"), s_flat3d_hud_depth_names) };
+    const ModSlider::Ptr m_flat3d_hud_marker_radius{ ModSlider::create(generate_name("Flat3D_HUDMarkerRadius"), 0.02f, 0.15f, 0.06f) };
+    // Depth-adaptive: how far around a classified tile the depth shift
+    // extends (fraction of screen width) — covers the whole icon + text.
+    const ModSlider::Ptr m_flat3d_hud_icon_radius{ ModSlider::create(generate_name("Flat3D_HUDIconRadius"), 0.015f, 0.125f, 0.035f) };
+    // Depth-adaptive: extend the icon-region dilation VERTICALLY, the way a
+    // marker's leader-line stem hangs, so a thin stem inherits the icon's
+    // classification + depth without the sideways bleed a bigger symmetric
+    // radius causes. Signed fraction of screen width (converted to tiles like
+    // the radius): >0 stem hangs DOWN, <0 hangs UP, 0 = off.
+    const ModSlider::Ptr m_flat3d_hud_stem_reach{ ModSlider::create(generate_name("Flat3D_HUDStemReach"), -0.25f, 0.25f, 0.0f) };
+    const ModToggle::Ptr m_flat3d_hud_debug{ ModToggle::create(generate_name("Flat3D_HUDDepthDebug"), false, true) };
+    // Color-gated UI alpha: zero the redirected UI's alpha where it has ~no
+    // color. Rescues the "UI Invert Alpha 0.5" workaround (P3R battles): that
+    // collapses all alpha to a flat 0.5, tinting the scene through the EMPTY
+    // UI regions; drawn UI has color, empty screen doesn't. 0 = off.
+    const ModSlider::Ptr m_flat3d_ui_color_gate{ ModSlider::create(generate_name("Flat3D_UIColorGate"), 0.0f, 0.25f, 0.0f) };
+    // Scene-depth source for the Adaptive Crosshair / HUD-depth features. OFF
+    // (default) uses the safe API-level per-draw GameDepthCapture. ON reads the
+    // engine's own render-target pool (SceneDepthZ by name), which finds a depth
+    // buffer allocated once at load — invisible to the API path (e.g. SMT5V) —
+    // but installs an inline FindFreeElement hook that crashes a few titles
+    // (Jedi: Survivor), so it is opt-in per game.
+    const ModToggle::Ptr m_flat3d_use_engine_depth{ ModToggle::create(generate_name("Flat3D_UseEngineDepth"), false) };
+    static const inline std::vector<std::string> s_flat3d_depth_source_names {
+        "Per-Draw Capture (Default)",
+        "Engine Pool (SceneDepthZ)",
+        "DSV Observer (D3D12)",
+        "DLSS Depth",
+    };
+    // Successor to Flat3D_UseEngineDepth (kept above for config back-compat):
+    // adds the hook-free D3D12 DSV-observer snapshot as a third source.
+    const ModCombo::Ptr m_flat3d_depth_source{ ModCombo::create(generate_name("Flat3D_DepthSource"), s_flat3d_depth_source_names, FLAT3D_DEPTH_PER_DRAW) };
+    // Mode-1 (Depth-Adaptive HUD) false-positive rejection — keeps animated but
+    // screen-fixed HUD (minimap radar, gauges) and permanent panels from being
+    // mistaken for world-tracking UI. See the classify shader in Flat3DShaders.
+    const ModSlider::Ptr m_flat3d_hud_trans_gate{ ModSlider::create(generate_name("Flat3D_HUDTransGate"), 0.02f, 0.30f, 0.06f) };
+    const ModSlider::Ptr m_flat3d_hud_rot_gate{ ModSlider::create(generate_name("Flat3D_HUDRotGate"), 0.01f, 0.20f, 0.05f) };
+    const ModSlider::Ptr m_flat3d_hud_trans_floor{ ModSlider::create(generate_name("Flat3D_HUDTransFloor"), 0.0005f, 0.02f, 0.0015f) };
+    const ModToggle::Ptr m_flat3d_hud_occlude_panels{ ModToggle::create(generate_name("Flat3D_HUDOccludePanels"), true) }; // #2
+    const ModSlider::Ptr m_flat3d_hud_occ_gate{ ModSlider::create(generate_name("Flat3D_HUDOccGate"), 0.5f, 0.99f, 0.85f) };
+    const ModInt32::Ptr m_flat3d_hud_panel_halo{ ModSliderInt32::create(generate_name("Flat3D_HUDPanelHalo"), 0, 6, 2) };
+    // Central marker safe-zone: occupancy suppression is disabled inside this
+    // box (half-extents in output UV from screen center) so world markers, which
+    // live centrally, are never flattened when they linger. Panels sit outside it.
+    const ModSlider::Ptr m_flat3d_hud_occ_safe_hw{ ModSlider::create(generate_name("Flat3D_HUDOccSafeHW"), 0.0f, 0.5f, 0.35f) };
+    const ModSlider::Ptr m_flat3d_hud_occ_safe_hh{ ModSlider::create(generate_name("Flat3D_HUDOccSafeHH"), 0.0f, 0.5f, 0.35f) };
+    // #5 Areal-fill reject: a large contiguous UI fill (menu backdrop / blurred
+    // scrim) is never a world-marker. Coverage is measured over a +/-radius tile
+    // block of the current UI; at/above the gate the tile is forced flat. Spatial
+    // and immediate (no occupancy lag), and it works dead-center, unlike the
+    // occupancy safe-zone which protects a central backdrop.
+    const ModToggle::Ptr m_flat3d_hud_reject_fills{ ModToggle::create(generate_name("Flat3D_HUDRejectFills"), true) };
+    const ModInt32::Ptr m_flat3d_hud_fill_radius{ ModSliderInt32::create(generate_name("Flat3D_HUDFillRadius"), 1, 16, 6) };
+    const ModSlider::Ptr m_flat3d_hud_fill_gate{ ModSlider::create(generate_name("Flat3D_HUDFillGate"), 0.3f, 0.95f, 0.6f) };
+    // #4 Up to 4 rectangular exclusion zones (always-flat HUD). cx/cy = center in
+    // output UV, hw/hh = half extents; a zone with hw or hh == 0 is disabled.
+    const std::array<ModSlider::Ptr, 4> m_flat3d_hud_excl_cx{
+        ModSlider::create(generate_name("Flat3D_HUDExcl0CX"), 0.0f, 1.0f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl1CX"), 0.0f, 1.0f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl2CX"), 0.0f, 1.0f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl3CX"), 0.0f, 1.0f, 0.0f) };
+    const std::array<ModSlider::Ptr, 4> m_flat3d_hud_excl_cy{
+        ModSlider::create(generate_name("Flat3D_HUDExcl0CY"), 0.0f, 1.0f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl1CY"), 0.0f, 1.0f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl2CY"), 0.0f, 1.0f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl3CY"), 0.0f, 1.0f, 0.0f) };
+    const std::array<ModSlider::Ptr, 4> m_flat3d_hud_excl_hw{
+        ModSlider::create(generate_name("Flat3D_HUDExcl0HW"), 0.0f, 0.5f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl1HW"), 0.0f, 0.5f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl2HW"), 0.0f, 0.5f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl3HW"), 0.0f, 0.5f, 0.0f) };
+    const std::array<ModSlider::Ptr, 4> m_flat3d_hud_excl_hh{
+        ModSlider::create(generate_name("Flat3D_HUDExcl0HH"), 0.0f, 0.5f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl1HH"), 0.0f, 0.5f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl2HH"), 0.0f, 0.5f, 0.0f),
+        ModSlider::create(generate_name("Flat3D_HUDExcl3HH"), 0.0f, 0.5f, 0.0f) };
+    // Full-screen-GUI detector: flatten the HUD/crosshair depth once the
+    // redirected UI covers at least this % of the screen (cursor-independent —
+    // catches controller-driven menus, map/inventory screens). 0 disables the
+    // coverage signal; the mouse-cursor and game-paused signals still apply.
+    const ModInt32::Ptr m_flat3d_fullscreen_coverage{ ModSliderInt32::create(generate_name("Flat3D_FullscreenUICoveragePct"), 0, 100, 60) };
+    // GUI / UEVR-menu depth as a MULTIPLE of the convergence distance:
+    // 1.0 = exactly at the screen plane (zero shift — never clips at any
+    // convergence), < 1 pops out, > 1 sits behind. Relative-to-convergence
+    // keeps the overlays' disparity (and the cover-zoom that eats their
+    // edges) from blowing up when convergence moves (slider or auto).
+    const ModSlider::Ptr m_flat3d_gui_depth{ ModSlider::create(generate_name("Flat3D_GUIDepthFactor"), 0.25f, 8.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_menu_depth{ ModSlider::create(generate_name("Flat3D_MenuDepthFactor"), 0.25f, 4.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_hdr_paper_white{ ModSlider::create(generate_name("Flat3D_HDRPaperWhiteNits"), 80.0f, 400.0f, 200.0f) };
+    // Diagnostic: enable the D3D12 debug layer's InfoQueue and log its validation
+    // messages (resource-barrier state mismatches, etc.) to the UEVR log. Off by
+    // default; requires the debug layer to be present on the game's device (early
+    // injection with UEVR_D3D12_DEBUG=1, or dxcpl.exe "Force On"). Used to pin the
+    // SceneDepthZ barrier mismatch behind the depth-feature crashes.
+    const ModToggle::Ptr m_flat3d_d3d12_debug_layer{ ModToggle::create(generate_name("Flat3D_D3D12DebugLayer"), false, true) };
+
+    // Display color correction (VRto3D-style; SDR only).
+    const ModToggle::Ptr m_flat3d_correction_enabled{ ModToggle::create(generate_name("Flat3D_ColorCorrection"), false) };
+    const ModSlider::Ptr m_flat3d_lift_r{ ModSlider::create(generate_name("Flat3D_LiftR"), -1.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_flat3d_lift_g{ ModSlider::create(generate_name("Flat3D_LiftG"), -1.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_flat3d_lift_b{ ModSlider::create(generate_name("Flat3D_LiftB"), -1.0f, 1.0f, 0.0f) };
+    const ModSlider::Ptr m_flat3d_gamma_r{ ModSlider::create(generate_name("Flat3D_GammaR"), 0.1f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_gamma_g{ ModSlider::create(generate_name("Flat3D_GammaG"), 0.1f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_gamma_b{ ModSlider::create(generate_name("Flat3D_GammaB"), 0.1f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_gain_r{ ModSlider::create(generate_name("Flat3D_GainR"), 0.0f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_gain_g{ ModSlider::create(generate_name("Flat3D_GainG"), 0.0f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_gain_b{ ModSlider::create(generate_name("Flat3D_GainB"), 0.0f, 3.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_curve{ ModSlider::create(generate_name("Flat3D_SCurve"), 0.33f, 3.0f, 1.0f) };
+
+    // OpenTrack head tracking (v2). UDP receiver feeds a small head-coupled
+    // perspective offset; separate look (yaw/pitch coupling) + parallax gains.
+    const ModToggle::Ptr m_flat3d_opentrack_enabled{ ModToggle::create(generate_name("Flat3D_OpenTrack"), false) };
+    const ModInt32::Ptr m_flat3d_opentrack_port{ ModInt32::create(generate_name("Flat3D_OpenTrackPort"), 4242) };
+    const ModSlider::Ptr m_flat3d_opentrack_pos_scale{ ModSlider::create(generate_name("Flat3D_OpenTrackPosScale"), 0.0f, 4.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_opentrack_rot_scale{ ModSlider::create(generate_name("Flat3D_OpenTrackRotScale"), 0.0f, 2.0f, 1.0f) };
+
+    // Keybinds matching VRto3D's hotkeys/step sizes (Ctrl+F3/F4 depth, Ctrl+F5/F6 convergence).
+    // ------------------------------------------------------------------------
 
     std::chrono::high_resolution_clock::time_point m_last_lerp_update{};
 
@@ -1176,6 +1693,65 @@ private:
 public:
     VR() {
         m_options = {
+            *m_flat3d_output_mode,
+            *m_flat3d_render_scale,
+            *m_flat3d_eye_swap,
+            *m_flat3d_vsync,
+            *m_flat3d_force_sdr,
+            *m_flat3d_fov_multiplier,
+            *m_flat3d_depth,
+            *m_flat3d_convergence,
+            *m_flat3d_reference_fov,
+            *m_flat3d_autoconv_enabled,
+            *m_flat3d_autoconv_target_disparity,
+            *m_flat3d_autoconv_smoothing,
+            *m_flat3d_autoconv_min_conv,
+            *m_flat3d_autoconv_logging,
+            *m_flat3d_crosshair_mode,
+            *m_flat3d_crosshair_adaptive,
+            *m_flat3d_crosshair_region_radius,
+            *m_flat3d_crosshair_region_center_y,
+            *m_flat3d_crosshair_size,
+            *m_flat3d_crosshair_color,
+            *m_flat3d_crosshair_static_depth,
+            *m_flat3d_hud_depth_mode,
+            *m_flat3d_hud_marker_radius,
+            *m_flat3d_hud_icon_radius,
+            *m_flat3d_hud_stem_reach,
+            *m_flat3d_ui_color_gate,
+            *m_flat3d_use_engine_depth,
+            *m_flat3d_depth_source,
+            *m_flat3d_hud_trans_gate,
+            *m_flat3d_hud_rot_gate,
+            *m_flat3d_hud_trans_floor,
+            *m_flat3d_hud_occlude_panels,
+            *m_flat3d_hud_occ_gate,
+            *m_flat3d_hud_panel_halo,
+            *m_flat3d_hud_occ_safe_hw,
+            *m_flat3d_hud_occ_safe_hh,
+            *m_flat3d_hud_reject_fills,
+            *m_flat3d_hud_fill_radius,
+            *m_flat3d_hud_fill_gate,
+            *m_flat3d_hud_excl_cx[0], *m_flat3d_hud_excl_cy[0], *m_flat3d_hud_excl_hw[0], *m_flat3d_hud_excl_hh[0],
+            *m_flat3d_hud_excl_cx[1], *m_flat3d_hud_excl_cy[1], *m_flat3d_hud_excl_hw[1], *m_flat3d_hud_excl_hh[1],
+            *m_flat3d_hud_excl_cx[2], *m_flat3d_hud_excl_cy[2], *m_flat3d_hud_excl_hw[2], *m_flat3d_hud_excl_hh[2],
+            *m_flat3d_hud_excl_cx[3], *m_flat3d_hud_excl_cy[3], *m_flat3d_hud_excl_hw[3], *m_flat3d_hud_excl_hh[3],
+            *m_flat3d_fullscreen_coverage,
+            *m_flat3d_gui_depth,
+            *m_flat3d_menu_depth,
+            *m_flat3d_cursor_mode,
+            *m_flat3d_cursor_size,
+            *m_flat3d_hdr_paper_white,
+            *m_flat3d_d3d12_debug_layer,
+            *m_flat3d_correction_enabled,
+            *m_flat3d_lift_r, *m_flat3d_lift_g, *m_flat3d_lift_b,
+            *m_flat3d_gamma_r, *m_flat3d_gamma_g, *m_flat3d_gamma_b,
+            *m_flat3d_gain_r, *m_flat3d_gain_g, *m_flat3d_gain_b,
+            *m_flat3d_curve,
+            *m_flat3d_opentrack_enabled,
+            *m_flat3d_opentrack_port,
+            *m_flat3d_opentrack_pos_scale,
+            *m_flat3d_opentrack_rot_scale,
             *m_rendering_method,
             *m_synced_afr_method,
             *m_extreme_compat_mode,
@@ -1227,6 +1803,7 @@ public:
             *m_compatibility_skip_uobjectarray_init,
             *m_compatibility_ahud,
             *m_sceneview_compatibility_mode,
+            *m_compatibility_single_view_render_target,
             *m_keybind_recenter,
             *m_keybind_recenter_horizon,
             *m_keybind_set_standing_origin,

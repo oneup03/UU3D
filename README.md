@@ -1,169 +1,351 @@
-# UEVR + 🎬 Embedded RenderDoc Capture
+# Unreal Universal 3D
 
-> **This is a fork of [praydog's UEVR](https://github.com/praydog/UEVR) that adds an embedded
-> [RenderDoc](https://renderdoc.org/) capture system.** You can grab a real GPU frame
-> (flat *or* stereo VR) from almost any Unreal Engine game and open it in RenderDoc —
-> no game source, no headset required.
->
-> ### 👉 **New here? Read the [RenderDoc Capture Guide](RENDERDOC_CAPTURE_GUIDE.md) — it walks you through everything step by step.**
->
-> **Just want to capture?** Download the [latest release](../../releases/latest), unzip, and run:
-> ```powershell
-> .\UEVRRenderDocLauncher.exe --exe "C:\Path\To\YourGame-Win64-Shipping.exe" --wait
-> .\Capture-RenderDoc.ps1
-> ```
->
-> Deeper design notes live in [docs/RENDERDOC_EMBEDDED_PORT.md](docs/RENDERDOC_EMBEDDED_PORT.md).
-> All UEVR credit goes to **praydog**; this fork only adds the capture plumbing + docs.
+UU3D can output stereo 3D directly to a screen — no headset, no SteamVR
+or OpenXR install — as a third runtime alongside OpenVR/OpenXR. The game
+renders in stereo through its normal render pipeline; instead of submitting to a
+VR compositor, the two eyes are woven into the game's own backbuffer in your
+chosen 3D format and presented normally. Works on 3D TVs, 3D projectors,
+Interlaced, LeiaSR, AR glasses, Frame Sequential, and plain monitors via
+anaglyph output.
 
----
+## Download
 
-## 🔨 Building from source (two reproducibility notes)
+Grab the latest nightly build from
+[github.com/oneup03/UU3D/releases/latest](https://github.com/oneup03/UU3D/releases/latest)
+— download `UU3D.zip` and extract it anywhere.
 
-If you build `UEVRBackend.dll` yourself instead of using the release, two pieces
-are required so your build behaves like the shipped one:
+Ready-made game profiles live at
+[github.com/oneup03/UU3D-Profiles](https://github.com/oneup03/UU3D-Profiles) —
+import them via **Import Config** below.
 
-1. **The UESDK crash-fix is applied for you at configure time.** The `UESDK`
-   submodule stays on upstream **`praydog/UESDK`** (praydog's gated SDK — you
-   need access to build at all, same as upstream UEVR). Because that repo is
-   private and can't be forked publicly, the CMake configure step instead applies
-   [`patches/UESDK-StereoStuff-renderdoc.patch`](patches/UESDK-StereoStuff-renderdoc.patch)
-   to your own checkout (see
-   [`cmake/ApplyUESDKPatch.cmake`](cmake/ApplyUESDKPatch.cmake)) — idempotent,
-   warns-not-fails on drift — so a normal recursive clone + build just works.
-   Without this fix, injecting under embedded RenderDoc **crashes** during stereo
-   setup (the `GetNativeResource` vtable probe rejects the RenderDoc-wrapped
-   resource).
+## Injecting with UU3DI
 
-2. **Use the bundled `renderdoc.dll` — not a stock RenderDoc install.** The
-   shipped DLL is a **custom RenderDoc fork**
-   ([`elliotttate/renderdoc`](https://github.com/elliotttate/renderdoc)) with a
-   D3D12 driver fix: at the tier-3 descriptor-heap max it reserves RenderDoc's
-   patch descriptors *from within* the heap instead of writing past its end.
-   Stock RenderDoc lacks this, so large UE5 titles can corrupt the heap and the
-   **swapchain backbuffer freezes**. The custom DLL is shipped prebuilt in every
-   release; rebuild it from the fork only if you want to.
+1. Launch the game, then open **UU3DI** and select the game's process from
+   the running-process list.
+2. Optionally **Import Config** to load a profile zip. The zip's filename
+   must **exactly match the game's exe name** (e.g. `Game-Win64-Shipping.zip`
+   for `Game-Win64-Shipping.exe`) or it won't be associated with the game.
+   If the zip contains a DLL plugin you'll be asked to confirm — only accept
+   plugins from sources you trust.
+3. Optionally adjust the settings UU3DI shows for the selected game before
+   injecting — they're saved to the game's `config.txt` and take effect at
+   injection.
+4. Hit **Inject**. From there, everything is driven from the in-game
+   **UU3D menu** — press **Insert** to open or close it (rebindable via the
+   menu key setting).
 
----
+## The Unreal tab in one minute
 
-![build](https://github.com/praydog/UEVR/actions/workflows/dev-release.yml/badge.svg)
+3D Display composites whatever stereo pair the **Unreal** tab produces, so
+three options there matter most:
 
-Universal Unreal Engine VR Mod (4/5)
+- **Rendering Method** — how the stereo pair is generated:
+  - *Native Stereo* (default) — the engine renders both eyes every frame.
+    Cleanest image and no eye lag, but full double-render GPU cost.
+  - *Synchronized Sequential* — both eyes are rendered on the same game tick
+    as two sequential full renders, then presented together. Same
+    double-render GPU cost as Native Stereo; the compatibility path for games
+    where the engine's native stereo pass misbehaves.
+  - *Alternating/AFR* — each engine frame renders one eye, presented as they
+    come. Still a full render per eye — no cheaper overall — and the two eyes
+    show different ticks, so fast motion shows eye lag.
+  - *Alternate Frame Warping* — the only method that actually cuts GPU cost:
+    one eye is rendered per frame and the other is reprojected by PureDark's
+    AFW plugin using depth and motion vectors. DX12 only (DX11 falls back to
+    AFR) and wants in-game DLSS enabled so depth and motion vectors are
+    available; the first moments after injection run Synced Sequential while
+    AFW warms up.
+- **Ghosting Fix** — gives each eye its own temporal-history (TAA) view state
+  so the alternating-eye methods don't smear one eye's history into the
+  other. Watch its status badge; leave *Bootstrap Separate View States* off
+  unless the badge never reaches "active".
+- **Native Stereo Fix** — for titles whose engine won't produce a correct
+  second eye under *Native Stereo*: runs an extra capture pass each frame to
+  obtain the other eye. Only applies to the Native Stereo method (the
+  Synced/AFR/AFW paths ignore it), and turns itself off for the session if
+  the extra pass crashes.
 
-## Supported Engine Versions
+This page walks through the **3D Display** tab in the UU3D menu, top to bottom.
 
-4.8 - 5.4
+## Output Mode
 
-## Links
+Pick how the stereo pair is packed into the screen image:
 
-- [Download (Stable release)](https://github.com/praydog/UEVR/releases)
-- [Download (Nightly release)](https://github.com/praydog/UEVR-nightly/releases/latest)
-- [Documentation](https://praydog.github.io/uevr-docs)
-- [Flat2VR Discord](https://flat2vr.com)
+- **Side by Side**, **Top and Bottom** — for 3D TVs/projectors set to the
+  matching SBS/TAB mode, and for most VR video players.
+- **Row Interlaced**, **Column Interlaced**, **Checkerboard** — for passive
+  3D displays. These patterns are drawn in real display pixels, so any render
+  resolution stays line-exact — but the game must run **borderless fullscreen
+  at the display's native resolution** (any scaling applied after us breaks
+  the pattern; you'll get an on-screen warning if a mismatch is detected).
+- **LeiaSR (SR display)** — glasses-free Leia/Dimenco panels. Needs a 
+  running SRService (D3D11/D3D12); falls back to Side by Side otherwise.
+- **Frame Packed 720p60 / 1080p24 / 1080p60** — HDMI 1.4 "3D" for 3D TVs. Emits
+  Top-and-Bottom with the HDMI blanking gap **and auto-applies the matching
+  display timing** (NVIDIA/AMD, or a CRU-preconfigured mode), which is what
+  makes the TV show its 3D icon. The timing reverts on exit. Intel GPUs need
+  the mode pre-added in CRU.
+- **Dual Display** / **Dual Display (Flip)** — send one eye to each of two
+  monitors arranged side by side (Flip vertically mirrors the left eye for
+  mirror-style rigs).
+- **Katanga (shared texture)** — publishes the pair as a shared texture for
+  VR and Frame Sequential viewers (Katanga.exe / VRScreenCap / NV3D-Glass /
+  WibbleWobbleInjector); launch any app in any order. Forces
+  the game into a normal window and shows a flat left-eye preview locally.
+- **Anaglyph** (Red/Cyan, Green/Magenta, Blue/Amber, plus Dubois / Deghosted /
+  Compromise variants) — for colored 3D glasses on any ordinary screen.
 
-## Features
+**Swap Eyes** — flips left/right if the depth looks inverted (also flips the
+interlace phase for passive displays).
 
-- Full 6DOF support out of the box (HMD movement)
-- Full stereoscopic 3D out of the box
-- Native UE4/UE5 stereo rendering system
-- Frontend GUI for easy process injection
-- Supports OpenVR and OpenXR runtimes
-- 3 rendering modes: Native Stereo, Synchronized Sequential, and Alternating/AFR
-- Automatic handling of most in-game UI so it is projected into 3D space
-- Optional 3DOF motion controls out of the box in many games, essentially emulating a semi-native VR experience
-- Optional roomscale movement in many games, moving the player character itself in 3D space along with the headset
-- User-authored UI-based system for adding motion controls and first person to games that don't support them
-- In-game menu with shortcuts for adjusting settings
-- Access to various CVars for fixing broken shaders/effects/performance issues
-- Optional depth buffer integration for improved latency on some headsets
-- Per-game configurations
-- [C++ Plugin system](https://praydog.github.io/uevr-docs/plugins/getting_started.html) and [Blueprint support](https://praydog.github.io/uevr-docs/plugins/blueprint.html) for modders to add additional features like motion controls
+**VSync Override** — *No-Tear Fast* (default), *Force On*, or *Use In-Game
+Setting*. No-Tear Fast overrides the game's own VSync: presents run uncapped
+at sync interval 0 with the DXGI tearing flag stripped, so a flip-model
+swapchain (all DX12 games) still flips on vblank only — tear-free **and**
+both eyes of an AFR-family pair land every refresh. The frame cap
+(`t.MaxFPS`) is managed automatically: twice the display refresh under
+Synced Sequential / AFR / AFW, native refresh under Native Stereo. (DX11
+exclusive-fullscreen can still tear at interval 0 — use *Force On* there, or
+run borderless windowed.)
 
-## Getting Started
+**Force SDR Output** — HDR output washes out the 3D modes and disables color
+correction. Leave this on unless you specifically want to experiment with HDR
+passthrough.
 
-There are two ways to use this build. Pick the one that matches what you want.
+> Output is always held at the display's native resolution. To lower GPU cost,
+> turn down the **in-game** resolution (or resolution scale) — that path is
+> upscaled correctly and won't break interlaced/checkerboard modes.
 
-### A) Capture a GPU frame (this fork's reason to exist)
+### Full-width side-by-side panels (32:9)
 
-Use the bundled **`UEVRRenderDocLauncher.exe`** — it injects `renderdoc.dll` and
-`UEVRBackend.dll` for you, so there is **no `UEVRInjector.exe` and no .NET
-required**. Full walkthrough in the
-[RenderDoc Capture Guide](RENDERDOC_CAPTURE_GUIDE.md):
+Some 3D displays are a single ultra-wide panel — e.g. 3840×1080 (32:9), where
+each eye is a full 16:9 half. When **Side by Side** is selected on a panel wider
+than ~2.5:1, UU3D detects this automatically and switches to **Native Render +
+Upscale**: the game is told its window is one eye wide (via a client-rect
+spoof), so it renders each eye at native 16:9 instead of being squeezed to 32:9,
+and the two eyes are composited back across the full panel. The result is full
+per-eye sharpness with no configuration. It's a no-op on ordinary half-width SbS
+displays (1920×1080), where the display itself stretches each half.
 
-**Easiest:** drag your game's real exe onto **`Launch-Capture.bat`** (or edit the
-`GAME_EXE` line in it and double-click), then run `Capture-RenderDoc.ps1`.
+Because the engine believes its window is one eye wide, the game's UI, the UU3D
+menu and the mouse cursor are all authored at that perceived per-eye size and
+composited into each eye — see the limitation in *Compatibility notes* for the
+rare title that ignores this.
 
-Or from PowerShell:
+## 3D Calibration
 
-```powershell
-.\UEVRRenderDocLauncher.exe --exe "C:\Path\To\YourGame-Win64-Shipping.exe" --wait
-.\Capture-RenderDoc.ps1
-```
+Three settings form one calibrated set, saved together per game:
 
-> Download the [latest release of **this** fork](../../releases/latest) (not
-> praydog's) — it contains the launcher, backend, RenderDoc runtime, VR loaders,
-> and capture scripts. The release does **not** include `UEVRInjector.exe`.
+- **Depth** — eye separation (how strong the 3D is).
+- **Convergence** — the distance that sits exactly on the screen plane. Things
+  nearer than this pop out toward you; things farther sit behind the screen.
+- **Reference FoV** — the field of view at which Depth and Convergence were
+  dialed in (recommended to set this to gameplay FoV).
 
-### B) Standard VR injection (upstream UEVR)
+Separation then auto-scales with the game's live FoV (always on), so zooming or
+aiming down sights keeps the perceived depth constant. The game's FoV is never
+overridden — only the stereo shear is injected into its own projection.
 
-For plain VR without capture, use praydog's upstream injector. Install the
-.NET 6.0 SDK ([download](https://dotnet.microsoft.com/en-us/download/dotnet/6.0) —
-x64 under Installers), grab the latest release from the
-[praydog/UEVR Releases page](https://github.com/praydog/UEVR/releases), then:
+Hotkeys (hold to repeat): **Ctrl+F3 / F4** depth −/+, **Ctrl+F5 / F6**
+convergence −/+. **Ctrl+F12** (or the **Take 3D Screenshot** button at the
+top of the menu) saves the composited stereo pair — the game, its own HUD, the
+crosshair and the stereo cursor at the current convergence, with only the UU3D
+menu hidden for the capture and both eyes valid even under AFR — as two PNGs
+under `<persistent>/flat3d_screenshots/`, regardless of the on-screen output
+mode: a canonical parallel-view (`sbs_<timestamp>.png`, left|right) and a
+cross-view companion (`…_crossview.png`, right|left) for cross-eyed free-viewing.
+The capture spans the 1–2 presents it takes to refresh both eyes with the menu
+hidden, so the menu briefly blinks off on screen as the shot is taken.
 
-1. Launch UEVRInjector.exe
-2. Launch the target game
-3. Locate the game in the process dropdown list
-4. Select your desired runtime (OpenVR/OpenXR)
-5. Toggle existing VR plugin nullification (if necessary)
-6. Configure pre-injection settings
-7. Inject
+## Depth Source
 
-## To-dos before injection
+The scene-depth source for **Adaptive Crosshair**, **HUD Depth**, and
+**Auto-Convergence**:
 
-1. Disable HDR (it will still work without it, but the game will be darker than usual if it is)
-2. Start as administrator if the game is not visible in the list
-3. Pass `-nohmd` to the game's command line and/or delete VR plugins from the game directory if the game contains any existing VR plugins
-4. Disable any overlays that may conflict and cause crashes (Rivatuner, ASUS software, Razer software, Overwolf, etc...)
-5. Disable graphical options in-game that may cause crashes or severe issues like DLSS Frame Generation
-6. Consider disabling `Hardware Accelerated GPU Scheduling` in your Windows `Graphics settings`
+- **Per-Draw Capture** (default) — a safe, API-level capture of the game's
+  rendering. Works on most titles, but it's blind to depth the game allocates
+  once at load time; in that case the depth features simply stay flat.
+- **Engine Pool (SceneDepthZ)** — reads the engine's own scene depth from its
+  render-target pool. Fixes titles that allocate depth at load (e.g. *SMT V:
+  Vengeance*), but it installs an engine hook that crashes a few games (e.g.
+  *Jedi: Survivor*). Enable it per-game. (Replaces the old **Use Engine Depth
+  Buffer** toggle; saved configs carry over.)
+- **DSV Observer** (D3D12 only) — watches depth-stencil views and resource
+  barriers at the API level and snapshots the live scene depth each frame.
+  Installs **no engine hook** (safe where Engine Pool crashes) and sees depth
+  allocated at any time (works where Per-Draw stays flat). A status line under
+  the combo shows what the observer is tracing.
+- **DLSS Depth** (D3D12 only) — snapshots the exact depth the game feeds DLSS,
+  captured from the DLSS call itself (no engine hook, no plugin). Only has
+  data while DLSS is enabled in the game's graphics settings; works in any
+  rendering method and is the natural choice when playing with AFW.
 
-## In-Game Menu
+## Auto-Convergence
 
-Press the **Insert** key or **L3+R3** on an XInput based controller to access the in-game menu, which opens by default at startup. With the menu open, hold **RT** for various shortcuts:
+Automatically pulls the screen plane just in front of the nearest significant
+object so its pop-out never exceeds **Target Disparity** (a fraction of screen
+width). Your manual Convergence acts as the ceiling; turning this off snaps back
+to it.
 
-- RT + Left Stick: Move the camera left/right/forward/back
-- RT + Right Stick: Move the camera up/down
-- RT + B: Reset camera offset
-- RT + Y: Recenter view
-- RT + X: Reset standing origin
+- **Smoothing** — how gently the convergence follows depth changes.
+- **Min Convergence** — never pulls the plane closer than this (raise it if
+  nearby objects drag the whole scene too deep).
+- **Log Samples** — diagnostic logging.
 
-## Quick overview of rendering methods
+Separation auto-scales with the pull-in, so the background stays exactly where
+you calibrated it. This reads the engine depth buffer (see above).
 
-### Native Stereo
+## Crosshair
 
-When it works, it looks the best, performs the best (usually). Can cause crashes or graphical bugs if the game does not play well with it.
+Put the aiming reticle at the right depth so it lands on the target instead of
+floating on the screen plane.
 
-Temporal effects like TAA are fully intact. DLSS/FSR2 usually work completely fine with no ghosting in this mode.
+- **Mode** — *Off*, *Game Crosshair* (re-projects the game's own reticle to the
+  aimed depth by extracting a small region of its UI), or *Laser Sight* (a
+  separate depth-aware dot, classic 3D-Vision style).
+- **Adaptive Depth** — read the aim depth from the depth buffer. When it's
+  unavailable the **Static Depth** slider is used instead.
+- Game Crosshair: **Region Radius** (size of the extracted center patch — HUD
+  inside it rides along) and **Region Center Y** (its vertical position).
+- Laser Sight: **Dot Size** and **Dot Color**.
 
-Fully synchronized eye rendering. Works with the majority of games. Uses the actual stereo rendering pipeline in the Unreal Engine to achieve a stereoscopic image.
+## GUI
 
-### Synchronized Sequential
+Controls the depth of the game's 2D UI (health bars, menus, markers), the
+UU3D menu, and the mouse cursor.
 
-A form of AFR. Can fix many rendering bugs that are introduced with Native Stereo. Renders two frames **sequentially** in a **synchronized** fashion on the same engine tick.
+**HUD Depth Mode**
 
-Fully synchronized eye rendering. Game world does not advance time between frames.
+- **Flat (GUI Depth)** — the whole UI sits on one plane at **GUI Depth**.
+- **Depth-Adaptive (Auto-Classified)** — UI that *moves with the camera*
+  (waypoints, nameplates, floating markers) is placed at the scene depth beneath
+  it, while static HUD stays flat. It learns which is which as you look around;
+  needs a working scene depth source. See tuning below.
+- **World Markers (Auto-Detected)** — hooks the engine's world→screen
+  projection and puts UI at each marker's true 3D position. Coverage depends on
+  how the game drives its HUD.
 
-Looks normal but temporal effects like TAA will have ghosting/doubling effect. Motion blur will need to be turned off.
+**Full-Screen UI Coverage %** — when the game's UI covers at least this much of
+the screen, HUD/crosshair depth flattens automatically. This catches full-screen
+menus (map, inventory, controller menus) that don't show a mouse cursor. Raise it
+if a busy gameplay HUD trips it; lower it if a full-screen menu isn't caught; 0
+disables the coverage check (paused-game detection still applies).
 
-This is the first alternative option that should be used if Native Stereo is not working as expected or you are encountering graphical bugs.
+**Depth-Adaptive tuning** (only shown in that mode):
 
-**Skip Draw** skips the viewport draw on the next engine tick. Usually works the best but sometimes particle effects may not play at the correct speed.
+- **Icon Region Radius** — how far around a detected moving element the depth
+  shift spreads, so a whole icon and its text move as one piece.
+- **Show Classification (debug)** — tints the HUD so you can tune it: red =
+  treated as world (gets scene depth), green = treated as flat HUD. Look around
+  to train it.
+- **False-Positive Rejection** — stops animated-but-fixed HUD (a spinning
+  minimap, gauges) and menu backdrops from being mistaken for world-tracking UI:
+  - **Suppress Permanent Panels** — UI that's on-screen every frame (a minimap
+    disc, a gauge cluster) is forced flat, along with a small halo around it.
+    **Panel Occupancy** sets how "always there" it must be; **Panel Halo** grows
+    the flat margin; **Marker Safe Zone W/H** is a central box where this
+    suppression is turned off, so real markers near the middle are never
+    flattened.
+  - **Reject Large UI Fills** — a big solid region of UI (a menu backdrop or
+    blurred scrim) is never a marker — a marker is a small island. This forces
+    such fills flat immediately, even in the center. **Fill Radius** sets how
+    large "big" is; **Fill Coverage** how solidly filled it must be.
+  - **Translation / Rotation Gate**, **Translation Floor** — how much motion
+    evidence is required before UI is called "world." Raise the gates for fewer
+    false positives (may miss subtle markers); the floor ignores tiny camera
+    drift.
+  - **Exclusion Zones** — up to four rectangles you mark as always-flat HUD
+    (center + half-size in screen fractions, 0..1). Set a zone's half-size to 0
+    to disable it.
 
-**Skip Tick** skips the next engine tick entirely. Usually buggy but does fix particle effects and sometimes brings higher performance.
+**GUI Depth** — depth of the flat UI plane. **UU3D Menu Depth** — depth of
+the UU3D menu. Depths are relative to convergence: **1.0 = the screen plane**
+(no shift), below 1 pops out, above 1 sits behind. Layers scale down as they
+shift so nothing is pushed off-screen.
 
-### AFR
+**Stereo Cursor** — replaces the flat system cursor (which the OS would draw at
+screen depth in one eye only) with a proper per-eye cursor whenever the game
+shows one: *None*, *GUI Depth* (at the UI plane), or *Geometry (Under Cursor)*
+(lands on the scene surface right under the tip; needs a scene depth source, and
+falls back to GUI depth over full-screen menus). **Cursor Size** sets its size.
 
-Alternated Frame Rendering. Renders each eye on separate frames in an alternating fashion, with the game world advancing time in between frames. Causes eye desyncs and usually nausea along with it.
+> The UU3D menu's font size is set from the main UU3D menu → Configuration →
+> Font Size.
 
-Not synchronized. Generally should not be used unless the other two are unusable in some way.
+## Head Tracking (OpenTrack)
+
+Point OpenTrack's **UDP over network** output at `127.0.0.1:<port>` (default
+4242). Two independent gains:
+
+- **Look Sensitivity** — adds head yaw/pitch/roll on top of the game's camera
+  (TrackIR-style).
+- **Parallax Sensitivity** — shifts the eye origin with head x/y/z for a
+  fishtank / head-coupled effect (natural on SR displays).
+
+Use OpenTrack's own **Center** hotkey to zero the neutral pose. Off by
+default and a pure no-op when disabled.
+
+## Color Correction (SDR)
+
+Adjust lift / gamma / gain plus an S-curve contrast, applied as a post step in
+the weave shader — handy for compensating for the dimming/tint of glasses or
+reducing crosstalk. **Enable**, then adjust **S-Curve Contrast** and the per-
+channel **Lift / Gamma / Gain** sliders. SDR output only (ignored under HDR).
+
+## Advanced
+
+- **HDR Paper White (nits)** — reference white used when converting HDR frames
+  for anaglyph output.
+- **D3D12 Debug Layer Log** — diagnostic logging of D3D12 validation messages
+  for depth-feature crashes (needs the debug layer enabled on the game's device;
+  see the in-menu tooltip). D3D12 only.
+
+## Compatibility notes
+
+- **Synchronized Sequential** shows only complete, matched pairs: both eyes
+  come from the same game state (a pair lock holds the first eye until its
+  partner arrives), and eye identity is measured per frame rather than
+  inferred — no cross-state judder, no inverted eyes, at roughly half the
+  effective framerate (each world state is rendered twice).
+- **Alternating/AFR** works with a per-eye cache: each frame one eye is fresh
+  and the other is one frame old. Fast motion shows the usual AFR shimmer.
+- **Alternate Frame Warping (AFW)** renders one eye and reprojects the other
+  from color + depth + motion vectors — near-2x scene performance with
+  same-state eyes. D3D12 only, needs DLSS enabled in-game (raw-buffer
+  fallback exists) and the real `PDAFWPlugin.dll` beside `UEVRBackend.dll`;
+  without it, AFW falls back to plain AFR. Pair it with the **DLSS Depth**
+  source so the depth features read the same depth the warp uses.
+- **Native Stereo Fix** titles are handled (eye layout follows the headset
+  logic), including modular DLL builds and engines with customized
+  scene-view-family layouts (Returnal, Hellblade 2).
+- Games that need **AHUD UI compatibility** (UI drawn via the viewport
+  render target, e.g. P3R) can look overly transparent — see **UI Invert
+  Alpha** and **UI Color Gate** on the main Compatibility page.
+- **Recommended: add `-nohmd` to the game's launch arguments.** Titles with
+  their own **native HMD/OpenXR stereo path** can misbehave when UU3D drives
+  stereo — either the game HUD/UI disappears (e.g. *Stellar Blade*), or the
+  game tries to start up SteamVR/an HMD on launch (e.g. *Storybook*). `-nohmd`
+  forces the game to mono so UU3D drives stereo cleanly — add **`-noxr`** as
+  well if needed.
+- On a **full-width (32:9) SbS panel** (see *Full-width side-by-side panels*
+  above), a title that draws its UI across the *entire physical panel* rather
+  than the per-eye area — e.g. *FF7 Rebirth*, whose menu composites full-width —
+  can't be cropped down to a single eye, so that UI is stretched across the
+  pair. The in-game HUD, which respects the perceived per-eye size, is
+  unaffected, and standard 16:9 displays are never affected. There is no
+  per-game fix for this today.
+- Both UE4 (float) and UE5 (double-precision) projection paths are supported.
+- Quick sanity check: Side by Side with Depth 0 gives two identical halves;
+  raise Depth and nearer-than-convergence objects show crossed disparity (use
+  **Swap Eyes** if it's inverted).
+
+## Thanks to
+
+- **[praydog](https://github.com/praydog)** — creator and principal author of
+  UEVR, the injection and stereo-rendering framework this mode is built on.
+- **joeyhodge** - got more recent UE 5.x games working
+- **PureDark** - created Alternate Frame Warping
+- The UEVR contributors whose work this builds on: narknon, keton, cursey,
+  mark-mon, mrbelowski, npt-1707, Raicuparta, Anton-4, and markmontec.
+- **MidlifeCrisis / EvilKermitReturns** — for early exploratory work on Unreal
+  Engine stereo 3D that shaped several of the design decisions applied here.

@@ -72,6 +72,23 @@ add_subdirectory(dependencies/submodules/UESDK)
 # RenderDoc source/runtime isn't present.
 include(cmake/RenderDocFull.cmake)
 
+set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
+message(STATUS "Using vendored safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b + UEVR patches)...")
+add_subdirectory(dependencies/vendor/safetyhook)
+
+# LeiaSR (Simulated Reality) SDK. The SR-lib submodule's own CMake package owns
+# the SDK layout, the import-library set and the /DELAYLOAD list, so none of it
+# is hardcoded here: an SDK version bump or a new SR DLL is picked up without
+# touching this file. Consumed by [target.uevr] via SRLib::SDK +
+# srlib_apply_delayload(). Requires the api_expansion branch (see .gitmodules);
+# on master the submodule has no CMakeLists.txt and we silently build without
+# LeiaSR, exactly as with the submodule missing entirely.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/SR-lib/CMakeLists.txt")
+    add_subdirectory(dependencies/submodules/SR-lib)
+else()
+    message(STATUS "SR-lib: submodule not checked out (or on a branch without the CMake package); LeiaSR disabled.")
+endif()
+
 include(FetchContent)
 
 message(STATUS "Fetching bddisasm (70db095765ab2066dd88dfb7bbcc42259ed167c5)...")
@@ -781,6 +798,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/PluginLoader.cpp"
 	"src/mods/UObjectHook.cpp"
 	"src/mods/VR.cpp"
+	"src/mods/VR_Flat3D.cpp"
 	"src/mods/bindings/FS.cpp"
 	"src/mods/bindings/ImGui.cpp"
 	"src/mods/bindings/Json.cpp"
@@ -795,12 +813,23 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/D3D11Component.cpp"
 	"src/mods/vr/D3D12Component.cpp"
 	"src/mods/vr/FFakeStereoRenderingHook.cpp"
+	"src/mods/vr/GameDepthCapture.cpp"
 	"src/mods/vr/IXRTrackingSystemHook.cpp"
 	"src/mods/vr/OverlayComponent.cpp"
 	"src/mods/vr/RenderTargetPoolHook.cpp"
 	"src/mods/vr/d3d12/CommandContext.cpp"
+	"src/mods/vr/d3d12/DepthStencilObserver.cpp"
 	"src/mods/vr/d3d12/DirectXTK.cpp"
 	"src/mods/vr/d3d12/TextureContext.cpp"
+	"src/mods/vr/flat3d/D3D11Component_Flat3D.cpp"
+	"src/mods/vr/flat3d/D3D12Component_Flat3D.cpp"
+	"src/mods/vr/flat3d/Flat3DAutoConvergence.cpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D11.cpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D12.cpp"
+	"src/mods/vr/flat3d/Flat3DDisplayTiming.cpp"
+	"src/mods/vr/flat3d/Flat3DKatanga.cpp"
+	"src/mods/vr/flat3d/Flat3DKatangaD3D12.cpp"
+	"src/mods/vr/runtimes/Flat3D.cpp"
 	"src/mods/vr/runtimes/OpenVR.cpp"
 	"src/mods/vr/runtimes/OpenXR.cpp"
 	"src/render/RenderDocCaptureControl.cpp"
@@ -841,14 +870,25 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/D3D11Component.hpp"
 	"src/mods/vr/D3D12Component.hpp"
 	"src/mods/vr/FFakeStereoRenderingHook.hpp"
+	"src/mods/vr/GameDepthCapture.hpp"
 	"src/mods/vr/IXRTrackingSystemHook.hpp"
 	"src/mods/vr/OverlayComponent.hpp"
 	"src/mods/vr/RenderTargetPoolHook.hpp"
 	"src/mods/vr/UpscaleHelper.hpp"
 	"src/mods/vr/d3d12/ComPtr.hpp"
 	"src/mods/vr/d3d12/CommandContext.hpp"
+	"src/mods/vr/d3d12/DepthStencilObserver.hpp"
 	"src/mods/vr/d3d12/DirectXTK.hpp"
 	"src/mods/vr/d3d12/TextureContext.hpp"
+	"src/mods/vr/flat3d/Flat3DAutoConvergence.hpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D11.hpp"
+	"src/mods/vr/flat3d/Flat3DCompositorD3D12.hpp"
+	"src/mods/vr/flat3d/Flat3DDisplayTiming.hpp"
+	"src/mods/vr/flat3d/Flat3DKatanga.hpp"
+	"src/mods/vr/flat3d/Flat3DKatangaD3D12.hpp"
+	"src/mods/vr/flat3d/Flat3DLeiaSRRuntime.hpp"
+	"src/mods/vr/flat3d/Flat3DShaders.hpp"
+	"src/mods/vr/runtimes/Flat3D.hpp"
 	"src/mods/vr/runtimes/OpenVR.hpp"
 	"src/mods/vr/runtimes/OpenXR.hpp"
 	"src/mods/vr/runtimes/VRRuntime.hpp"
@@ -861,6 +901,7 @@ list(APPEND uevr_SOURCES
 	"src/uevr-imgui/uevr_imconfig.hpp"
 	"src/utility/ImGui.hpp"
 	"src/utility/Logging.hpp"
+	"src/mods/vr/flat3d/Flat3DDisplayUtils.h"
 	"src/uevr-imgui/imgui_impl_dx11.h"
 	"src/uevr-imgui/imgui_impl_dx12.h"
 	"src/uevr-imgui/imgui_impl_win32.h"
@@ -895,6 +936,8 @@ target_include_directories(uevr PUBLIC
 	"include/"
 	"${OPENXR_SOURCE_DIR}/src"
 	"dependencies/vendor/renderdoc"
+	"dependencies/submodules/nvapi"
+	"dependencies/submodules/adl_sdk/include"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -915,6 +958,8 @@ target_link_libraries(uevr PUBLIC
 	asmjit
 	luavrlib
 	pdafwmod
+	delayimp
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/submodules/nvapi/amd64/nvapi64.lib"
 )
 
 target_link_libraries(uevr PUBLIC
@@ -926,7 +971,7 @@ set_target_properties(uevr PROPERTIES
 	OUTPUT_NAME
 		UEVRBackend
 	LINK_FLAGS
-		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll"
+		"/DELAYLOAD:openvr_api.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:nvapi64.dll"
 	RUNTIME_OUTPUT_DIRECTORY_RELEASE
 		"${CMAKE_BINARY_DIR}/bin/${CMKR_TARGET}"
 	RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO
@@ -959,6 +1004,25 @@ add_custom_command(
 # Build the RenderDoc launcher + smoke tools and stage renderdoc.dll beside
 # UEVRBackend.dll. No-op if RenderDoc isn't available on this machine.
 uevr_attach_full_renderdoc(uevr)
+
+# LeiaSR. SRLib::SR is the whole integration: SR.cpp/SR.hpp wrap the SDK, and it
+# PUBLIC-links SRLib::SDK for the SR + third_party include dirs and every import
+# library. srlib_apply_delayload() applies the full /DELAYLOAD set so
+# UEVRBackend.dll still loads on machines that have never had the SR Platform
+# installed — the loader would otherwise refuse it with a popup naming
+# opencv_world343.dll before any of our code runs.
+#
+# Both compositors go through SRInterfaceDX11 / SRInterfaceDX12 and never touch
+# the SDK directly, so SR-lib owns the SRContext lifetime, the DLL preflight and
+# the load-bearing "initialize() after weaver creation" ordering. Their
+# __has_include("SR.hpp") probe is what compiles the LeiaSR paths in at all, so
+# it keys off this link rather than off an SDK header being present.
+if(SRLIB_FOUND)
+    target_link_libraries(uevr PRIVATE SRLib::SR)
+    srlib_apply_delayload(uevr)
+else()
+    message(STATUS "uevr: building without LeiaSR support (SR-lib SDK not found).")
+endif()
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
