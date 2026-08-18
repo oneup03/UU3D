@@ -18,7 +18,7 @@
 // Two ways to enable:
 //   1. Environment variable UEVR_DUMPER_MODE=1 in the game process.
 //   2. Sentinel file `dumper_mode` in the per-game config directory —
-//      %APPDATA%\UnrealVRMod\<GameExeStem>\dumper_mode
+//      %APPDATA%\UU3D\<GameExeStem>\dumper_mode
 //
 // File sentinel is preferred for games launched via Steam / Epic where
 // env vars don't propagate through the launcher shell. The MCP server's
@@ -46,7 +46,7 @@ inline bool is_dumper_mode() noexcept {
             if (_stricmp(env, "on") == 0) return true;
         }
 
-        // 2. Sentinel file under %APPDATA%\UnrealVRMod\<GameExeStem>\dumper_mode
+        // 2. Sentinel file under %APPDATA%\UU3D\<GameExeStem>\dumper_mode
         // Build the path manually (UEVR's Framework::get_persistent_dir has
         // similar logic but this header is included early).
         try {
@@ -56,7 +56,7 @@ inline bool is_dumper_mode() noexcept {
                 GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
                 std::filesystem::path exe_fs(exe_path);
                 const auto game_name = exe_fs.stem().wstring();
-                std::filesystem::path sentinel = std::filesystem::path(appdata) / L"UnrealVRMod" / game_name / L"dumper_mode";
+                std::filesystem::path sentinel = std::filesystem::path(appdata) / L"UU3D" / game_name / L"dumper_mode";
                 if (std::filesystem::exists(sentinel)) return true;
             }
         } catch (...) { /* fall through to return false */ }

@@ -1124,6 +1124,221 @@ constexpr auto AVOWED_NATIVE_FIX_TRANSITION_HOLD = std::chrono::seconds(10);
 constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_HOLD = std::chrono::milliseconds(1500);
 constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_MAX_MISSING = std::chrono::seconds(60);
 
+// Engine version, resolved without depending on the executable's version
+// resource being the ENGINE's version. Games built from a private engine tree
+// ship neither of the two things the SDK looks at: Elliot (UE5.6.1) stamps
+// Square Enix's own 1.2.0.0 in the version resource and its BRANCH_NAME is just
+// "UE5", not "++UE5+Release-5.6", so every version gate below took its UE4
+// fallback. The engine's own "Unreal Engine <major>.<minor>.<patch>" display
+// string survives that, so use it as a last resort.
+// Returns "<major>.<minor>", or "0.00" when nothing could be established.
+std::string resolved_engine_version_string() {
+    static const std::string result = []() -> std::string {
+        if (const auto branch = sdk::search_for_version(utility::get_executable())) {
+            return utility::narrow(*branch);
+        }
+
+        const auto module = utility::get_executable();
+        const auto module_size = utility::get_module_size(module).value_or(0);
+        constexpr std::wstring_view needle{L"Unreal Engine "};
+        constexpr size_t version_headroom = 16; // major.minor.patch + terminator
+
+        const auto count = module_size / sizeof(wchar_t);
+        const auto start = (const wchar_t*)module;
+
+        auto parse_digits = [](const wchar_t* str, size_t& index, uint32_t& out) {
+            size_t digits = 0;
+            out = 0;
+
+            while (digits < 3 && str[index] >= L'0' && str[index] <= L'9') {
+                out = (out * 10) + (uint32_t)(str[index] - L'0');
+                ++index;
+                ++digits;
+            }
+
+            return digits > 0;
+        };
+
+        for (size_t i = 0; i + needle.size() + version_headroom < count; ++i) try {
+            const wchar_t* ptr = start + i;
+
+            if (ptr[0] != L'U' || ptr[1] != L'n' || std::wmemcmp(ptr, needle.data(), needle.size()) != 0) {
+                continue;
+            }
+
+            const wchar_t* version = ptr + needle.size();
+            size_t index = 0;
+            uint32_t major{};
+            uint32_t minor{};
+
+            if (!parse_digits(version, index, major) || version[index] != L'.') {
+                continue;
+            }
+
+            ++index;
+
+            if (!parse_digits(version, index, minor)) {
+                continue;
+            }
+
+            // Only trust it when it looks like an engine version rather than prose
+            if (major != 4 && major != 5) {
+                continue;
+            }
+
+            SPDLOG_INFO("[EngineVersion] Recovered {}.{} from the embedded \"Unreal Engine\" string", major, minor);
+            return std::to_string(major) + "." + std::to_string(minor);
+        } catch (...) {
+            continue;
+        }
+
+        return "0.00";
+    }();
+
+    return result;
+}
+
+// The SDK resolves FRHITexture::GetNativeResource's vtable slot ONCE, on the
+// first call, and only takes its safe UE5.5/5.6 direct-slot path when the
+// executable's version resource says 5.5/5.6. When the version resource holds
+// a game version instead (see resolved_engine_version_string), it falls back to
+// blind-calling vtable slots 2..14 on a live FRHITexture — which on Elliot hung
+// the render thread for 60 seconds and then killed the engine with
+// "A FRenderResource was deleted without being released first!".
+//
+// We cannot change what the SDK reads, but it consults its discovery cache
+// before that fallback, and it VALIDATES any cached slot with an SEH-guarded
+// call before trusting it. So seed the cache with a slot we established safely
+// ourselves: probe only the slots the UE5.5/5.6 D3D12 layouts actually use,
+// under SEH, and require a real D3D resource back. Must run before the first
+// get_native_resource() call anywhere - see the callers.
+void* seh_call_native_resource_candidate(const void* texture, void* function) {
+    __try {
+        using GetNativeResourceFn = void* (*)(const void*);
+        return ((GetNativeResourceFn)function)(texture);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+void seed_frhitexture_native_resource_slot(FRHITexture2D* texture) {
+    static bool s_done = false;
+
+    if (s_done || texture == nullptr || !g_framework->is_dx12() || IsBadReadPtr(texture, sizeof(void*))) {
+        return;
+    }
+
+    // Only needed while the SDK mis-reads the engine version; when the version
+    // resource is right it already takes the safe path on its own.
+    const auto sdk_version = sdk::get_file_version_info().dwFileVersionMS;
+    if (sdk_version == 0x00050005 || sdk_version == 0x00050006) {
+        s_done = true;
+        return;
+    }
+
+    const auto vtable = *(void***)texture;
+
+    if (vtable == nullptr || IsBadReadPtr(vtable, sizeof(void*) * 15) ||
+        !utility::get_module_within(vtable).has_value()) {
+        return; // not a usable candidate yet; try again on the next texture
+    }
+
+    // FRHITextureDesc placement identifies the layout, and each layout has its
+    // own defensible slot set (same table the SDK uses).
+    const auto texture_address = (uintptr_t)texture;
+    std::optional<uintptr_t> desc_offset{};
+
+    for (const uintptr_t candidate : {(uintptr_t)0x20, (uintptr_t)0xe0, (uintptr_t)0xf0}) {
+        if (IsBadReadPtr((void*)(texture_address + candidate), 0x38)) {
+            continue;
+        }
+
+        const auto extent_x = *(const int32_t*)(texture_address + candidate + 0x24);
+        const auto extent_y = *(const int32_t*)(texture_address + candidate + 0x28);
+        const auto num_mips = *(const uint8_t*)(texture_address + candidate + 0x30);
+        const auto num_samples = *(const uint8_t*)(texture_address + candidate + 0x31);
+        const auto dimension = *(const uint8_t*)(texture_address + candidate + 0x32);
+        const auto format = *(const uint8_t*)(texture_address + candidate + 0x33);
+
+        if (extent_x <= 0 || extent_y <= 0 || extent_x > 65536 || extent_y > 65536 ||
+            num_mips == 0 || num_mips > 32 ||
+            !(num_samples == 1 || num_samples == 2 || num_samples == 4 || num_samples == 8 || num_samples == 16) ||
+            dimension > 8 || format == 0 || format > 128) {
+            continue;
+        }
+
+        desc_offset = candidate;
+        break;
+    }
+
+    if (!desc_offset) {
+        return;
+    }
+
+    std::vector<size_t> slots{};
+    if (*desc_offset == 0xe0) {
+        slots = {7};
+    } else if (*desc_offset == 0xf0) {
+        slots = {5, 4};
+    } else {
+        slots = {4, 5};
+    }
+
+    for (const auto slot : slots) {
+        auto* const func = vtable[slot];
+
+        if (func == nullptr || IsBadReadPtr(func, 1)) {
+            continue;
+        }
+
+        auto* const resource = seh_call_native_resource_candidate(texture, func);
+
+        if (resource == nullptr || IsBadReadPtr(resource, sizeof(void*))) {
+            continue;
+        }
+
+        auto* const resource_vtable = *(void**)resource;
+
+        if (resource_vtable == nullptr || IsBadReadPtr(resource_vtable, sizeof(void*))) {
+            continue;
+        }
+
+        const auto resource_module = utility::get_module_within(resource_vtable);
+        const auto resource_module_path = resource_module ? utility::get_module_path(*resource_module) : std::nullopt;
+
+        if (!resource_module_path) {
+            continue;
+        }
+
+        auto lowered = std::string{*resource_module_path};
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+
+        if (!lowered.ends_with("d3d12.dll") && !lowered.ends_with("d3d12core.dll") && !lowered.ends_with("dxgi.dll")) {
+            continue;
+        }
+
+        if (const auto vtable_module = utility::get_module_within(vtable); vtable_module) {
+            sdk::discovery_cache::save_entry("frhitexture_get_native_resource", *vtable_module, {
+                {"vtable_index", (uint32_t)slot}
+            });
+        }
+
+        s_done = true;
+        SPDLOG_INFO(
+            "[NativeResource] Seeded FRHITexture::GetNativeResource slot {} (desc offset 0x{:x}) so the SDK never "
+            "blind-probes this title's vtable",
+            slot,
+            *desc_offset);
+        return;
+    }
+
+    SPDLOG_WARN_ONCE(
+        "[NativeResource] Could not establish a safe FRHITexture::GetNativeResource slot for texture {:x} "
+        "(desc offset 0x{:x})",
+        (uintptr_t)texture,
+        *desc_offset);
+}
+
 bool is_deadzone_ue56_executable() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -1132,7 +1347,7 @@ bool is_deadzone_ue56_executable() {
             return false;
         }
 
-        const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+        const auto str_version = resolved_engine_version_string();
         const auto file_version = sdk::get_file_version_info();
 
         return str_version.starts_with("5.6") || file_version.dwFileVersionMS == 0x00050006;
@@ -3552,7 +3767,7 @@ bool avowed_native_fix_gate_ready(uint32_t* out_stable_frames = nullptr, uint32_
 
 bool is_ue_5_7_or_newer() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         if (str_version.starts_with("5.7") || str_version.starts_with("5.8") || str_version.starts_with("5.9")) {
@@ -3565,7 +3780,7 @@ bool is_ue_5_7_or_newer() {
 
 bool is_ue_4_27_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("4.27");
@@ -3598,7 +3813,7 @@ bool is_ue_4_25_runtime() {
 
 bool is_ue_4_16_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("4.16");
@@ -3647,7 +3862,7 @@ bool prospi_is_current_game() {
 
 bool is_ue_5_8_or_newer() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         if (str_version.starts_with("5.8") || str_version.starts_with("5.9")) {
@@ -3660,7 +3875,7 @@ bool is_ue_5_8_or_newer() {
 
 bool is_ue_5_8() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.8");
@@ -3672,7 +3887,7 @@ bool is_ue_5_8() {
 
 bool is_ue_5_6_or_newer() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         if (str_version.starts_with("5.6") || str_version.starts_with("5.7") || str_version.starts_with("5.8") || str_version.starts_with("5.9")) {
@@ -3689,7 +3904,7 @@ bool is_ue_5_1_dx12_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.1");
@@ -3704,7 +3919,7 @@ bool is_ue_5_1_dx_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.1");
@@ -3719,7 +3934,7 @@ bool is_ue_5_2_dx_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.2");
@@ -3734,7 +3949,7 @@ bool is_ue_5_3_dx_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.3");
@@ -3745,7 +3960,7 @@ bool is_ue_5_3_dx_backend() {
 
 bool is_ue_5_0_to_5_3_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.0") ||
@@ -3759,7 +3974,7 @@ bool is_ue_5_0_to_5_3_runtime() {
 
 bool is_ue_5_4_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.4");
@@ -3778,7 +3993,7 @@ bool is_ue_5_4_dx_backend() {
 
 bool is_ue_5_5_runtime() {
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.5");
@@ -3809,7 +4024,7 @@ bool is_ue_5_6_dx12_backend() {
     }
 
     static const auto disk_version = sdk::get_file_version_info();
-    static const auto str_version = utility::narrow(sdk::search_for_version(utility::get_executable()).value_or(L"0.00"));
+    static const auto str_version = resolved_engine_version_string();
 
     if (str_version != "0.00") {
         return str_version.starts_with("5.6");
@@ -5810,6 +6025,138 @@ std::optional<RuntimeFunctionRange> get_ue426_427_begin_rendering_viewfamily_ran
     return std::nullopt;
 }
 
+// SEH-probed read. Hooked functions can be reached with arbitrary arguments
+// (ICF-folded modular builds — Returnal), including pointers into live thread
+// stacks whose contents change between a validity check and the dereference.
+// Pointwise IsBadReadPtr/VirtualQuery checks can never make that safe — copy
+// first, interpret the copy.
+static bool nsf_seh_read(const void* src, void* dst, size_t n) {
+    __try {
+        memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// SEH isolation for the native-stereo-fix render passes. Returnal's modular
+// build AVs inside BeginRenderingViewFamilies (its FSR2 view extension calling
+// through nulled state) a few frames after the NSF flow engages. Contain the
+// fault so the interaction disables NSF for the session instead of killing the
+// game — and so the log pinpoints WHICH pass faulted. Plain args only: no
+// unwindable objects may live in a __try frame, hence its own function.
+__declspec(noinline) static bool nsf_run_pass_guarded(
+    safetyhook::InlineHook& hook, void* render_module, sdk::FCanvas* canvas,
+    sdk::FSceneViewFamily* view_family, void* trailing_ptr_arg, uintptr_t trailing_flag_arg) {
+    __try {
+        hook.unsafe_call<void>(render_module, canvas, view_family, trailing_ptr_arg, trailing_flag_arg);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// One fault anywhere in the NSF flow permanently reverts this session to a
+// plain passthrough (no view suppression, no capture pass).
+static bool s_nsf_flow_disabled = false;
+
+// Resolve a family's Views array by VERIFIED offset instead of trusting the one
+// scanned offset. Returnal's Housemarque family has no vtable and a custom
+// leading member (a float — its raw first field reads as 0x..3f800000), which
+// puts Views at +0x8 while the scanner latches the no-vtable default of 0.
+// Reading there yields a non-array: the eye-pair proving loop never sees its two
+// views, so no pair is ever proven and NSF stays inert (doubled geometry in the
+// left eye, black right eye), and writing there would scribble the family.
+//
+// Probe the plausible offsets and accept one only on full verification: sane
+// TArray header, readable pointer array, and EVERY view's owning-family
+// back-pointer naming this exact family. That back-pointer sits at slot 0 on
+// UE4, after the vtable on UE5.6+, and deeper still on Hellblade 2's UE5 build,
+// so search the first 16 qwords — a foreign struct containing this exact family
+// pointer is essentially impossible, which keeps the test definitive. Returns
+// nullptr when nothing verifies, so callers fall back rather than act on
+// garbage. Every read goes through nsf_seh_read.
+static sdk::TArray<sdk::FSceneView*>* nsf_resolve_verified_views(sdk::FSceneViewFamily* view_family) {
+    if (view_family == nullptr) {
+        return nullptr;
+    }
+
+    struct ViewsCopy {
+        sdk::FSceneView** data;
+        uint32_t count;
+        uint32_t capacity;
+    };
+
+    const auto scanned = view_family->get_views(); // pointer arithmetic only, no deref
+    const uintptr_t base = (uintptr_t)view_family;
+    const uintptr_t candidates[6] = {
+        scanned != nullptr ? (uintptr_t)scanned : 0,
+        base + 0x8,
+        base,
+        base + 0x10,
+        base + 0x18,
+        base + 0x20,
+    };
+
+    for (const auto cand : candidates) {
+        if (cand == 0) {
+            continue;
+        }
+
+        ViewsCopy probe{};
+        sdk::FSceneView* probe_views[8]{};
+
+        if (!nsf_seh_read((void*)cand, &probe, sizeof(probe)) ||
+            probe.count == 0 || probe.count > 8 || probe.capacity < probe.count ||
+            probe.data == nullptr ||
+            !nsf_seh_read(probe.data, probe_views, sizeof(void*) * probe.count)) {
+            continue;
+        }
+
+        bool all_backptrs_ok = true;
+        for (uint32_t i = 0; i < probe.count && all_backptrs_ok; ++i) {
+            sdk::FSceneViewFamily* owner_slots[16]{};
+            bool matched = false;
+
+            if (probe_views[i] != nullptr &&
+                nsf_seh_read(probe_views[i], owner_slots, sizeof(owner_slots))) {
+                for (auto* slot : owner_slots) {
+                    if (slot == view_family) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            all_backptrs_ok = matched;
+        }
+
+        if (all_backptrs_ok) {
+            SPDLOG_INFO_ONCE(
+                "[NativeStereoFix] Views verified at family+{:x} (count={}, scanned offset {})",
+                cand - base, probe.count,
+                scanned != nullptr ? (int64_t)((uintptr_t)scanned - base) : -1);
+            return (sdk::TArray<sdk::FSceneView*>*)cand;
+        }
+    }
+
+    // Nothing verified. Fall back to the scanned offset — that is exactly what
+    // the engine-side code did before this helper existed, so titles whose views
+    // simply do not carry a family back-pointer where we search keep working
+    // instead of regressing to an inert NSF. Callers that WRITE through the
+    // result still apply their own plausibility guard.
+    //
+    // This is expected, not an error: cloned families back-point at the original,
+    // and candidates reached with stack-borne garbage never verify. Log it once
+    // at info level so it stays diagnosable without spamming a normal session.
+    SPDLOG_INFO_ONCE(
+        "[NativeStereoFix] A family's views did not pass back-pointer verification; "
+        "using the scanned offset (family {:x}, scanned {:x})",
+        base, (uintptr_t)scanned);
+    return scanned;
+}
+
+
 bool has_begin_rendering_viewfamily_wrapper_shape(const RuntimeFunctionRange& wrapper) {
     // UE5's singular wrapper builds a one-element TArrayView on the stack. Keep
     // this as corroborating evidence rather than the sole resolver condition.
@@ -5932,15 +6279,90 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
         constexpr size_t min_renderer_size = 0x200;
         constexpr size_t max_renderer_size = 0x4000;
 
+        const auto our_module = reinterpret_cast<uintptr_t>(g_framework->get_framework_module());
+
         for (uint32_t i = 1; i < depth && i <= max_renderer_stack_index; ++i) {
             const auto candidate = source_validated_ue4
                 ? get_ue426_427_begin_rendering_viewfamily_range(stack[i])
                 : get_runtime_function_range(stack[i]);
-            if (!candidate || candidate->image_base != game_module ||
-                candidate->size() < min_renderer_size ||
-                candidate->size() > max_renderer_size)
-            {
+            if (!candidate) {
                 continue;
+            }
+
+            // The direct caller is NOT necessarily in the main exe. Modular
+            // shipping builds exist — Returnal ships the engine as per-module
+            // DLLs, so the real caller lives in
+            // Returnal-Renderer-Win64-Shipping.dll. An exe-only filter skips
+            // every correct frame and settles on an unrelated exe frame higher
+            // up the stack (observed: stack_index=10), which is then hooked:
+            // the wrong function receives stack garbage instead of a view
+            // family ("unreadable argument" forever), so the second view is
+            // never suppressed (doubled geometry in the left eye) and the
+            // capture pass never runs (black right eye).
+            //
+            // Accept the first frame in ANY module that is not our own backend.
+            // Also do NOT size-filter a candidate outside the main exe: in
+            // modular builds the vtable points at a tiny page-aligned export
+            // thunk (Returnal: 0x17 bytes) and hooking the THUNK is correct —
+            // every virtual call routes through it.
+            const bool in_main_exe = candidate->image_base == game_module;
+            uintptr_t entry = candidate->begin;
+
+            if (in_main_exe) {
+                if (candidate->size() < min_renderer_size || candidate->size() > max_renderer_size) {
+                    continue;
+                }
+
+                // A chained unwind fragment is not modular-specific: Hellblade 2
+                // ships a single exe and still resolved 0x..e5b, an unaligned
+                // mid-function address that killed the process the instant the
+                // hook installed. Resolve the real entry the same way as below.
+                if (!source_validated_ue4) {
+                    const auto unwind = utility::find_function_start_unwind(stack[i]);
+                    const auto resolved = utility::find_virtual_function_start(unwind ? *unwind : stack[i]);
+
+                    if (resolved) {
+                        entry = *resolved;
+                    } else if (unwind) {
+                        entry = *unwind;
+                    }
+                }
+            } else {
+                if (source_validated_ue4) {
+                    continue; // UE4.26/4.27 keeps upstream's exe-only source validation
+                }
+
+                if (candidate->image_base == 0 || candidate->image_base == our_module) {
+                    continue;
+                }
+
+                // get_runtime_function_range().begin is the start of the
+                // RUNTIME_FUNCTION covering this address, which for a CHAINED
+                // unwind fragment is the fragment — not a callable entry
+                // (Returnal resolved 0x..c017, not even 16-byte aligned;
+                // hooking it killed the process the instant the hook installed).
+                // Unwind first: find_function_start_unwind walks
+                // UNW_FLAG_CHAININFO back to the primary RUNTIME_FUNCTION, and
+                // find_virtual_function_start then confirms a real entry. Never
+                // fall back to the raw return address — it points into the
+                // middle of the frame.
+                const auto unwind = utility::find_function_start_unwind(stack[i]);
+                const auto resolved = utility::find_virtual_function_start(unwind ? *unwind : stack[i]);
+
+                if (resolved) {
+                    entry = *resolved;
+                } else if (unwind) {
+                    // No table reference to the entry (private engine trees
+                    // devirtualize it — Elliot/UE5.6). The unwind entry still
+                    // describes the real function start exactly.
+                    entry = *unwind;
+                    SPDLOG_INFO(
+                        "[ViewFamilySelector] No table reference for the modular entry; using the "
+                        "unwind-resolved start {:x} (stack_index={})",
+                        entry, i);
+                } else {
+                    continue;
+                }
             }
 
             if (source_validated_ue4 &&
@@ -5950,7 +6372,7 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
                 continue;
             }
 
-            best_candidate = candidate->begin;
+            best_candidate = entry;
             if (source_validated_ue4) {
                 SPDLOG_INFO(
                     "[UE4.26/4.27][ViewFamilySelector] Resolved source-validated direct "
@@ -5962,11 +6384,16 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
             } else {
                 SPDLOG_INFO(
                     "[ViewFamilySelector] Resolved direct BeginRenderingViewFamily entry from stack "
-                    "target={:x} size={:x} return={:x} stack_index={}",
+                    "target={:x} (range_begin={:x}) size={:x} return={:x} stack_index={} module={} in_main_exe={}",
+                    entry,
                     candidate->begin,
                     candidate->size(),
                     stack[i],
-                    i);
+                    i,
+                    utility::get_module_pathw(reinterpret_cast<HMODULE>(candidate->image_base))
+                        .transform([](const auto& p) { return std::filesystem::path{p}.filename().string(); })
+                        .value_or("<unknown>"),
+                    in_main_exe);
             }
             break;
         }
@@ -14086,6 +14513,41 @@ bool FFakeStereoRenderingHook::refresh_ghosting_fix_owner(GhostingFixPair& pair,
     return true;
 }
 
+namespace {
+// FSceneViewInitOptions::ViewFamily is reached through a SCANNED offset. When
+// that scan lands wrong the "family" is whatever bytes live there, and reading
+// its scene interface dereferences a non-canonical address — which Windows
+// reports as EXCEPTION_ACCESS_VIOLATION "reading address 0xffffffffffffffff",
+// inside the engine's own FSceneView constructor (Hellblade 2 on inject;
+// FANTASY LIFE i likewise).
+//
+// Probe both reads under SEH and report absence rather than dying: every
+// consumer downstream already has a path for a null family/scene. Its own
+// function because sceneview_constructor holds objects that need unwinding, and
+// __try cannot coexist with those in one frame.
+__declspec(noinline) bool try_read_view_family_and_scene(sdk::FSceneViewInitOptions* init_options,
+                                                         sdk::FSceneViewFamily** out_family,
+                                                         sdk::FSceneInterface** out_scene) {
+    *out_family = nullptr;
+    *out_scene = nullptr;
+
+    __try {
+        auto* family = init_options->get_view_family();
+
+        if (family != nullptr) {
+            *out_scene = family->get_scene_interface();
+        }
+
+        *out_family = family;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *out_family = nullptr;
+        *out_scene = nullptr;
+        return false;
+    }
+}
+}
+
 // FSceneView constructor hook
 sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
     SPDLOG_INFO_ONCE("Called FSceneView constructor for the first time");
@@ -14179,10 +14641,12 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     auto* native_effective_scene_state = init_options_scene_state;
     const auto init_options_original_stereo_pass = init_options->get_stereo_pass();
     const auto init_options_player_index = init_options->get_player_index();
-    const auto init_options_view_family = init_options->get_view_family();
-    const auto init_options_scene = init_options_view_family != nullptr
-        ? init_options_view_family->get_scene_interface()
-        : nullptr;
+    sdk::FSceneViewFamily* init_options_view_family = nullptr;
+    sdk::FSceneInterface* init_options_scene = nullptr;
+    if (!try_read_view_family_and_scene(init_options, &init_options_view_family, &init_options_scene)) {
+        SPDLOG_WARN_ONCE("[SceneView] Reading FSceneViewInitOptions::ViewFamily faulted — the scanned offset is "
+                         "wrong for this build. Continuing without the family; stereo may degrade to mono.");
+    }
     const bool split_fiction_haze_context =
         g_split_fiction_haze_view_build.active &&
         split_fiction_is_current_game() &&
@@ -14292,6 +14756,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 : is_ue5
                     ? init_options_ue5->constrained_view_rect
                     : init_options->constrained_view_rect;
+
         auto& init_options_projection_matrix = init_options->projection_matrix;
         auto& init_options_projection_matrix_ue5 =
             is_ue50_to_53
@@ -14466,18 +14931,47 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     "[NativeStereoFix] Preserving UE5.5+ SECONDARY pass identity for modern per-eye renderer paths");
             }
 
-            if (is_ue5) {
+            {
+                // Verified offset: this path WRITES count = 0, and Returnal's
+                // family layout puts another member where the scan points, so a
+                // raw get_views() write would scribble the family.
                 auto view_family = init_options->get_view_family();
-                auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+                auto views = nsf_resolve_verified_views(view_family);
 
                 if (views != nullptr && use_primary_constructor_pass) {
+                    // A relabeled PRIMARY constructed with the multi-view family
+                    // visible runs the constructor's special stereo logic
+                    // (instanced-stereo/family lookups) — on UE4 this doubles
+                    // the pass geometry and breaks the scene-capture render.
                     // UE5.5+ indexes the primary view while constructing a
-                    // secondary pass. Never hide this list unless the temporary
-                    // constructor pass has also been relabeled as PRIMARY.
-                    views_original_count = views->count;
-                    views->count = 0;
-                    SPDLOG_INFO_ONCE(
-                        "[NativeStereoFix] Hiding FSceneViewFamily views during secondary-view construction");
+                    // secondary pass, so the list is still only hidden when the
+                    // temporary constructor pass has been relabeled as PRIMARY.
+                    //
+                    // Only write through a views array that LOOKS like one:
+                    // custom family layouts (Returnal/Housemarque) put other
+                    // members at the scanned offset, and writing 0 there
+                    // scribbles the family (driver-crash class).
+                    struct {
+                        void* data;
+                        uint32_t count;
+                        uint32_t capacity;
+                    } hide_probe{};
+
+                    const bool hide_plausible = nsf_seh_read(views, &hide_probe, sizeof(hide_probe)) &&
+                        hide_probe.count <= 8 && hide_probe.capacity >= hide_probe.count &&
+                        (hide_probe.count == 0 || hide_probe.data != nullptr);
+
+                    if (hide_plausible) {
+                        views_original_count = views->count;
+                        views->count = 0;
+                        SPDLOG_INFO_ONCE(
+                            "[NativeStereoFix] Hiding FSceneViewFamily views during secondary-view construction");
+                    } else {
+                        SPDLOG_WARN_ONCE(
+                            "[NativeStereoFix] NOT hiding views: array at scanned offset fails plausibility "
+                            "(count={} cap={} data={:x}) — family layout differs from scan",
+                            hide_probe.count, hide_probe.capacity, (uintptr_t)hide_probe.data);
+                    }
                 }
             }
         }
@@ -15143,10 +15637,12 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         g_hook->m_sceneview_data.splitscreen_state = SplitScreenCompatibilityState::Off;
     }
 
-    // Reset the view count back to what it was.
+    // Reset the view count back to what it was. Must resolve the array exactly
+    // like the hiding path above did — restoring through a different offset
+    // would write the count into an unrelated family member.
     if (views_original_count.has_value()) {
         auto view_family = init_options->get_view_family();
-        auto views = view_family != nullptr ? view_family->get_views() : nullptr;
+        auto views = nsf_resolve_verified_views(view_family);
 
         if (views != nullptr) {
             views->count = views_original_count.value();
@@ -15783,7 +16279,24 @@ void FFakeStereoRenderingHook::localplayer_setup_viewpoint(void* localplayer, vo
     g_hook->m_localplayer_get_viewpoint_hook.call<void>(localplayer, view_info, pass);
 }
 
-void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
+// The hooked function is NOT always the 3-argument singular overload. The
+// pre-UE5.7 resolver hooks whatever DIRECTLY called the view extension, which in
+// modular builds is the wider renderer entry (Returnal:
+// Returnal-Renderer-Win64-Shipping.dll). Re-calling that with only three
+// arguments constructs the scene renderer with whatever garbage is left in
+// r9/[rsp+0x28] — which AVs inside the engine's own view extensions a few frames
+// after the NSF flow engages. Accept and forward both trailing arguments; on the
+// older 3-argument shape the callee simply ignores them and passing them costs
+// nothing.
+static void nsf_brvf_member_handler(void* render_module, sdk::FCanvas* canvas,
+                                    sdk::FSceneViewFamily* view_family_candidate,
+                                    void* trailing_ptr_arg, uintptr_t trailing_flag_arg) {
+    FFakeStereoRenderingHook::begin_render_viewfamily_real(
+        render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
+}
+
+void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate,
+                                                            void* trailing_ptr_arg, uintptr_t trailing_flag_arg) {
     ZoneScopedN("BeginRenderViewFamilyReal");
     g_hook->m_render_module_begin_render_viewfamily_observed.store(true, std::memory_order_release);
     const auto profile_engine_render = should_profile_engine_render_timing();
@@ -15801,7 +16314,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamilyReal for the first time");
 
     if (!g_framework->is_game_data_intialized()) {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         return;
     }
 
@@ -15809,6 +16322,12 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     auto rtm = g_hook->get_render_target_manager();
     const bool split_screen_enabled = vr->is_splitscreen_compatibility_enabled();
     const bool native_stereo_fix_enabled = vr->is_native_stereo_fix_enabled();
+
+    if (s_nsf_flow_disabled) {
+        // A pass already faulted this session; never re-enter the NSF flow.
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
+        return;
+    }
 
     if (!vr->is_hmd_active() || (!native_stereo_fix_enabled && !split_screen_enabled)) {
         avowed_native_fix_gate_reset("hmd inactive or native stereo fix disabled");
@@ -15831,7 +16350,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
             g_hook->m_sceneview_data.splitscreen_state = SplitScreenCompatibilityState::Off;
         }
 
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         return;
     }
 
@@ -15841,7 +16360,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     };
 
     const auto call_original = [&]() {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
     };
     const auto reject_candidate = [&](const char* reason) {
         SPDLOG_WARNING_EVERY_N_SEC(
@@ -15851,7 +16370,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         call_original();
     };
 
-    if (view_family_candidate == nullptr || !is_readable_process_range((uintptr_t)view_family_candidate, sizeof(void*))) {
+    // SEH-probed COPY, not a pointwise readability check. In ICF-folded modular
+    // builds (Returnal) this hooked address is reached with arbitrary arguments,
+    // including pointers into live thread stacks whose mapping/contents change
+    // between a VirtualQuery and the dereference — is_readable_process_range
+    // rejects those outright ("unreadable argument" on every call, leaving NSF
+    // inert: doubled geometry in the left eye, black right eye). Copy first and
+    // interpret the copy.
+    uintptr_t first_word{};
+    if (view_family_candidate == nullptr ||
+        !nsf_seh_read(view_family_candidate, &first_word, sizeof(first_word))) {
         reject_candidate("unreadable argument");
         return;
     }
@@ -15859,8 +16387,6 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     const auto strict_candidate_validation =
         dune_awakening_is_current_game() || split_screen_enabled || native_stereo_fix_enabled;
     const auto expected_vtable = reinterpret_cast<uintptr_t>(sdk::FSceneViewFamily::get_vtable_ptr());
-    uintptr_t first_word{};
-    std::memcpy(&first_word, view_family_candidate, sizeof(first_word));
 
     const auto uses_tarrayview = sdk::FSceneViewFamily::has_vtable() && first_word != expected_vtable;
     constexpr size_t max_sane_view_families = 16;
@@ -16364,7 +16890,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
                 continue;
             }
 
-            auto* const candidate_views = family->get_views();
+            // Verified offset, not the scanned one — see nsf_resolve_verified_views.
+            // Returnal's family puts Views at +0x8 while the scan latches 0, so the
+            // raw lookup never yields the two views and no pair is ever proven.
+            auto* const candidate_views = nsf_resolve_verified_views(family);
             if (candidate_views == nullptr ||
                 !is_readable_process_range(reinterpret_cast<uintptr_t>(candidate_views), sizeof(*candidate_views)) ||
                 candidate_views->count != 2 || candidate_views->capacity < 2 ||
@@ -16540,35 +17069,22 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     }
 
     if (view_family == nullptr || IsBadReadPtr(view_family, sizeof(void*))) {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate);
+        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family_candidate, trailing_ptr_arg, trailing_flag_arg);
         return;
     }
 
-    auto views_ptr = view_family->get_views();
-    if (views_ptr == nullptr) {
-        call_original();
+    // Verified offset, not the scanned one (see nsf_resolve_verified_views).
+    auto* views_ptr = nsf_resolve_verified_views(view_family);
+    if (views_ptr == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(views_ptr), sizeof(*views_ptr)) ||
+        views_ptr->count == 0 || views_ptr->count > 16 ||
+        views_ptr->capacity < views_ptr->count || views_ptr->data == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(views_ptr->data), sizeof(void*) * views_ptr->count)) {
+        reject_candidate("no usable views array for this family");
         return;
     }
 
-    if (strict_candidate_validation)
-    {
-        if (!is_readable_process_range((uintptr_t)views_ptr, sizeof(*views_ptr))) {
-            reject_candidate("unreadable Views array");
-            return;
-        }
-
-        constexpr uint32_t max_sane_views = 16;
-        if (views_ptr->count == 0 || views_ptr->count > max_sane_views ||
-            views_ptr->capacity < views_ptr->count ||
-            views_ptr->data == nullptr ||
-            !is_readable_process_range((uintptr_t)views_ptr->data, sizeof(void*) * views_ptr->count))
-        {
-            reject_candidate("invalid Views data/count");
-            return;
-        }
-    }
-
-    auto& views = *views_ptr;
+    auto& views = *views_ptr; // verified above - safe to use directly now
     const auto prev_count = views.count;
 
     if (auto view_family_target = view_family->get_render_target(); view_family_target != nullptr) {
@@ -16684,8 +17200,13 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         view_family->set_render_target(original_target);
     }};
 
+    // Flat3D is a THIRD runtime alongside OpenXR/OpenVR. Upstream only knows the
+    // two XR ones and fails closed here on anything else, which under 3D Display
+    // kills NSF on every frame (doubled geometry in the left eye, black right
+    // eye) even though the flow needs no compositor at all — the pose-cloning
+    // below is skipped for Flat3D and the capture pass is what we actually want.
     auto runtime = vr->get_runtime();
-    if (runtime == nullptr || (!runtime->is_openxr() && !runtime->is_openvr())) {
+    if (runtime == nullptr || (!runtime->is_openxr() && !runtime->is_openvr() && !runtime->is_flat3d())) {
         g_hook->invalidate_native_stereo_frame_packet(
             NativeStereoFixState::FailedClosed,
             "active XR runtime is unavailable or unsupported");
@@ -16905,7 +17426,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         const auto now_frame = (runtime_frame_count + 1) % runtimes::OpenXR::QUEUE_SIZE;
         openxr->pipeline_states[now_frame] = openxr->pipeline_states[last_frame];
         openxr->pipeline_states[now_frame].frame_count = now_frame;
-    } else {
+    } else if (runtime->is_openvr()) {
         auto* openvr = static_cast<runtimes::OpenVR*>(runtime);
         if (openvr->pose_queue.empty()) {
             g_hook->invalidate_native_stereo_frame_packet(
@@ -16920,32 +17441,67 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         const auto now_frame = (runtime_frame_count + 1) % openvr->pose_queue.size();
         openvr->pose_queue[now_frame] = openvr->pose_queue[last_frame];
     }
+    // Flat3D: no compositor pose queue to clone — an unguarded else would
+    // static_cast the Flat3D runtime to runtimes::OpenVR* and walk pose_queue.
 
     // Render the proven primary view through the game's complete original
     // family array so auxiliary families keep their normal behavior.
     views.data[0] = native_left_view;
     views.data[1] = native_right_view;
     views.count = 1;
-    call_original();
+
+    // Both passes run under SEH: a modular build can AV inside the engine's own
+    // view extensions once the NSF flow engages (Returnal). Disable NSF for the
+    // session on a fault rather than taking the process down with us.
+    if (!nsf_run_pass_guarded(
+            g_hook->m_render_module_begin_render_viewfamily_hook, render_module, canvas, view_family_candidate,
+            trailing_ptr_arg, trailing_flag_arg)) {
+        s_nsf_flow_disabled = true;
+        vr->m_native_stereo_fix->value() = false; // coherent fallback: stops capture churn too
+        SPDLOG_ERROR(
+            "[NativeStereoFix] Main (first) render pass FAULTED with the NSF flow active — "
+            "turning Native Stereo Fix OFF for this session");
+        views.count = prev_count;
+        return;
+    }
 
     // Render only the proven secondary view into the generation-owned target.
     view_family->set_render_target(rtfrt);
     views.data[0] = native_right_view;
     views.count = 1;
 
+    bool decremented = false;
     if (auto* scene = reinterpret_cast<sdk::FScene*>(view_family_scene); scene != nullptr) {
         scene->decrement_frame_count();
+        decremented = true;
     }
 
+    bool capture_ok = false;
     if (uses_tarrayview) {
         sdk::FSceneViewFamily* selected_family = view_family;
         TArrayViewViewFamily second_family_array{&selected_family, 1};
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(
+        capture_ok = nsf_run_pass_guarded(
+            g_hook->m_render_module_begin_render_viewfamily_hook,
             render_module,
             canvas,
-            reinterpret_cast<sdk::FSceneViewFamily*>(&second_family_array));
+            reinterpret_cast<sdk::FSceneViewFamily*>(&second_family_array),
+            trailing_ptr_arg,
+            trailing_flag_arg);
     } else {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family);
+        capture_ok = nsf_run_pass_guarded(
+            g_hook->m_render_module_begin_render_viewfamily_hook, render_module, canvas, view_family,
+            trailing_ptr_arg, trailing_flag_arg);
+    }
+
+    if (!capture_ok) {
+        s_nsf_flow_disabled = true;
+        vr->m_native_stereo_fix->value() = false;
+        SPDLOG_ERROR(
+            "[NativeStereoFix] Second (capture) render pass FAULTED — turning Native Stereo Fix OFF "
+            "for this session. decrement_applied={}",
+            decremented);
+        views.count = prev_count;
+        return;
     }
 
     publish_native_packet();
@@ -17114,7 +17670,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
 
             g_hook->m_render_module_begin_render_viewfamily_hook = safetyhook::create_inline(
                 reinterpret_cast<uintptr_t>(begin_rendering_view_family_real_fn),
-                reinterpret_cast<uintptr_t>(&begin_render_viewfamily_real));
+                reinterpret_cast<uintptr_t>(&nsf_brvf_member_handler));
 
             if (g_hook->m_render_module_begin_render_viewfamily_hook) {
                 SPDLOG_INFO("[ViewFamilySelector] Hooked BeginRenderingViewFamilies real function");
@@ -19436,7 +19992,32 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     if (vr->is_using_afr() && !is_full_pass) {
         true_index = g_frame_count % 2;
 
-        if (!vr->is_using_synchronized_afr() && !vr->is_using_afw()) {
+        // Flat3D: alternate the eye per DRAW, not per engine frame number.
+        // Some titles (Hogwarts) keep the frame number for the forced synced-
+        // sequential draw — raw %2 then renders the SAME eye twice per pair,
+        // collapsing the stereo baseline (squished depth). A stalled frame
+        // number takes the complement of the previous draw's eye; the
+        // projection hook consumes m_afr_draw_index for the same draw.
+        if (vr->is_using_flat3d()) {
+            int idx = (int)(g_frame_count % 2);
+            if (g_hook->m_afr_draw_frame == (int64_t)g_frame_count && g_hook->m_afr_draw_index >= 0) {
+                idx = g_hook->m_afr_draw_index ^ 1;
+                if (auto* f = vr->get_flat3d_runtime(); f != nullptr) {
+                    f->pair_stall_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            g_hook->m_afr_draw_frame = (int64_t)g_frame_count;
+            g_hook->m_afr_draw_index = idx;
+            true_index = idx;
+        }
+
+        // Plain-AFR rotation latch: freeze one HMD pose across the AFR pair so
+        // the eyes don't shear apart under head motion. HMD-only — under
+        // Flat3D the rotation IS the game camera: latching makes the right eye
+        // lag a frame, and any special pass that enters here on even parity
+        // (map/portrait scene captures are typically top-down) poisons the
+        // latch and pins the right eye looking at the ground.
+        if (!vr->is_using_synchronized_afr() && !vr->is_using_afw() && !vr->is_using_flat3d()) {
             if (g_hook->m_has_double_precision) {
                 if (true_index == 1) {
                     *rot_d = g_hook->m_last_afr_rotation_double;
@@ -19449,6 +20030,44 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 } else {
                     g_hook->m_last_afr_rotation = *view_rotation;
                 }
+            }
+        }
+    }
+
+    // Synced Sequential pair detector (Flat3D): the forced second draw of a
+    // pair runs on unticked game state, so its RAW camera (view location +
+    // rotation as passed in, before any eye offset / OpenTrack mutation) is
+    // bit-identical to the first draw's. Push one match record per eye draw;
+    // the present path consumes them FIFO to publish complete same-state
+    // pairs (build_flat3d_frame_params). No de-dup and no other heuristics:
+    // when this signal is absent or ambiguous the consumer falls back to
+    // NAIVE per-present publishing — a wrongly-aligned pair lock shows a
+    // cross-state pair on EVERY present, which is strictly worse than naive
+    // (matched pair every other present).
+    if (!is_full_pass && vr->is_using_flat3d() && vr->is_using_synchronized_afr()) {
+        if (auto* f = vr->get_flat3d_runtime(); f != nullptr) {
+            uint8_t sig[48]{};
+            const size_t comp = has_double_precision ? sizeof(double) : sizeof(float);
+            memcpy(sig, view_location, comp * 3);
+            memcpy(sig + comp * 3, view_rotation, comp * 3);
+            const size_t len = comp * 6;
+            const bool match = f->prev_cam_sig_len == len && memcmp(f->prev_cam_sig, sig, len) == 0;
+            memcpy(f->prev_cam_sig, sig, len);
+            f->prev_cam_sig_len = len;
+
+            std::scoped_lock _{f->pair_mtx};
+            f->pair_push_count++;
+            if (match) {
+                f->pair_match_count++;
+            }
+            const uint8_t flags = (match ? 1u : 0u) |
+                ((g_hook->m_afr_draw_index >= 0 ? ((uint8_t)g_hook->m_afr_draw_index & 1u) : 0u) << 1);
+            f->pair_second_fifo.push_back({(uint32_t)g_frame_count, flags});
+            if (f->pair_second_fifo.size() > 8) {
+                // Draw->present correspondence lost (draws outpacing presents):
+                // records no longer describe the frames being presented. Reset
+                // to naive rather than consume stale, misaligning values.
+                f->pair_second_fifo.clear();
             }
         }
     }
@@ -19577,7 +20196,9 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
         *view_location += camera_up;
     }
 
-    const auto is_2d_screen = vr->is_using_2d_screen();
+    // Flat 3D monitor mode reuses the 2D-screen neutralization: skip head
+    // translation and rotation overwrite (no HMD), keep eye separation.
+    const auto is_2d_screen = vr->is_using_2d_screen() || vr->is_using_flat3d();
 
     const auto rotation_offset = vr->get_rotation_offset();
     const auto current_hmd_rotation = glm::normalize(rotation_offset * glm::quat{vr->get_rotation(0)});
@@ -19604,7 +20225,6 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     // if we have stereo emulation mode enabled
     // it is only for debugging purposes
     if (!vr->is_stereo_emulation_enabled()) {
-
         if (!has_double_precision) {
             if (!is_2d_screen) {
                 *view_location -= head_offset;
@@ -19630,6 +20250,59 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 rot_d->pitch = euler.x;
                 rot_d->yaw = euler.y;
                 rot_d->roll = euler.z;
+            }
+        }
+
+        // Flat 3D + OpenTrack head tracking (v2): additive TrackIR-style look
+        // (head rotation added on top of the game's own camera) and
+        // head-coupled parallax (camera-local translation). Pure no-op when
+        // OpenTrack is off — the game keeps its rotation and only the fixed
+        // eye separation applies (as above).
+        if (vr->is_using_flat3d()) {
+            auto* f = vr->get_flat3d_runtime();
+
+            if (f != nullptr && f->opentrack_active.load()) {
+                const float rs = vr->get_flat3d_opentrack_rot_scale();
+                const float ps = vr->get_flat3d_opentrack_pos_scale();
+
+                // Read the current (game) view yaw to build a camera-local
+                // basis for the positional shift.
+                const float base_yaw_deg = has_double_precision ? (float)rot_d->yaw : view_rotation->yaw;
+                const float add_pitch = glm::degrees(f->head_pitch.load()) * rs;
+                const float add_yaw   = glm::degrees(f->head_yaw.load())   * rs;
+                const float add_roll  = glm::degrees(f->head_roll.load())  * rs;
+
+                if (!has_double_precision) {
+                    view_rotation->pitch += add_pitch;
+                    view_rotation->yaw   += add_yaw;
+                    view_rotation->roll  += add_roll;
+                } else {
+                    rot_d->pitch += add_pitch;
+                    rot_d->yaw   += add_yaw;
+                    rot_d->roll  += add_roll;
+                }
+
+                // Positional parallax: translate the eye origin by head x/y/z
+                // in the game camera's local frame (yaw-only basis, UE X=fwd,
+                // Y=right, Z=up), scaled to world units.
+                const float yaw_rad = glm::radians(base_yaw_deg);
+                const float cy = std::cos(yaw_rad);
+                const float sy = std::sin(yaw_rad);
+                const float hx = f->head_x.load() * ps * world_scale; // right
+                const float hy = f->head_y.load() * ps * world_scale; // up
+                const float hz = f->head_z.load() * ps * world_scale; // forward
+
+                // forward = (cy, sy, 0), right = (sy, -cy, 0), up = (0,0,1)
+                const glm::vec3 head_shift{
+                    hz * cy + hx * sy,
+                    hz * sy - hx * cy,
+                    hy};
+
+                if (!has_double_precision) {
+                    *view_location -= head_shift;
+                } else {
+                    *view_d -= head_shift;
+                }
             }
         }
 
@@ -19975,6 +20648,157 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         } else {
             (*out)[3][2] = sdk::globals::get_near_clipping_plane();
         }
+    }
+
+    // Flat 3D monitor mode: game-FoV perspective + off-axis shear at [2][0].
+    // Shear delta = dir * (sep/2 / convergence) * P00 — the classic
+    // parallel-cameras + asymmetric-frustum method (VRto3D / perfect_dark_3D):
+    // geometry at z == convergence lands at zero disparity, nearer pops out.
+    //
+    // The matrix produced by the "original" call above is NOT the game
+    // camera's projection — the hooked function is UE's built-in
+    // FFakeStereoRenderingDevice (hardcoded ~126° FoV, 640x480 aspect), and
+    // when no direct hook exists `out` is untouched garbage. So the game's
+    // real FoV is sampled from APlayerCameraManager (game thread) and the
+    // projection is rebuilt with the engine's own reversed-Z infinite-far
+    // construction (same shape as the 2d-screen path below).
+    if (vr->is_using_flat3d() && out != nullptr) {
+        auto true_index = index_starts_from_one ? ((view_index + 1) % 2) : (view_index % 2);
+
+        if (vr->is_using_afr()) {
+            // Use the per-draw eye the view-offset hook chose (it alternates
+            // even when the engine keeps its frame number for the forced
+            // synced draw — see m_afr_draw_index). Raw %2 here would put the
+            // same shear on both halves of such a pair.
+            true_index = g_hook->m_afr_draw_index >= 0 ? g_hook->m_afr_draw_index : (int)(g_frame_count % 2);
+        }
+
+        auto* flat3d = vr->get_flat3d_runtime();
+
+        // Once per frame (this is called once per eye).
+        static uint32_t fov_sample_frame = 0xFFFFFFFF;
+        if (fov_sample_frame != (uint32_t)g_frame_count) {
+            fov_sample_frame = (uint32_t)g_frame_count;
+            flat3d->game_fov_deg.store(vr->sample_flat3d_game_fov(flat3d->game_fov_deg.load()));
+            flat3d->game_fov_is_vertical.store(vr->sample_flat3d_fov_is_vertical(flat3d->game_fov_is_vertical.load()));
+            flat3d->game_wants_cursor.store(vr->sample_flat3d_show_cursor(flat3d->game_wants_cursor.load()));
+            flat3d->game_paused.store(vr->sample_flat3d_game_paused(flat3d->game_paused.load()));
+            vr->sample_flat3d_camera_and_publish_anchors();
+        }
+
+        const float half_fov = glm::radians(flat3d->game_fov_deg.load()) * 0.5f;
+        const float rt_w = (float)flat3d->get_width();
+        const float rt_h = (float)flat3d->get_height();
+        const float aspect = rt_h > 0.0f && rt_w > 0.0f ? (rt_w / rt_h) : (16.0f / 9.0f);
+
+        float tan_half_h = glm::tan(half_fov);
+
+        // The sampled angle may be the VERTICAL FoV (UE's MaintainYFOV / portrait
+        // constraint — see VR::sample_flat3d_fov_is_vertical). Widen it to the
+        // horizontal one through the per-eye aspect, which reproduces UE's own
+        // XAxisMultiplier = H/W exactly: xs = (H/W)/tan == 1/(tan * aspect).
+        // Without this the frustum is far too narrow and the scene renders
+        // heavily zoomed in.
+        if (flat3d->game_fov_is_vertical.load()) {
+            tan_half_h *= aspect;
+        }
+
+        // User FoV scale (see VR::flat3d_fov_multiplier). Applied ON TOP of the
+        // game's live FoV sampled above, so the game keeps driving the camera
+        // (ADS zoom, cine cameras) and this only widens/narrows it. >1 widens the
+        // frustum, which zooms the rendered scene OUT. Logged on change only —
+        // this is a normal setting, not a per-frame event.
+        if (const float fov_mult = vr->flat3d_fov_multiplier(); fov_mult != 1.0f) {
+            tan_half_h *= fov_mult;
+
+            static float last_logged_fov_mult = 1.0f;
+
+            if (fov_mult != last_logged_fov_mult) {
+                last_logged_fov_mult = fov_mult;
+                SPDLOG_INFO("[Flat3D][fov] FoV multiplier {:.3f}: hfov {:.2f} -> {:.2f} deg",
+                    fov_mult, glm::degrees(2.0f * half_fov), glm::degrees(2.0f * std::atan(tan_half_h)));
+            }
+        }
+
+        // Our-side near-plane resolver (SDK dummy -> r.SetNearClipPlane / UE
+        // default) so the UESDK submodule stays pristine. See VR::flat3d_effective_nearz.
+        const float near_z = vr->flat3d_effective_nearz();
+
+        // Effective separation must match the eye translation the view path
+        // applies (eyes[] x world_to_meters x world_scale); convergence stays
+        // in game meters, so only world_scale enters the ratio.
+        const float sep = flat3d->separation_m.load() * vr->get_world_scale(); // meters
+        const float conv = std::max(flat3d->convergence_m.load(), 0.001f);     // meters
+        const float o = sep * 0.5f / conv; // frustum shear offset (tangent units)
+
+        // Symmetric-projection compat — driven by the same Compatibility page
+        // setting the HMD paths use (Horizontal Projection = Symmetrical in
+        // OpenVR/OpenXR.cpp: widen the tangents to a symmetric superset,
+        // compensate by cropping — here the compositor crops via the scene
+        // shift+scale instead of submit view_bounds). The flat3d frustum is
+        // already vertically symmetric and horizontally mirrored between the
+        // eyes, so the Vertical override and Mirrored are inherently no-ops.
+        const bool symmetric = vr->get_horizontal_projection_override() == VR::HORIZONTAL_PROJECTION_OVERRIDE::HORIZONTAL_SYMMETRIC;
+
+        // Horizontal scale: original tangent, widened by |o| when symmetric.
+        const float xs_tan = symmetric ? (tan_half_h + o) : tan_half_h;
+        const float xs = xs_tan > 0.0f ? (1.0f / xs_tan) : 1.0f;
+        // Vertical FoV is unchanged in either mode.
+        const float ys = (tan_half_h > 0.0f ? (1.0f / tan_half_h) : 1.0f) * aspect;
+
+        // Sign: in UE's projection convention (z forward, w = z) the LEFT eye
+        // shear is NEGATIVE. Proof via the HMD chain this mode mirrors:
+        // VRto3D returns left-eye tangents {l = -t+o, r = t+o} with
+        // o = +sep/2/conv, and OpenVR.cpp's get_mat maps raw tangents into
+        // [2][0] = (l'+r')/(l'-r') with l' = -l, r' = -r, giving -o*P00.
+        const float dir = (true_index == 0) ? -1.0f : 1.0f;                    // left -, right +
+        const float shear = symmetric ? 0.0f : dir * o * xs;
+
+        vr->m_nearz = near_z;
+        flat3d->update_matrices(near_z, 10000.0f);
+
+        // AFW warp camera data: this branch returns before the HMD path's
+        // render_projection_matrix write below, which used to leave the matrix
+        // zero — update_camera_data() then fed the frame-warp plugin garbage
+        // view->clip matrices under Flat3D. Mirror that write here with the
+        // same conversion (UE z-forward/w=z clip -> RH w=-z, near plane scaled
+        // to meters via -1/world_to_meters, off-center terms sign-flipped).
+        {
+            const auto wtm = vr->get_world_to_meters();
+            const float near_m = wtm != 0.0f ? (-near_z / wtm) : -near_z;
+            Matrix4x4f warp_proj{
+                xs, 0.0f, 0.0f, 0.0f,
+                0.0f, ys, 0.0f, 0.0f,
+                -shear, 0.0f, -1.0f, -1.0f,
+                0.0f, 0.0f, near_m, 0.0f
+            };
+            vr->render_projection_matrix[true_index].curr = warp_proj;
+            warp_proj[2][0] = shear; // the other eye mirrors the shear
+            vr->render_projection_matrix[true_index].other = warp_proj;
+        }
+
+        if (!g_hook->m_has_double_precision) {
+            *out = Matrix4x4f {
+                xs, 0.0f, 0.0f, 0.0f,
+                0.0f, ys, 0.0f, 0.0f,
+                shear, 0.0f, 0.0f, 1.0f,
+                0.0f, 0.0f, near_z, 0.0f
+            };
+
+            flat3d->set_game_projection((uint32_t)true_index, *out, tan_half_h, 1.0f / ys, near_z);
+        } else {
+            auto& dm = *(Matrix4x4d*)out;
+            dm = Matrix4x4d {
+                (double)xs, 0.0, 0.0, 0.0,
+                0.0, (double)ys, 0.0, 0.0,
+                (double)shear, 0.0, 0.0, 1.0,
+                0.0, 0.0, (double)near_z, 0.0
+            };
+
+            flat3d->set_game_projection((uint32_t)true_index, Matrix4x4f{dm}, tan_half_h, 1.0f / ys, near_z);
+        }
+
+        return out;
     }
 
     if (medium_one_based_projection_pass && (view_index < 1 || view_index > 2)) {
@@ -25596,8 +26420,16 @@ void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewpo
         this->request_dedicated_ui_target(x, y);
     }
 
-    x = VR::get()->get_hmd_width() * 2;
+    // See VR::flat3d_single_view_target.
+    const auto single_view = VR::get()->flat3d_single_view_target();
+
+    x = VR::get()->get_hmd_width() * (single_view ? 1 : 2);
     y = VR::get()->get_hmd_height();
+
+    if (single_view) {
+        SPDLOG_INFO_ONCE("[Flat3D] SINGLE-view render target {}x{}: one view per frame owns the WHOLE surface, "
+                         "so a double-wide would leave it covering only the left half", x, y);
+    }
 
     SPDLOG_DEBUG("RenderTargetSize After: {}x{}", x, y);
 }
@@ -25753,6 +26585,39 @@ bool VRRenderTargetManager_Base::need_reallocate_depth_texture(const void* Depth
     }
 
     return false;
+}
+
+// Size for the redirected UI (Slate) render target. Normally the backbuffer
+// size — but under the 3D Display native-output override the swapchain is
+// held at the display's native size while the ENGINE believes (and draws
+// Slate at) its own requested resolution; the UI target must match that
+// belief or the UI renders cropped into a corner of the larger texture.
+static auto get_ui_texture_size() {
+    auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+
+    if (VR::get()->is_using_flat3d()) {
+        uint32_t believed_w = 0;
+        uint32_t believed_h = 0;
+
+        if (g_framework->is_dx11()) {
+            if (const auto& hook = g_framework->get_d3d11_hook(); hook != nullptr) {
+                believed_w = hook->get_engine_believed_width();
+                believed_h = hook->get_engine_believed_height();
+            }
+        } else {
+            if (const auto& hook = g_framework->get_d3d12_hook(); hook != nullptr) {
+                believed_w = hook->get_engine_believed_width();
+                believed_h = hook->get_engine_believed_height();
+            }
+        }
+
+        if (believed_w != 0 && believed_h != 0) {
+            size.x = (float)believed_w;
+            size.y = (float)believed_h;
+        }
+    }
+
+    return size;
 }
 
 void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& ctx, bool from_second) {
@@ -26110,7 +26975,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
     //a.movabs(rdx, ctx.rdx);
     a.movabs(r8, ctx.r8);
     //a.movabs(r9, ctx.r9);
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    const auto size = get_ui_texture_size();
     a.mov(r9, (uint32_t)size.x);
     // move w into first stack argument
     a.mov(dword_ptr(rsp, 0x20), (uint32_t)size.y);
@@ -26210,7 +27075,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
         a.mov(r8, ctx.r8);
 
-        const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+        const auto size = get_ui_texture_size();
         a.mov(r9, (uint32_t)size.x);
 
         a.sub(rsp, 0x100);
@@ -26247,7 +27112,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
     static FTexture2DRHIRef out{};
     static FTexture2DRHIRef shader_out{};
 
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    const auto size = get_ui_texture_size();
     const auto stack_args = (uintptr_t*)(ctx.rsp + 0x20);
 
     SPDLOG_INFO("About to call the original!");
@@ -26798,6 +27663,10 @@ void VRRenderTargetManager_Base::texture_hook_callback(safetyhook::Context& ctx,
                     texture_source, (uintptr_t)texture);
             } else {
                 SPDLOG_INFO(" Resulting texture: {:x}", (uintptr_t)texture);
+                // This is the earliest FRHITexture we hold, and this log line is
+                // the first get_native_resource() call in the process — seed the
+                // safe slot before it can trigger the SDK's blind vtable probe.
+                seed_frhitexture_native_resource_slot(texture);
                 SPDLOG_INFO(" Real resource: {:x}", (uintptr_t)texture->get_native_resource());
             }
         } else {
@@ -29237,7 +30106,7 @@ bool VRRenderTargetManager::AllocateRenderTargetTexture(uint32_t Index, uint32_t
     *(uint64_t*)&TargetableTextureFlags |= (uint64_t)ETextureCreateFlags::ShaderResource | (uint64_t)Flags;
     RHICreateTexture2D_RenderThread(dynamic_rhi, &OutTargetableTexture, command_list, SizeX, SizeY, 2, NumMips, NumSamples, TargetableTextureFlags, &create_info);
 
-    const auto size = g_framework->is_dx11() ? g_framework->get_d3d11_rt_size() : g_framework->get_d3d12_rt_size();
+    const auto size = get_ui_texture_size();
     RHICreateTexture2D_RenderThread(dynamic_rhi, &OutShaderResourceTexture, command_list, (uint32_t)size.x, (uint32_t)size.y, 2, NumMips, NumSamples, TargetableTextureFlags, &create_info);
 
     this->render_target = OutTargetableTexture.texture;

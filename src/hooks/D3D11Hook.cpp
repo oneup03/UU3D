@@ -395,16 +395,28 @@ HRESULT WINAPI D3D11Hook::present(IDXGISwapChain* swap_chain, UINT sync_interval
 
         if (d3d11->m_next_present_interval) {
             sync_interval = *d3d11->m_next_present_interval;
+            const auto no_tearing = d3d11->m_next_present_no_tearing;
             d3d11->m_next_present_interval = std::nullopt;
+            d3d11->m_next_present_no_tearing = false;
 
             if (sync_interval == 0) {
                 BOOL is_fullscreen = 0;
                 swap_chain->GetFullscreenState(&is_fullscreen, nullptr);
                 flags &= ~DXGI_PRESENT_DO_NOT_SEQUENCE;
 
-                if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+                if (no_tearing) {
+                    // No-Tear Fast: interval 0 WITHOUT ALLOW_TEARING — a
+                    // flip-model swapchain cannot tear without the flag while
+                    // presents run unthrottled (see the D3D12 hook).
+                    flags &= ~DXGI_PRESENT_ALLOW_TEARING;
+                } else if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
                     flags |= DXGI_PRESENT_ALLOW_TEARING;
                 }
+            } else {
+                // Forcing vsync ON while the game presents with tearing
+                // enabled: ALLOW_TEARING is only valid with interval 0 —
+                // leaving it set fails DXGI_ERROR_INVALID_CALL (fatal in UE).
+                flags &= ~DXGI_PRESENT_ALLOW_TEARING;
             }
         }
     }
@@ -447,6 +459,33 @@ HRESULT WINAPI D3D11Hook::resize_buffers(
 
     if (WindowFilter::get().is_filtered(swap_desc.OutputWindow)) {
         return resize_buffers_fn(swap_chain, buffer_count, width, height, new_format, swap_chain_flags);
+    }
+
+    // 3D Display mode: force sub-native swapchain sizes up to the display's
+    // native size (pixel-exact output modes die under post-composite scaling).
+    if (const auto fw = d3d11->m_forced_resize_w.load(), fh = d3d11->m_forced_resize_h.load();
+        fw != 0 && fh != 0) {
+        // The engine's belief — Slate sizes its UI draw from this.
+        d3d11->m_engine_believed_w = width;
+        d3d11->m_engine_believed_h = height;
+
+        // Preserve the request as the 3D render resolution — except within
+        // the suppress window after our own nudge/kick (games can re-apply
+        // OUR requested resolution multiple times, seconds apart; capturing
+        // those would silently jump the render resolution to native).
+        if (!d3d11->is_render_res_capture_suppressed()) {
+            d3d11->m_game_requested_w = width;
+            d3d11->m_game_requested_h = height;
+        }
+
+        // Pin in BOTH directions — see the D3D12 counterpart: UE's high-DPI
+        // path can echo our native r.SetRes back multiplied by the monitor
+        // scale, and an oversized swapchain breaks pixel-exact output too.
+        if (width != fw || height != fh) {
+            spdlog::info("D3D11 resize buffers: forcing {}x{} -> {}x{} (native output)", width, height, fw, fh);
+            width = fw;
+            height = fh;
+        }
     }
 
     d3d11->m_swap_chain = swap_chain;

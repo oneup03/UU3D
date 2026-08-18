@@ -216,14 +216,14 @@ void Framework::hook_monitor() {
     // reflection dumps.
     //
     // Normal UEVR bootstraps plugins in two phases:
-    //   1. Framework ctor calls PluginLoader::early_init ¡ú LoadLibrary each DLL
+    //   1. Framework ctor calls PluginLoader::early_init ï¿½ï¿½ LoadLibrary each DLL
     //   2. On first D3D Present, Framework::on_frame_d3d11/12 calls
-    //      Mods::on_initialize_d3d_thread ¡ú PluginLoader queries device/
+    //      Mods::on_initialize_d3d_thread ï¿½ï¿½ PluginLoader queries device/
     //      swapchain, calls uevr_plugin_required_version + uevr_plugin_initialize
     //   3. Stereo hook's on_frame installs UGameEngine::Tick hook
     //   4. Engine tick hook fans out on_pre_engine_tick to all mods + plugins
     //
-    // In dumper mode there's no Present ¡ú phases 2-4 never fire without
+    // In dumper mode there's no Present ï¿½ï¿½ phases 2-4 never fire without
     // intervention. We drive them from here instead: first mods::on_initialize
     // + on_initialize_d3d_thread (which now skips the D3D device queries),
     // then the stereo-hook's on_frame to install the tick hook.
@@ -233,7 +233,7 @@ void Framework::hook_monitor() {
 
         // One-shot phase-2: mods + plugin init. Equivalent of what the first
         // D3D Present would trigger. Must also set m_game_data_initialized
-        // so the engine_tick_hook fans out on_pre_engine_tick to mods ¡ª
+        // so the engine_tick_hook fans out on_pre_engine_tick to mods ï¿½ï¿½
         // otherwise the hook runs but returns before dispatching.
         if (!m_dumper_mods_initialized) {
             try {
@@ -241,7 +241,7 @@ void Framework::hook_monitor() {
                 (void)m_mods->on_initialize();
                 (void)m_mods->on_initialize_d3d_thread();
                 // m_game_data_initialized is the gate on engine_tick_hook
-                // fanning out to mods. Don't set m_initialized ¡ª that gates
+                // fanning out to mods. Don't set m_initialized ï¿½ï¿½ that gates
                 // imgui rendering which requires D3D in dumper mode.
                 m_game_data_initialized = true;
                 m_mods_fully_initialized = true;
@@ -403,6 +403,23 @@ Framework::Framework(HMODULE framework_module)
     // Keep immediate flushing for actual errors only.
     spdlog::flush_on(spdlog::level::err);
     spdlog::info("UnrealVR entry");
+
+    // Effective process DPI awareness â€” per-monitor is REQUIRED for pixel-exact
+    // 3D output (LeiaSR etc.) to fill the whole panel on a scaled display. We
+    // request it in startup_thread; this reports whether it actually took (i.e.
+    // whether we were injected early enough, before the game made its window).
+    if (auto* user32 = GetModuleHandleW(L"user32.dll")) {
+        using GetThreadCtxFn = HANDLE(WINAPI*)();
+        using GetAwarenessFn = int(WINAPI*)(HANDLE);
+        auto get_ctx = (GetThreadCtxFn)GetProcAddress(user32, "GetThreadDpiAwarenessContext");
+        auto get_awareness = (GetAwarenessFn)GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext");
+        if (get_ctx != nullptr && get_awareness != nullptr) {
+            const int a = get_awareness(get_ctx()); // 0=unaware, 1=system, 2=per-monitor
+            spdlog::info("DPI awareness: {} ({})", a,
+                         a == 2 ? "per-monitor" : a == 1 ? "system" : a == 0 ? "unaware" : "invalid");
+        }
+    }
+
     spdlog::info("Commit hash: {}", UEVR_COMMIT_HASH);
     spdlog::info("Tag: {}", UEVR_TAG);
     spdlog::info("Commits past tag: {}", UEVR_COMMITS_PAST_TAG);
@@ -796,6 +813,8 @@ void Framework::on_frame_d3d11() {
         ImGui_ImplDX11_NewFrame();
     }*/
 
+    m_flat3d_menu_composited = false;
+
     if (is_init_ok) {
         m_mods->on_present();
     }
@@ -803,20 +822,24 @@ void Framework::on_frame_d3d11() {
     if (auto draw_data = ImGui::GetDrawData(); draw_data != nullptr) {
         ComPtr<ID3D11DeviceContext> context{};
         float clear_color[]{0.0f, 0.0f, 0.0f, 0.0f};
-    
+
         m_d3d11_hook->get_device()->GetImmediateContext(&context);
         context->ClearRenderTargetView(m_d3d11.blank_rt_rtv.Get(), clear_color);
         context->ClearRenderTargetView(m_d3d11.rt_rtv.Get(), clear_color);
         context->OMSetRenderTargets(1, m_d3d11.rt_rtv.GetAddressOf(), NULL);
         ImGui_ImplDX11_RenderDrawData(draw_data);
-    
+
         for (auto& mod : m_mods->get_mods()) {
             mod->on_post_render_vr_framework_dx11(context.Get(), m_d3d11.rt.Get(), m_d3d11.rt_rtv.Get());
         }
-    
-        // Set the back buffer to be the render target.
-        context->OMSetRenderTargets(1, m_d3d11.bb_rtv.GetAddressOf(), nullptr);
-        ImGui_ImplDX11_RenderDrawData(draw_data);
+
+        // Set the back buffer to be the render target. Skipped when the 3D
+        // Display compositor consumed the menu RT as an in-eye layer this
+        // frame â€” the flat copy would sit on top of the stereo one.
+        if (!m_flat3d_menu_composited) {
+            context->OMSetRenderTargets(1, m_d3d11.bb_rtv.GetAddressOf(), nullptr);
+            ImGui_ImplDX11_RenderDrawData(draw_data);
+        }
     }
 
     if (is_init_ok) {
@@ -930,6 +953,8 @@ void Framework::on_frame_d3d12() {
         ImGui_ImplDX12_NewFrame();
     }*/
 
+    m_flat3d_menu_composited = false;
+
     if (is_init_ok) {
         m_mods->on_present();
     }
@@ -982,27 +1007,31 @@ void Framework::on_frame_d3d12() {
         render::D3D12Diagnostics::get().record_resource_barriers("Framework::on_frame_d3d12/ImGuiToSRV", 1, &barrier);
         cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
 
-        // Draw to the back buffer.
-        auto swapchain = m_d3d12_hook->get_swap_chain();
-        auto bb_index = swapchain->GetCurrentBackBufferIndex();
-        barrier.Transition.pResource = m_d3d12.rts[bb_index].Get();
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        render::D3D12Diagnostics::get().record_resource_barriers("Framework::on_frame_d3d12/BackbufferToRT", 1, &barrier);
-        cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
-        rts[0] = m_d3d12.get_cpu_rtv(device, (D3D12::RTV)bb_index);
-        render::D3D12Diagnostics::get().record_rtv_bind("Framework::on_frame_d3d12/BackbufferRT", 1, rts, nullptr);
-        cmd_ctx->cmd_list->OMSetRenderTargets(1, rts, FALSE, NULL);
-        render::D3D12Diagnostics::get().record_descriptor_heaps_set("Framework::on_frame_d3d12/BackbufferSRVHeap", 1, m_d3d12.srv_desc_heap.GetAddressOf());
-        cmd_ctx->cmd_list->SetDescriptorHeaps(1, m_d3d12.srv_desc_heap.GetAddressOf());
+        // Draw to the back buffer. Skipped when the 3D Display compositor
+        // consumed the menu RT as an in-eye layer this frame â€” the flat copy
+        // would sit on top of the stereo one.
+        if (!m_flat3d_menu_composited) {
+            auto swapchain = m_d3d12_hook->get_swap_chain();
+            auto bb_index = swapchain->GetCurrentBackBufferIndex();
+            barrier.Transition.pResource = m_d3d12.rts[bb_index].Get();
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            render::D3D12Diagnostics::get().record_resource_barriers("Framework::on_frame_d3d12/BackbufferToRT", 1, &barrier);
+            cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
+            rts[0] = m_d3d12.get_cpu_rtv(device, (D3D12::RTV)bb_index);
+            render::D3D12Diagnostics::get().record_rtv_bind("Framework::on_frame_d3d12/BackbufferRT", 1, rts, nullptr);
+            cmd_ctx->cmd_list->OMSetRenderTargets(1, rts, FALSE, NULL);
+            render::D3D12Diagnostics::get().record_descriptor_heaps_set("Framework::on_frame_d3d12/BackbufferSRVHeap", 1, m_d3d12.srv_desc_heap.GetAddressOf());
+            cmd_ctx->cmd_list->SetDescriptorHeaps(1, m_d3d12.srv_desc_heap.GetAddressOf());
 
-        ImGui::GetIO().BackendRendererUserData = m_d3d12.imgui_backend_datas[0];
-        ImGui_ImplDX12_RenderDrawData(draw_data, cmd_ctx->cmd_list.Get());
+            ImGui::GetIO().BackendRendererUserData = m_d3d12.imgui_backend_datas[0];
+            ImGui_ImplDX12_RenderDrawData(draw_data, cmd_ctx->cmd_list.Get());
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        render::D3D12Diagnostics::get().record_resource_barriers("Framework::on_frame_d3d12/BackbufferToPresent", 1, &barrier);
-        cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            render::D3D12Diagnostics::get().record_resource_barriers("Framework::on_frame_d3d12/BackbufferToPresent", 1, &barrier);
+            cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
+        }
 
         cmd_ctx->execute();
         m_d3d12_ui_generation.fetch_add(1, std::memory_order_release);
@@ -1305,13 +1334,13 @@ std::filesystem::path Framework::get_persistent_dir() {
 
         const auto exe_name = [&]() {
             const auto result = std::filesystem::path(*utility::get_module_pathw(utility::get_executable())).stem().string();
-            const auto dir = std::filesystem::path(app_data_path) / "UnrealVRMod" / result;
+            const auto dir = std::filesystem::path(app_data_path) / "UU3D" / result;
             std::filesystem::create_directories(dir);
 
             return result;
         }();
 
-        return std::filesystem::path(app_data_path) / "UnrealVRMod" / exe_name;
+        return std::filesystem::path(app_data_path) / "UU3D" / exe_name;
     };
 
     static const auto result = return_appdata_dir();
@@ -1529,7 +1558,7 @@ void Framework::draw_ui() {
         m_cursor_state_changed = false;
     }
     
-    static const auto UEVR_NAME = std::format("UEVR [{}+{}-{:.8}]", UEVR_TAG, UEVR_COMMITS_PAST_TAG, UEVR_COMMIT_HASH);
+    static const auto UEVR_NAME = std::format("UU3D [{}+{}-{:.8}]", UEVR_TAG, UEVR_COMMITS_PAST_TAG, UEVR_COMMIT_HASH);
 
     ImGui::SetNextWindowSize(ImVec2(window_w, window_h), ImGuiCond_::ImGuiCond_Once);
     ImGui::Begin(UEVR_NAME.c_str(), &m_draw_ui);
@@ -1573,6 +1602,12 @@ void Framework::draw_ui() {
     ImGui::Text("Gamepad L3 + R3: Toggle Menu");
     ImGui::Text("Gamepad RT: Shortcuts");
     ImGui::Text("Gamepad LB/RB: Change Sidebar Page");
+
+    if (m_vr != nullptr && m_vr->is_using_flat3d()) {
+        if (ImGui::Button("Take 3D Screenshot (Ctrl+F12)")) {
+            m_vr->request_flat3d_screenshot();
+        }
+    }
 
     ImGui::EndGroup();
     ImGui::EndGroup();

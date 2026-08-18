@@ -101,17 +101,34 @@ public:
             return;
         }
 
-        // Use the correct conversion function based on the type.
-        else if constexpr (std::is_integral_v<T>) {
-            if constexpr (std::is_unsigned_v<T>) {
-                m_value = (T)std::stoul(value);
-                return;
-            }
+        // Numeric mods (bool handled above). Two robustness rules here:
+        //  1. Accept the legacy bool literals "true"/"false" as 1/0. A mod that
+        //     used to be a ModToggle can become a float/int (e.g. UI_InvertAlpha
+        //     bool -> ModSlider), but scripts/plugins still pass "true"/"false"
+        //     — notably the FF7RB-UEVR plugin does set_mod_value("UI_InvertAlpha",
+        //     "true") to turn the invert fully on. Map it instead of rejecting.
+        //  2. std::sto* must never throw out of here: set() is reachable from the
+        //     plugin C-ABI (uevr::vr::set_mod_value); an uncaught
+        //     std::invalid_argument/out_of_range would cross the extern "C"
+        //     boundary and terminate the whole game. Reject bad input, keep the
+        //     current value.
+        else if constexpr (std::is_arithmetic_v<T>) {
+            if (value == "true") { m_value = (T)1; return; }
+            if (value == "false") { m_value = (T)0; return; }
 
-            m_value = (T)std::stol(value);
-            return;
-        } else if constexpr (std::is_floating_point_v<T>) {
-            m_value = (T)std::stod(value);
+            try {
+                if constexpr (std::is_integral_v<T>) {
+                    if constexpr (std::is_unsigned_v<T>) {
+                        m_value = (T)std::stoul(value);
+                    } else {
+                        m_value = (T)std::stol(value);
+                    }
+                } else {
+                    m_value = (T)std::stod(value);
+                }
+            } catch (const std::exception& e) {
+                spdlog::error("[ModValue] Ignoring invalid value '{}' for '{}': {}", value, m_config_name, e.what());
+            }
             return;
         }
 

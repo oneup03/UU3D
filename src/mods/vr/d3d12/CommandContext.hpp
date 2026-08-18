@@ -62,6 +62,7 @@ struct CommandContext {
     bool has_commands{false};
     bool poisoned{false};
     uint64_t close_failure_count{0};
+    bool last_close_failed{false}; // set by execute(); lets callers correlate failures
 
     std::wstring internal_name{L"CommandContext object"};
 };

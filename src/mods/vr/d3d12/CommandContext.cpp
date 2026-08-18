@@ -662,6 +662,8 @@ void CommandContext::execute() {
 
     if (this->has_commands) {
         const auto close_result = this->cmd_list->Close();
+        this->last_close_failed = FAILED(close_result);
+
         if (FAILED(close_result)) {
             this->has_commands = false;
             this->poisoned = true;

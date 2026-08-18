@@ -1,3 +1,5 @@
+#include <windows.h>
+
 #include <spdlog/spdlog.h>
 
 #include <utility/Scan.hpp>
@@ -37,11 +39,19 @@ RenderTargetPoolHook::RenderTargetPoolHook() {
 }
 
 void RenderTargetPoolHook::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
-    if (!m_attempted_hook && VR::get()->is_depth_enabled()) {
+    // Flat3D defaults to the API-level GameDepthCapture for scene depth, but can
+    // opt into this engine pool hook (Flat3D_UseEngineDepth) for titles whose
+    // depth is allocated at load and thus invisible to the API path (e.g. SMT5V).
+    const bool flat3d_engine_depth = VR::get()->is_using_flat3d() && VR::get()->flat3d_use_engine_depth();
+
+    if (!m_attempted_hook && (VR::get()->is_depth_enabled() || flat3d_engine_depth)) {
         m_wants_activate = true;
     }
 
-    if (!m_attempted_hook && m_wants_activate) {
+    // Installing the inline hook mid-game on FindFreeElement crashes some titles
+    // (e.g. Jedi: Survivor), so in Flat3D it is gated behind the opt-in toggle;
+    // the VR depth-submission path installs it whenever VR depth is enabled.
+    if (!m_attempted_hook && m_wants_activate && (!VR::get()->is_using_flat3d() || flat3d_engine_depth)) {
         m_attempted_hook = true;
         m_hooked = hook();
     }
@@ -100,8 +110,24 @@ void RenderTargetPoolHook::on_post_find_free_element(
         return;
     }
 
-    if (name != nullptr) {
+    // InDebugName is NOT guaranteed to be a valid string pointer. Shipping UE
+    // builds strip RDG debug names and can pass a non-null sentinel here (Jedi
+    // Survivor passes 0x1). A plain null check lets that through, and using it
+    // as a std::wstring key below dereferences it (wcslen) -> AV reading 0x1.
+    // Require an actually-readable pointer.
+    if (name != nullptr && !IsBadReadPtr(name, sizeof(wchar_t))) {
         //SPDLOG_INFO("FRenderTargetPool::FindFreeElement called with name {}", utility::narrow(name));
+
+        // `out` (the TRefCountPtr the engine fills in) can ALSO arrive as a
+        // shifted-arg sentinel. Jedi Survivor's FindFreeElement is UE5-style
+        // (no leading FRHICommandList), but has_double_precision() selected the
+        // UE4 hook, so we read the args one slot over and `out` lands on the
+        // stripped RDG InDebugName == 0x1 — out->reference below then AVs reading
+        // 0x1. Bail on a non-readable out rather than fall through to erase
+        // (name is suspect too when the signature doesn't match).
+        if (out != nullptr && IsBadReadPtr(out, sizeof(void*))) {
+            return;
+        }
 
         std::scoped_lock _{g_hook->m_mutex};
 

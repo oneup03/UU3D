@@ -14,6 +14,9 @@
 #include <DirectXMath.h>
 #include <SpriteBatch.h>
 
+#include "flat3d/Flat3DCompositorD3D11.hpp"
+#include "flat3d/Flat3DKatanga.hpp"
+
 class VR;
 namespace render {
 class FrameResourceInspector;
@@ -22,13 +25,14 @@ class FrameResourceInspector;
 namespace vrmod {
 class D3D11Component {
 public:
-    D3D11Component() 
+    D3D11Component()
         : m_openxr{this}
     {
 
     }
 
     vr::EVRCompositorError on_frame(VR* vr);
+    vr::EVRCompositorError on_frame_flat3d(VR* vr);
     void on_post_present(VR* vr);
     void on_reset(VR* vr);
 
@@ -206,6 +210,9 @@ private:
     std::array<uint32_t, 2> m_real_backbuffer_size{};
 
     ID3D11Texture2D* m_last_checked_native{nullptr};
+
+    flat3d::Flat3DCompositorD3D11 m_flat3d_compositor{};
+    flat3d::Flat3DKatanga m_flat3d_katanga{};
 
     uint32_t m_last_rendered_frame{0};
     bool m_force_reset{true};
