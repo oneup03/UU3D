@@ -98,7 +98,7 @@ jobs:
       - name: Create Release
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
-          name: ${{format('UU3D Nightly {0} ({1})', env.RUN_NUMBER, github.sha)}}
+          name: ${{format('UU3D Nightly {0} [{1}] ({2})', env.RUN_NUMBER, github.ref_name, github.sha)}}
           tag: ${{format('nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
           artifacts: "${{github.workspace}}/UU3D.zip,${{github.workspace}}/UU3D.zip.sha256"
           makeLatest: true
