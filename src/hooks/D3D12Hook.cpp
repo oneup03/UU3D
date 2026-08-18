@@ -7,6 +7,7 @@
 #include <utility/Thread.hpp>
 #include <utility/Module.hpp>
 #include <utility/RTTI.hpp>
+#include <utility/String.hpp> // utility::narrow — pulled in transitively on the Joey-Merged base
 
 #include <d3d12sdklayers.h>
 #include <wrl.h>
@@ -442,6 +443,25 @@ bool D3D12Hook::hook() {
         return false;
     }
 
+    // The AFW base only needs a dummy queue here, but the command-list vtable
+    // slots (SetPipelineState / ResourceBarrier / ClearDepthStencilView) have to
+    // be hooked off a real ID3D12GraphicsCommandList, and the Flat3D depth
+    // capture depends on them. Create a throwaway allocator + list purely to
+    // reach that vtable; both are released with the other dummies below.
+    ID3D12CommandAllocator* command_allocator{ nullptr };
+    ID3D12GraphicsCommandList* command_list{ nullptr };
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator)))) {
+        spdlog::error("Failed to create D3D12 Dummy Command Allocator");
+        return false;
+    }
+
+    if (FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, command_allocator, nullptr, IID_PPV_ARGS(&command_list)))) {
+        spdlog::error("Failed to create D3D12 Dummy Graphics Command List");
+        return false;
+    }
+
     spdlog::info("Creating dummy swapchain");
 
     // used in CreateSwapChainForHwnd fallback
@@ -860,6 +880,12 @@ bool D3D12Hook::hook() {
 
     device->Release();
     command_queue->Release();
+    if (command_list != nullptr) {
+        command_list->Release();
+    }
+    if (command_allocator != nullptr) {
+        command_allocator->Release();
+    }
     factory->Release();
     swap_chain1->Release();
     swap_chain->Release();
@@ -1219,19 +1245,6 @@ HRESULT WINAPI D3D12Hook::create_graphics_pipeline_state(
 
     const auto result = original(device, desc, riid, pipeline_state);
 
-    auto& shader_registry = render::ShaderOverrideRegistry::get();
-    if (shader_registry.should_track_d3d12_pipelines() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
-        desc != nullptr) {
-        shader_registry.register_d3d12_graphics_pipeline_state_creation(
-            device,
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
-            desc
-        );
-    }
 
     return result;
 }
@@ -1253,19 +1266,6 @@ HRESULT WINAPI D3D12Hook::create_pipeline_state(
 
     const auto result = original(device, desc, riid, pipeline_state);
 
-    auto& shader_registry = render::ShaderOverrideRegistry::get();
-    if (shader_registry.should_track_d3d12_pipelines() &&
-        SUCCEEDED(result) &&
-        pipeline_state != nullptr &&
-        *pipeline_state != nullptr &&
-        riid == __uuidof(ID3D12PipelineState) &&
-        desc != nullptr) {
-        shader_registry.register_d3d12_pipeline_state_stream_creation(
-            device,
-            static_cast<ID3D12PipelineState*>(*pipeline_state),
-            desc
-        );
-    }
 
     return result;
 }
@@ -1286,7 +1286,6 @@ void WINAPI D3D12Hook::create_render_target_view(
         original(device, resource, desc, descriptor);
     }
 
-    render::D3D12Diagnostics::get().register_rtv_descriptor("D3D12Hook::CreateRenderTargetView", resource, descriptor);
 }
 
 void WINAPI D3D12Hook::create_depth_stencil_view(
@@ -1305,7 +1304,6 @@ void WINAPI D3D12Hook::create_depth_stencil_view(
         original(device, resource, desc, descriptor);
     }
 
-    render::D3D12Diagnostics::get().register_dsv_descriptor("D3D12Hook::CreateDepthStencilView", resource, descriptor);
 
     if (const auto observer = d3d12 != nullptr ? d3d12->m_depth_stencil_observer.load(std::memory_order_acquire) : nullptr;
         observer != nullptr) {
@@ -1399,11 +1397,6 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
         return;
     }
 
-    auto& shader_registry = render::ShaderOverrideRegistry::get();
-    if (!shader_registry.should_track_d3d12_pipelines()) {
-        original(command_list, pipeline_state);
-        return;
-    }
 
     auto bound_pipeline_state = shader_registry.resolve_d3d12_pipeline_state(pipeline_state);
     shader_registry.note_d3d12_pipeline_state_bound(pipeline_state, bound_pipeline_state);

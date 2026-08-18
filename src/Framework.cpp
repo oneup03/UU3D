@@ -844,12 +844,9 @@ void Framework::on_frame_d3d12() {
             barrier.Transition.pResource = m_d3d12.rts[bb_index].Get();
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            render::D3D12Diagnostics::get().record_resource_barriers("Framework::on_frame_d3d12/BackbufferToRT", 1, &barrier);
             cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
             rts[0] = m_d3d12.get_cpu_rtv(device, (D3D12::RTV)bb_index);
-            render::D3D12Diagnostics::get().record_rtv_bind("Framework::on_frame_d3d12/BackbufferRT", 1, rts, nullptr);
             cmd_ctx->cmd_list->OMSetRenderTargets(1, rts, FALSE, NULL);
-            render::D3D12Diagnostics::get().record_descriptor_heaps_set("Framework::on_frame_d3d12/BackbufferSRVHeap", 1, m_d3d12.srv_desc_heap.GetAddressOf());
             cmd_ctx->cmd_list->SetDescriptorHeaps(1, m_d3d12.srv_desc_heap.GetAddressOf());
 
             ImGui::GetIO().BackendRendererUserData = m_d3d12.imgui_backend_datas[0];

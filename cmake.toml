@@ -48,9 +48,18 @@ add_subdirectory(dependencies/submodules/UESDK)
 # RenderDoc source/runtime isn't present.
 include(cmake/RenderDocFull.cmake)
 
-set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
-message(STATUS "Using vendored safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b + UEVR patches)...")
-add_subdirectory(dependencies/vendor/safetyhook)
+# Joey-Merged vendors a patched safetyhook; the AFW base ships none and fetches
+# it from praydog/safetyhook instead. Only claim the vendored copy when it is
+# actually present, so the same build works on either base.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/vendor/safetyhook/CMakeLists.txt")
+    set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
+    message(STATUS "Using vendored safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b + UEVR patches)...")
+    add_subdirectory(dependencies/vendor/safetyhook)
+    set(UEVR_HAVE_VENDORED_SAFETYHOOK ON)
+else()
+    message(STATUS "No vendored safetyhook in this tree; fetching it below.")
+    set(UEVR_HAVE_VENDORED_SAFETYHOOK OFF)
+endif()
 
 # LeiaSR (Simulated Reality) SDK. The SR-lib submodule's own CMake package owns
 # the SDK layout, the import-library set and the /DELAYLOAD list, so none of it

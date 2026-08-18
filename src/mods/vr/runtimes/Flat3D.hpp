@@ -30,10 +30,11 @@ struct Flat3D final : public VRRuntime {
 
     // No blocking sync: there is no compositor to wait on. The game's own
     // Present paces the frame loop.
-    VRRuntime::Error synchronize_frame(
-        std::optional<uint32_t> frame_count = std::nullopt,
-        SyncFrameCallsite callsite = SyncFrameCallsite::Unknown) override
-    {
+    //
+    // The AFW base's VRRuntime::synchronize_frame takes only frame_count; the
+    // SyncFrameCallsite argument is Joey-Merged-only, so this override matches
+    // the older signature.
+    VRRuntime::Error synchronize_frame(std::optional<uint32_t> frame_count = std::nullopt) override {
         this->got_first_sync = true;
         this->frame_synced = true;
         return VRRuntime::Error::SUCCESS;
