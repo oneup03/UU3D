@@ -459,10 +459,10 @@ void set_screen_percentage_cvar(int32_t mode, int32_t value) {
                 return;
             }
 
-            if (!(*cvar)->Set(std::to_wstring(value).c_str())) {
-                spdlog::warn("[Flat3D] {} setter unavailable", utility::narrow(name));
-                return;
-            }
+            // [legacy-afw] IConsoleVariable::Set returns void on the AFW base SDK
+            // (it only started reporting success on the joeyhodge fork), so there
+            // is no result to test here.
+            (*cvar)->Set(std::to_wstring(value).c_str());
 
             spdlog::info("[Flat3D] 3D Render Resolution -> {} {}", utility::narrow(name), value);
         } catch (...) {
@@ -2158,7 +2158,9 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     };
 
     p.ui_enabled = m_enable_gui->value();
-    p.ui_invert_alpha = get_overlay_component().get_ui_invert_alpha(); // same UI_InvertAlpha config/slider as the VR path
+    // [legacy-afw] UI_InvertAlpha is a bool toggle on the AFW base, not the 0..1
+    // float slider the joeyhodge fork uses; map it onto the same range.
+    p.ui_invert_alpha = get_overlay_component().should_invert_ui_alpha() ? 1.0f : 0.0f;
 
     // The UI's FINAL on-screen shift (after the crop map) is px(z_ui); the
     // drawn shift/scale are pre-divided by scene_scale so the crop map's

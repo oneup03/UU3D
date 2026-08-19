@@ -313,7 +313,9 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
         // Clear empty regions to alpha = ui_invert_alpha (not 0) so the
         // UI_InvertAlpha (1-a) shader distinguishes drawn content (a=0 -> opaque)
         // from untouched empty screen (-> transparent). See the D3D12 counterpart.
-        const float inv = VR::get()->get_overlay_component().get_ui_invert_alpha();
+        // [legacy-afw] UI_InvertAlpha is a bool toggle on the AFW base (it only became
+    // a 0..1 float slider on the joeyhodge fork), so map it onto the same range.
+    const float inv = VR::get()->get_overlay_component().should_invert_ui_alpha() ? 1.0f : 0.0f;
         float ui_clear[4]{0.0f, 0.0f, 0.0f, inv};
         m_engine_ui_ref.clear_rtv(ui_clear);
     }

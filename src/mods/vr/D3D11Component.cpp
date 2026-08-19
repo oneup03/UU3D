@@ -1027,12 +1027,6 @@ void D3D11Component::on_reset(VR* vr) {
     m_constant_buffer.Reset();
     m_backbuffer_batch.reset();
     m_game_batch.reset();
-    m_ui_invert_ps.Reset();
-    m_ui_invert_blend.Reset();
-    m_ui_invert_ready = false;
-    m_daysgone_ui_key_ps.Reset();
-    m_daysgone_ui_key_blend.Reset();
-    m_daysgone_ui_key_ready = false;
     m_flat3d_compositor.reset();
     m_flat3d_katanga.shutdown();
     m_is_shader_setup = false;

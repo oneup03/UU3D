@@ -1240,6 +1240,9 @@ private:
 
     const ModCombo::Ptr m_rendering_method{ ModCombo::create(generate_name("RenderingMethod"), s_rendering_method_names, RenderingMethod::NATIVE_STEREO) };
     const ModCombo::Ptr m_synced_afr_method{ ModCombo::create(generate_name("SyncedSequentialMethod"), s_synced_afr_method_names, 1) };
+    // Ours (Desktop Spectator View Mode); the enum + names above survived the
+    // cherry-pick but this member landed in a hunk that took the AFW side.
+    const ModCombo::Ptr m_desktop_mirror_mode{ ModCombo::create(generate_name("DesktopSpectatorViewMode"), s_desktop_mirror_mode_names, DESKTOP_MIRROR_FULL) };
     const ModToggle::Ptr m_extreme_compat_mode{ ModToggle::create(generate_name("ExtremeCompatibilityMode"), false, true) };
     const ModToggle::Ptr m_uncap_framerate{ ModToggle::create(generate_name("UncapFramerate"), true) };
     const ModToggle::Ptr m_disable_blur_widgets{ ModToggle::create(generate_name("DisableBlurWidgets"), true) };

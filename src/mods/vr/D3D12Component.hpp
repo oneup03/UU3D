@@ -66,9 +66,9 @@ private:
     void draw_spectator_view(ID3D12GraphicsCommandList* command_list, bool is_right_eye_frame);
     void clear_backbuffer();
     bool ensure_2d_screen_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
-    bool ensure_halo_electra_quad_source_texture(ID3D12Device* device, uint64_t width, uint32_t height);
-    // Lazily (re)create m_ui_invert_tex to match the given UI texture desc.
-    bool ensure_ui_invert_tex(ID3D12Device* device, const D3D12_RESOURCE_DESC& base_desc);
+    // [legacy-afw] The SHf / Dune mono-scene expansion, the UE5.8 converted-UI
+    // slot pool, the Halo Electra staging texture and the UI alpha-invert
+    // texture are all Joey-Merged features; they are not carried on this branch.
 
     enum class ShfSceneMode {
         Unknown,
@@ -78,18 +78,6 @@ private:
 
     static const char* shf_scene_mode_name(ShfSceneMode mode);
     ShfSceneMode classify_shf_scene_mode(const D3D12_RESOURCE_DESC& source_desc, const D3D12_RESOURCE_DESC& real_desc) const;
-    void log_shf_scene_mode_if_needed(
-        ShfSceneMode mode,
-        const D3D12_RESOURCE_DESC& source_desc,
-        const D3D12_RESOURCE_DESC& real_desc,
-        uint64_t frame_count,
-        bool using_mono_expansion);
-    bool ensure_shf_mono_scene_texture(ID3D12Device* device, const D3D12_RESOURCE_DESC& source_desc);
-    d3d12::TextureContext* render_shf_mono_scene_texture(ID3D12Device* device);
-    bool ensure_dune_hmd_mono_scene_texture(ID3D12Device* device, const D3D12_RESOURCE_DESC& source_desc);
-    d3d12::TextureContext* render_dune_hmd_mono_scene_texture(
-        ID3D12Device* device,
-        D3D12_RESOURCE_STATES source_state);
 
     // Flat3D AFW: reproject the freshly-rendered eye (left half of double_wide)
     // into the other eye via the PDAFWPlugin, consuming the globally-harvested

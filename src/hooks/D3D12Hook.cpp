@@ -1398,9 +1398,9 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     }
 
 
-    auto bound_pipeline_state = shader_registry.resolve_d3d12_pipeline_state(pipeline_state);
-    shader_registry.note_d3d12_pipeline_state_bound(pipeline_state, bound_pipeline_state);
-    original(command_list, bound_pipeline_state);
+    // [legacy-afw] ShaderOverrideRegistry (which could substitute a replacement
+    // PSO here) is a Joey-Merged subsystem; bind what the game asked for.
+    original(command_list, pipeline_state);
 }
 
 thread_local int32_t g_resize_buffers_depth = 0;

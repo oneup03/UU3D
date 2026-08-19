@@ -4,6 +4,7 @@
 #include <winternl.h>
 
 #include <asmjit/asmjit.h>
+#include <cwctype> // std::towlower — transitive on the Joey-Merged base
 #include <future>
 
 #include <spdlog/spdlog.h>
@@ -45,6 +46,7 @@
 #include "Framework.hpp"
 #include "Mods.hpp"
 #include "DumperMode.hpp"
+#include "mods/GameSpecific.hpp" // uevr::games exe-path predicates
 #include "mods/UObjectHook.hpp"
 
 #include <bdshemu.h>
@@ -377,168 +379,11 @@ bool validate_ue57_cloned_view_array(
     return std::equal(source->data, source->data + source->count, clone->data);
 }
 
-bool try_set_ue57_scene_view_family(
-    sdk::FSceneView* view,
-    sdk::FSceneViewFamily* expected_current,
-    sdk::FSceneViewFamily* replacement)
-{
-    if (view == nullptr || expected_current == nullptr || replacement == nullptr ||
-        !is_readable_process_range(reinterpret_cast<uintptr_t>(view), sizeof(uintptr_t)))
-    {
-        return false;
-    }
-
-    const auto family_offset = view->get_view_family_offset(expected_current);
-    if (!family_offset.has_value()) {
-        return false;
-    }
-
-    const auto family_slot = reinterpret_cast<uintptr_t>(view) + *family_offset;
-
-    if (!is_writable_process_range(family_slot, sizeof(replacement))) {
-        return false;
-    }
-
-    std::memcpy(reinterpret_cast<void*>(family_slot), &replacement, sizeof(replacement));
-    return view->has_view_family(replacement);
-}
-
-class UE57FSceneViewSingletonPrimaryOverride {
-public:
-    UE57FSceneViewSingletonPrimaryOverride() = default;
-    UE57FSceneViewSingletonPrimaryOverride(const UE57FSceneViewSingletonPrimaryOverride&) = delete;
-    UE57FSceneViewSingletonPrimaryOverride& operator=(const UE57FSceneViewSingletonPrimaryOverride&) = delete;
-
-    ~UE57FSceneViewSingletonPrimaryOverride() {
-        restore();
-    }
-
-    bool initialize(
-        sdk::FSceneView* view,
-        sdk::FSceneViewFamily* expected_family,
-        const char*& failure_reason)
-    {
-        failure_reason = nullptr;
-
-        if (view == nullptr || expected_family == nullptr || !view->has_view_family(expected_family)) {
-            failure_reason = "secondary singleton view or Family backlink changed";
-            return false;
-        }
-
-        const auto view_address = reinterpret_cast<uintptr_t>(view);
-        const auto metadata_address = view_address + ue57_stereo_pass_offset;
-        if (!is_readable_process_range(metadata_address, ue57_stereo_metadata_span) ||
-            !is_writable_process_range(metadata_address, ue57_stereo_metadata_span))
-        {
-            failure_reason = "secondary singleton stereo metadata is not safely writable";
-            return false;
-        }
-
-        std::memcpy(&m_saved_stereo_pass, reinterpret_cast<const void*>(metadata_address), sizeof(m_saved_stereo_pass));
-        std::memcpy(
-            &m_saved_primary_view_index,
-            reinterpret_cast<const void*>(view_address + ue57_primary_view_index_offset),
-            sizeof(m_saved_primary_view_index));
-
-        if (m_saved_stereo_pass != static_cast<uint32_t>(EStereoscopicPass::eSSP_SECONDARY) ||
-            m_saved_primary_view_index != 0)
-        {
-            failure_reason = "secondary singleton stereo metadata did not match the proven two-eye layout";
-            return false;
-        }
-
-        m_view = view;
-        m_active = true;
-
-        constexpr uint32_t primary_stereo_pass = EStereoscopicPass::eSSP_PRIMARY;
-        constexpr int32_t singleton_primary_view_index = 0;
-        std::memcpy(
-            reinterpret_cast<void*>(metadata_address),
-            &primary_stereo_pass,
-            sizeof(primary_stereo_pass));
-        std::memcpy(
-            reinterpret_cast<void*>(view_address + ue57_primary_view_index_offset),
-            &singleton_primary_view_index,
-            sizeof(singleton_primary_view_index));
-
-        uint32_t applied_stereo_pass{};
-        int32_t applied_primary_view_index{-1};
-        std::memcpy(&applied_stereo_pass, reinterpret_cast<const void*>(metadata_address), sizeof(applied_stereo_pass));
-        std::memcpy(
-            &applied_primary_view_index,
-            reinterpret_cast<const void*>(view_address + ue57_primary_view_index_offset),
-            sizeof(applied_primary_view_index));
-
-        if (applied_stereo_pass != primary_stereo_pass ||
-            applied_primary_view_index != singleton_primary_view_index)
-        {
-            const bool restored = restore();
-            failure_reason = restored
-                ? "secondary singleton could not be adapted to an internal primary view"
-                : "secondary singleton metadata could not be restored after adaptation failed";
-            return false;
-        }
-
-        return true;
-    }
-
-    bool restore() {
-        if (!m_active) {
-            return true;
-        }
-
-        if (m_view == nullptr) {
-            return false;
-        }
-
-        const auto view_address = reinterpret_cast<uintptr_t>(m_view);
-        const auto metadata_address = view_address + ue57_stereo_pass_offset;
-        if (!is_readable_process_range(metadata_address, ue57_stereo_metadata_span) ||
-            !is_writable_process_range(metadata_address, ue57_stereo_metadata_span))
-        {
-            return false;
-        }
-
-        std::memcpy(
-            reinterpret_cast<void*>(metadata_address),
-            &m_saved_stereo_pass,
-            sizeof(m_saved_stereo_pass));
-        std::memcpy(
-            reinterpret_cast<void*>(view_address + ue57_primary_view_index_offset),
-            &m_saved_primary_view_index,
-            sizeof(m_saved_primary_view_index));
-
-        uint32_t restored_stereo_pass{};
-        int32_t restored_primary_view_index{-1};
-        std::memcpy(&restored_stereo_pass, reinterpret_cast<const void*>(metadata_address), sizeof(restored_stereo_pass));
-        std::memcpy(
-            &restored_primary_view_index,
-            reinterpret_cast<const void*>(view_address + ue57_primary_view_index_offset),
-            sizeof(restored_primary_view_index));
-
-        if (restored_stereo_pass != m_saved_stereo_pass ||
-            restored_primary_view_index != m_saved_primary_view_index)
-        {
-            return false;
-        }
-
-        m_active = false;
-        m_view = nullptr;
-        return true;
-    }
-
-private:
-    // Verified against UE5.7 FSceneView's native copy constructor in Venice.
-    static constexpr size_t ue57_stereo_pass_offset = 0xDD0;
-    static constexpr size_t ue57_primary_view_index_offset = 0xDD8;
-    static constexpr size_t ue57_stereo_metadata_span =
-        ue57_primary_view_index_offset + sizeof(int32_t) - ue57_stereo_pass_offset;
-
-    sdk::FSceneView* m_view{};
-    uint32_t m_saved_stereo_pass{};
-    int32_t m_saved_primary_view_index{};
-    bool m_active{};
-};
+// UE5.7 linked-family NSF machinery (try_set_ue57_scene_view_family and
+// UE57FSceneViewSingletonPrimaryOverride) is not carried on this branch: it
+// needs the UESDK FSceneView::has_view_family / get_view_family_offset
+// accessors, which the AFW base SDK does not provide, and AFW NSF has no
+// UE5.7 linked-family path to drive it.
 
 class UE57FSceneViewFamilyClone {
 public:
@@ -1201,123 +1046,10 @@ void* seh_call_native_resource_candidate(const void* texture, void* function) {
     }
 }
 
-void seed_frhitexture_native_resource_slot(FRHITexture2D* texture) {
-    static bool s_done = false;
-
-    if (s_done || texture == nullptr || !g_framework->is_dx12() || IsBadReadPtr(texture, sizeof(void*))) {
-        return;
-    }
-
-    // Only needed while the SDK mis-reads the engine version; when the version
-    // resource is right it already takes the safe path on its own.
-    const auto sdk_version = sdk::get_file_version_info().dwFileVersionMS;
-    if (sdk_version == 0x00050005 || sdk_version == 0x00050006) {
-        s_done = true;
-        return;
-    }
-
-    const auto vtable = *(void***)texture;
-
-    if (vtable == nullptr || IsBadReadPtr(vtable, sizeof(void*) * 15) ||
-        !utility::get_module_within(vtable).has_value()) {
-        return; // not a usable candidate yet; try again on the next texture
-    }
-
-    // FRHITextureDesc placement identifies the layout, and each layout has its
-    // own defensible slot set (same table the SDK uses).
-    const auto texture_address = (uintptr_t)texture;
-    std::optional<uintptr_t> desc_offset{};
-
-    for (const uintptr_t candidate : {(uintptr_t)0x20, (uintptr_t)0xe0, (uintptr_t)0xf0}) {
-        if (IsBadReadPtr((void*)(texture_address + candidate), 0x38)) {
-            continue;
-        }
-
-        const auto extent_x = *(const int32_t*)(texture_address + candidate + 0x24);
-        const auto extent_y = *(const int32_t*)(texture_address + candidate + 0x28);
-        const auto num_mips = *(const uint8_t*)(texture_address + candidate + 0x30);
-        const auto num_samples = *(const uint8_t*)(texture_address + candidate + 0x31);
-        const auto dimension = *(const uint8_t*)(texture_address + candidate + 0x32);
-        const auto format = *(const uint8_t*)(texture_address + candidate + 0x33);
-
-        if (extent_x <= 0 || extent_y <= 0 || extent_x > 65536 || extent_y > 65536 ||
-            num_mips == 0 || num_mips > 32 ||
-            !(num_samples == 1 || num_samples == 2 || num_samples == 4 || num_samples == 8 || num_samples == 16) ||
-            dimension > 8 || format == 0 || format > 128) {
-            continue;
-        }
-
-        desc_offset = candidate;
-        break;
-    }
-
-    if (!desc_offset) {
-        return;
-    }
-
-    std::vector<size_t> slots{};
-    if (*desc_offset == 0xe0) {
-        slots = {7};
-    } else if (*desc_offset == 0xf0) {
-        slots = {5, 4};
-    } else {
-        slots = {4, 5};
-    }
-
-    for (const auto slot : slots) {
-        auto* const func = vtable[slot];
-
-        if (func == nullptr || IsBadReadPtr(func, 1)) {
-            continue;
-        }
-
-        auto* const resource = seh_call_native_resource_candidate(texture, func);
-
-        if (resource == nullptr || IsBadReadPtr(resource, sizeof(void*))) {
-            continue;
-        }
-
-        auto* const resource_vtable = *(void**)resource;
-
-        if (resource_vtable == nullptr || IsBadReadPtr(resource_vtable, sizeof(void*))) {
-            continue;
-        }
-
-        const auto resource_module = utility::get_module_within(resource_vtable);
-        const auto resource_module_path = resource_module ? utility::get_module_path(*resource_module) : std::nullopt;
-
-        if (!resource_module_path) {
-            continue;
-        }
-
-        auto lowered = std::string{*resource_module_path};
-        std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
-
-        if (!lowered.ends_with("d3d12.dll") && !lowered.ends_with("d3d12core.dll") && !lowered.ends_with("dxgi.dll")) {
-            continue;
-        }
-
-        if (const auto vtable_module = utility::get_module_within(vtable); vtable_module) {
-            sdk::discovery_cache::save_entry("frhitexture_get_native_resource", *vtable_module, {
-                {"vtable_index", (uint32_t)slot}
-            });
-        }
-
-        s_done = true;
-        SPDLOG_INFO(
-            "[NativeResource] Seeded FRHITexture::GetNativeResource slot {} (desc offset 0x{:x}) so the SDK never "
-            "blind-probes this title's vtable",
-            slot,
-            *desc_offset);
-        return;
-    }
-
-    SPDLOG_WARN_ONCE(
-        "[NativeResource] Could not establish a safe FRHITexture::GetNativeResource slot for texture {:x} "
-        "(desc offset 0x{:x})",
-        (uintptr_t)texture,
-        *desc_offset);
-}
+// [legacy-afw] seed_frhitexture_native_resource_slot (the Elliot / UE5.6 fix
+// that pre-seeds FRHITexture::GetNativeResource so the SDK does not blind-probe
+// the vtable) is not carried here: it writes through sdk::discovery_cache, which
+// the AFW base SDK lacks, and this branch predates UE5.6 support.
 
 bool is_deadzone_ue56_executable() {
     static const bool result = []() {
@@ -2004,55 +1736,18 @@ bool dimension_shift_is_auxiliary_view_family(sdk::FSceneViewFamily* view_family
     }
 }
 
+// Dune Awakening compatibility is a joeyhodge feature this branch does not
+// carry: the character-creation / live-pawn tracking it keys on lives in the
+// Joey-Merged hook state. Disabled here rather than partially applied.
 bool dune_should_preserve_native_viewport_target() {
-    return dune_awakening_is_current_game() &&
-        g_hook != nullptr &&
-        (g_hook->is_dune_character_creation_active() || g_hook->dune_has_live_pawn());
+    return false;
 }
 
 bool dune_is_auxiliary_view_family(sdk::FSceneViewFamily* view_family, const char* source) {
-    if (!dune_awakening_is_current_game() || view_family == nullptr) {
-        return false;
-    }
+    // See dune_should_preserve_native_viewport_target: Dune compatibility is not
+    // carried on this branch, so no family is classified as auxiliary.
+    return false;
 
-    if (g_hook == nullptr) {
-        return false;
-    }
-
-    // A different render-target pointer is not sufficient to identify a
-    // showroom family once Dune has entered a playable world. Its custom
-    // FidelityFX pipeline legitimately replaces the main family target.
-    if (g_hook->dune_has_live_pawn()) {
-        return false;
-    }
-
-    try {
-        auto* rtm = g_hook->get_render_target_manager();
-        auto* main_viewport = rtm != nullptr ? rtm->get_viewport() : nullptr;
-        auto* family_target = view_family->get_render_target();
-
-        if (main_viewport == nullptr || family_target == nullptr) {
-            return false;
-        }
-
-        if (reinterpret_cast<void*>(family_target) == reinterpret_cast<void*>(main_viewport)) {
-            return false;
-        }
-
-        SPDLOG_INFO_EVERY_N_SEC(
-            2,
-            "[Dune][Showroom] Isolating auxiliary view family at {} target={:x} main_viewport={:x}",
-            source != nullptr ? source : "<unknown>",
-            reinterpret_cast<uintptr_t>(family_target),
-            reinterpret_cast<uintptr_t>(main_viewport));
-        return true;
-    } catch (...) {
-        SPDLOG_WARNING_EVERY_N_SEC(
-            2,
-            "[Dune][Showroom] Failed to classify view family at {}; preserving normal UEVR behavior",
-            source != nullptr ? source : "<unknown>");
-        return false;
-    }
 }
 
 bool subnautica2_is_current_game() {
@@ -2428,53 +2123,6 @@ bool everspace2_is_live_uniform_buffer(uintptr_t buffer) {
     return first_virtual >= module && first_virtual < module + *module_size;
 }
 
-void everspace2_world_cleanup_hook(void* scene) {
-    constexpr uintptr_t uniform_buffers_offset = 0x30;
-    constexpr size_t uniform_buffer_count = 5;
-    size_t sanitized{};
-    std::shared_ptr<const VRRenderTargetManager_Base::Everspace2D3D12SceneTargetSnapshot>
-        retired_scene_target{};
-
-    if (g_hook != nullptr) {
-        if (auto* rtm = g_hook->get_render_target_manager(); rtm != nullptr) {
-            // Stop new D3D12 frames from acquiring the outgoing world's target.
-            // Keep the COM reference alive until the engine cleanup call returns.
-            retired_scene_target =
-                rtm->retire_everspace2_scene_target_snapshot("FScene::OnWorldCleanup");
-        }
-    }
-
-    if (scene != nullptr && !IsBadWritePtr(
-            reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(scene) + uniform_buffers_offset),
-            sizeof(uintptr_t) * uniform_buffer_count))
-    {
-        auto* slots = reinterpret_cast<uintptr_t*>(
-            reinterpret_cast<uintptr_t>(scene) + uniform_buffers_offset);
-
-        for (size_t index = 0; index < uniform_buffer_count; ++index) {
-            const auto buffer = slots[index];
-            if (buffer != 0 && !everspace2_is_live_uniform_buffer(buffer)) {
-                slots[index] = 0;
-                ++sanitized;
-                SPDLOG_ERROR(
-                    "[Everspace2][WorldCleanup] Dropped stale persistent uniform buffer "
-                    "scene={:x} slot={} buffer={:x} before FScene::OnWorldCleanup",
-                    reinterpret_cast<uintptr_t>(scene),
-                    index,
-                    buffer);
-            }
-        }
-    }
-
-    if (sanitized != 0) {
-        if (const auto logger = spdlog::default_logger(); logger != nullptr) {
-            logger->flush();
-        }
-    }
-
-    g_everspace2_world_cleanup_hook.call<void>(scene);
-}
-
 const Everspace2ExecutableProfile* everspace2_find_executable_profile(HMODULE module) {
     if (module == nullptr || IsBadReadPtr(module, sizeof(IMAGE_DOS_HEADER))) {
         return nullptr;
@@ -2786,193 +2434,6 @@ void everspace2_compute_memory_size_trace(safetyhook::Context& ctx) {
     }
 }
 
-void attempt_everspace2_pool_trace() {
-    if (!everspace2_is_current_game() ||
-        g_everspace2_pool_trace_attempted.exchange(true, std::memory_order_acq_rel))
-    {
-        return;
-    }
-
-    const auto module = utility::get_executable();
-    const auto* profile = everspace2_find_executable_profile(module);
-    if (profile == nullptr) {
-        SPDLOG_WARN(
-            "[Everspace2][PoolTrace] Disabled because the executable fingerprint does not match "
-            "a supported demo or retail build");
-        return;
-    }
-
-    const auto hook_address = (uintptr_t)module + profile->compute_memory_size_rva;
-    constexpr std::array<uint8_t, 13> expected{
-        0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x41, 0x54,
-    };
-
-    if (IsBadReadPtr((void*)hook_address, expected.size()) ||
-        std::memcmp((void*)hook_address, expected.data(), expected.size()) != 0)
-    {
-        SPDLOG_WARN(
-            "[Everspace2][PoolTrace] Disabled because FPooledRenderTarget::ComputeMemorySize "
-            "signature did not match at {:x}",
-            hook_address);
-        return;
-    }
-
-    const auto create_render_target_address =
-        reinterpret_cast<uintptr_t>(module) + profile->create_render_target_rva;
-    constexpr std::array<uint8_t, 13> create_render_target_expected{
-        0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41,
-    };
-
-    if (IsBadReadPtr((void*)create_render_target_address, create_render_target_expected.size()) ||
-        std::memcmp(
-            (void*)create_render_target_address,
-            create_render_target_expected.data(),
-            create_render_target_expected.size()) != 0)
-    {
-        SPDLOG_ERROR(
-            "[Everspace2][PoolTrace] CreateRenderTarget signature did not match at {:x}",
-            create_render_target_address);
-        return;
-    }
-
-    const auto final_release_address =
-        reinterpret_cast<uintptr_t>(module) + profile->final_release_path_rva;
-
-    if (IsBadReadPtr((void*)final_release_address, profile->final_release_signature.size()) ||
-        std::memcmp(
-            (void*)final_release_address,
-            profile->final_release_signature.data(),
-            profile->final_release_signature.size()) != 0)
-    {
-        SPDLOG_ERROR(
-            "[Everspace2][PoolTrace] FPooledRenderTarget final-release signature did not match at {:x}",
-            final_release_address);
-        return;
-    }
-
-    const auto ref_assignment_address =
-        reinterpret_cast<uintptr_t>(module) + profile->ref_assignment_rva;
-    constexpr std::array<uint8_t, 13> ref_assignment_expected{
-        0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19,
-    };
-
-    if (IsBadReadPtr((void*)ref_assignment_address, ref_assignment_expected.size()) ||
-        std::memcmp(
-            (void*)ref_assignment_address,
-            ref_assignment_expected.data(),
-            ref_assignment_expected.size()) != 0)
-    {
-        SPDLOG_ERROR(
-            "[Everspace2][PoolTrace] TRefCountPtr assignment signature did not match at {:x}",
-            ref_assignment_address);
-        return;
-    }
-
-    const auto preshadow_assignment_call_address =
-        reinterpret_cast<uintptr_t>(module) +
-        profile->preshadow_depth_assignment_return_rva -
-        profile->preshadow_assignment_call_signature.size();
-
-    if (IsBadReadPtr(
-            reinterpret_cast<void*>(preshadow_assignment_call_address),
-            profile->preshadow_assignment_call_signature.size()) ||
-        std::memcmp(
-            reinterpret_cast<void*>(preshadow_assignment_call_address),
-            profile->preshadow_assignment_call_signature.data(),
-            profile->preshadow_assignment_call_signature.size()) != 0)
-    {
-        SPDLOG_ERROR(
-            "[Everspace2][PoolTrace] PreshadowCache assignment call signature did not match at {:x}",
-            preshadow_assignment_call_address);
-        return;
-    }
-
-    int32_t preshadow_assignment_displacement{};
-    std::memcpy(
-        &preshadow_assignment_displacement,
-        reinterpret_cast<void*>(preshadow_assignment_call_address + 1),
-        sizeof(preshadow_assignment_displacement));
-
-    const auto preshadow_assignment_target =
-        preshadow_assignment_call_address +
-        profile->preshadow_assignment_call_signature.size() +
-        preshadow_assignment_displacement;
-
-    if (preshadow_assignment_target != ref_assignment_address) {
-        SPDLOG_ERROR(
-            "[Everspace2][PoolTrace] PreshadowCache assignment call target mismatch "
-            "expected={:x} actual={:x}",
-            ref_assignment_address,
-            preshadow_assignment_target);
-        return;
-    }
-
-    uintptr_t world_cleanup_address{};
-    if (profile->world_cleanup_rva != 0) {
-        world_cleanup_address =
-            reinterpret_cast<uintptr_t>(module) + profile->world_cleanup_rva;
-
-        if (IsBadReadPtr(
-                reinterpret_cast<void*>(world_cleanup_address),
-                profile->world_cleanup_signature.size()) ||
-            std::memcmp(
-                reinterpret_cast<void*>(world_cleanup_address),
-                profile->world_cleanup_signature.data(),
-                profile->world_cleanup_signature.size()) != 0)
-        {
-            SPDLOG_ERROR(
-                "[Everspace2][WorldCleanup] FScene::OnWorldCleanup signature did not match at {:x}",
-                world_cleanup_address);
-            return;
-        }
-    }
-
-    g_everspace2_active_profile = profile;
-    g_everspace2_pool_trace_hook =
-        safetyhook::create_mid((void*)hook_address, &everspace2_compute_memory_size_trace);
-    g_everspace2_create_render_target_hook = safetyhook::create_inline(
-        reinterpret_cast<void*>(create_render_target_address),
-        &everspace2_create_render_target_hook);
-    g_everspace2_ref_assignment_hook =
-        safetyhook::create_inline(reinterpret_cast<void*>(ref_assignment_address), &everspace2_ref_assignment_hook);
-    g_everspace2_final_release_hook =
-        safetyhook::create_mid(reinterpret_cast<void*>(final_release_address), &everspace2_final_release_trace);
-    if (world_cleanup_address != 0) {
-        g_everspace2_world_cleanup_hook = safetyhook::create_inline(
-            reinterpret_cast<void*>(world_cleanup_address),
-            &everspace2_world_cleanup_hook);
-    }
-
-    if (!g_everspace2_pool_trace_hook ||
-        !g_everspace2_create_render_target_hook ||
-        !g_everspace2_ref_assignment_hook ||
-        !g_everspace2_final_release_hook ||
-        (world_cleanup_address != 0 && !g_everspace2_world_cleanup_hook))
-    {
-        SPDLOG_ERROR(
-            "[Everspace2][PoolTrace] Failed to install provenance hooks "
-            "observer={} create={} assignment={} final_release={} world_cleanup={}",
-            static_cast<bool>(g_everspace2_pool_trace_hook),
-            static_cast<bool>(g_everspace2_create_render_target_hook),
-            static_cast<bool>(g_everspace2_ref_assignment_hook),
-            static_cast<bool>(g_everspace2_final_release_hook),
-            world_cleanup_address == 0 || static_cast<bool>(g_everspace2_world_cleanup_hook));
-        return;
-    }
-
-    SPDLOG_INFO(
-        "[Everspace2][PoolTrace] Installed {} passive bounded owner trace "
-        "observer={:x} create={:x} assignment={:x} final_release={:x} world_cleanup={:x}; "
-        "the exact PreshadowCache depth assignment at return RVA 0x{:x} is serialized",
-        profile->name,
-        hook_address,
-        create_render_target_address,
-        ref_assignment_address,
-        final_release_address,
-        world_cleanup_address,
-        profile->preshadow_depth_assignment_return_rva);
-}
-
 namespace home_together_pool_guard {
 constexpr uint32_t IMAGE_TIMESTAMP = 0x27A677D3;
 constexpr uint32_t IMAGE_SIZE = 0x0B822000;
@@ -3191,58 +2652,6 @@ void attempt_install() {
 }
 }
 
-bool everspace2_set_dedicated_ui_root(sdk::UObjectBase* object, bool rooted) {
-    if (object == nullptr) {
-        return false;
-    }
-
-    auto* object_array = sdk::FUObjectArray::get();
-    auto* object_item = object_array != nullptr ? object_array->get_object(object->get_internal_index()) : nullptr;
-
-    if (object_item == nullptr || object_item->get_object() != object) {
-        return false;
-    }
-
-    constexpr uint32_t root_set_flag = 1u << 30;
-
-    for (;;) {
-        const auto current = object_item->get_flags();
-        const auto desired = rooted ? current | root_set_flag : current & ~root_set_flag;
-
-        if (current == desired || object_item->compare_exchange_flags(current, desired)) {
-            return true;
-        }
-    }
-}
-
-void root_dedicated_ui_texture(sdk::UTexture* texture) {
-    if (texture == nullptr) {
-        return;
-    }
-
-    if (everspace2_is_current_game()) {
-        if (!everspace2_set_dedicated_ui_root(texture, true)) {
-            SPDLOG_ERROR("[Everspace2][UE5.5][SlateUI] Failed to root the persistent dedicated UI texture");
-        }
-        return;
-    }
-
-    texture->add_to_root();
-}
-
-void unroot_dedicated_ui_texture(sdk::UTexture* texture) {
-    if (texture == nullptr) {
-        return;
-    }
-
-    if (everspace2_is_current_game()) {
-        everspace2_set_dedicated_ui_root(texture, false);
-        return;
-    }
-
-    texture->remove_from_root();
-}
-
 bool pitpanic_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -3424,15 +2833,7 @@ void windrose_note_hfsm_transition(void* object, bool entering, const char* sour
         return;
     }
 
-    auto& vr = VR::get();
-    if (vr != nullptr) {
-        vr->set_windrose_meta_ui_2d_state_active(
-            utility::narrow(self_name.empty() ? name : self_name),
-            reinterpret_cast<uintptr_t>(object),
-            source != nullptr ? source : "unknown",
-            meta_ui_class == WindroseMetaUiClass::HardMenu,
-            entering);
-    }
+    // Windrose meta-UI 2D-state tracking is not carried on this branch.
 }
 
 std::optional<uintptr_t> windrose_resolve_hfsm_symbol(
@@ -4247,7 +3648,7 @@ void log_engine_render_timing_if_needed() {
 
 bool should_profile_engine_render_timing() {
     const auto vr = VR::get();
-    return is_ue_5_7_or_newer() && vr != nullptr && vr->is_hitch_diagnostics_enabled();
+    return false; // engine-render timing profile is a Joey-Merged feature
 }
 
 bool shf_is_valid_texture_with_vtable(FRHITexture2D* texture, void* required_vtable) {
@@ -5185,7 +4586,7 @@ void shf_force_scene_viewport_separate_rt(const sdk::FViewport& viewport, const 
                 2,
                 "[Dune][CustomPresent] Restored Dune's native viewport target from {} mode={}",
                 source,
-                g_hook->is_dune_character_creation_active() ? "character_creation" : "gameplay");
+                "gameplay");
         }
 
         return;
@@ -5209,74 +4610,10 @@ void shf_force_scene_viewport_separate_rt(const sdk::FViewport& viewport, const 
 }
 
 constexpr auto UE57_SLATE_THREAD_PREFERENCE_CACHE_KEY = "ue57_prefer_slate_thread";
-constexpr auto UE57_VIEW_EXTENSION_DISCOVERY_CACHE_KEY = "ue57_view_extension_discovery";
-
-bool load_ue57_slate_thread_preference() {
-    if (!is_ue_5_7_or_newer()) {
-        return false;
-    }
-
-    if (const auto cached = sdk::discovery_cache::load_entry(UE57_SLATE_THREAD_PREFERENCE_CACHE_KEY, utility::get_executable())) {
-        return cached->value("prefer_slate_thread", false);
-    }
-
-    return false;
-}
-
-void save_ue57_slate_thread_preference(bool prefer) {
-    if (!is_ue_5_7_or_newer()) {
-        return;
-    }
-
-    if (prefer) {
-        sdk::discovery_cache::save_entry(UE57_SLATE_THREAD_PREFERENCE_CACHE_KEY, utility::get_executable(), {
-            {"prefer_slate_thread", true}
-        });
-    } else {
-        sdk::discovery_cache::invalidate_entry(UE57_SLATE_THREAD_PREFERENCE_CACHE_KEY);
-    }
-}
-
-enum class UE57RenderTargetLoadAction : uint32_t {
-    NoAction = 0,
-    Load = 1,
-    Clear = 2,
-};
-
-struct UE57SlateDrawElementsPassInputsHead {
-    FRDGTexture* stencil_texture;
-    FRDGTexture* elements_texture;
-    FRDGTexture* scene_viewport_texture;
-    UE57RenderTargetLoadAction elements_load_action;
-};
-
-bool looks_like_ue57_slate_draw_elements_inputs(const UE57SlateDrawElementsPassInputsHead* inputs) {
-    if (inputs == nullptr || !is_readable_process_range((uintptr_t)inputs, sizeof(UE57SlateDrawElementsPassInputsHead))) {
-        return false;
-    }
-
-    const auto action = static_cast<uint32_t>(inputs->elements_load_action);
-
-    if (action > static_cast<uint32_t>(UE57RenderTargetLoadAction::Clear)) {
-        return false;
-    }
-
-    const auto scene_viewport_texture = inputs->scene_viewport_texture;
-    const auto elements_texture = inputs->elements_texture;
-
-    if (scene_viewport_texture == nullptr || elements_texture == nullptr) {
-        return false;
-    }
-
-    if (!is_readable_process_range((uintptr_t)scene_viewport_texture, sizeof(void*)) ||
-        !is_readable_process_range((uintptr_t)elements_texture, sizeof(void*))) {
-        return false;
-    }
-
-    return true;
-}
-
-using RegisterExternalTextureFromRHIFn = FRDGTexture* (*)(FRDGBuilder&, FRHITexture*, const wchar_t*);
+// [legacy-afw] UE5.7 Slate draw-elements detection removed: it models the
+// UE5.7 render-dependency-graph inputs (sdk::FRDGTexture) and the discovery
+// cache, neither of which exists in the AFW base SDK. This branch predates
+// UE5.7 support entirely.
 
 bool looks_like_nontrivial_virtual(uintptr_t fn) {
     if (fn == 0 || IsBadReadPtr((void*)fn, 1) || !utility::get_module_within((void*)fn).has_value()) {
@@ -6810,46 +6147,6 @@ std::optional<LegacyLocalPlayerViewStatesSnapshot> resolve_ue425_426_view_states
     return resolved;
 }
 
-bool ghosting_object_array_contains(
-    uintptr_t object,
-    int32_t internal_index,
-    bool validate_serial,
-    int32_t expected_serial,
-    int32_t* out_serial)
-{
-    auto* const object_array = sdk::FUObjectArray::get();
-    if (object_array == nullptr) {
-        return false;
-    }
-
-    __try {
-        const auto object_count = object_array->get_object_count();
-        if (object_count <= 0 || internal_index < 0 || internal_index >= object_count) {
-            return false;
-        }
-
-        auto* const item = object_array->get_object(internal_index);
-        if (item == nullptr) {
-            return false;
-        }
-
-        const auto serial = item->get_serial_number();
-        if (item->get_object() != reinterpret_cast<sdk::UObjectBase*>(object) ||
-            (validate_serial && serial != expected_serial))
-        {
-            return false;
-        }
-
-        if (out_serial != nullptr) {
-            *out_serial = serial;
-        }
-
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 bool ghosting_object_vtable_matches(void* object, void** expected_vtable) {
     if (object == nullptr || expected_vtable == nullptr) {
         return false;
@@ -6908,15 +6205,11 @@ bool ghosting_is_live_uobject(
     int32_t serial{};
     if (validate_membership) {
         if (validation_mode == GhostingUObjectValidationMode::ObjectArray) {
-            if (!ghosting_object_array_contains(
-                    address,
-                    internal_index,
-                    expected_identity != nullptr,
-                    expected_identity != nullptr ? expected_identity->serial : 0,
-                    &serial))
-            {
-                return false;
-            }
+            // [legacy-afw] ghosting_object_array_contains walked the UObjectArray
+            // through Joey-Merged-only accessors (get_object / get_serial_number /
+            // get_item_object_offset). Without it the ObjectArray validation mode
+            // cannot prove membership, so fail closed rather than assume.
+            return false;
         } else {
             auto& object_hook = UObjectHook::get();
             if (!ghosting_can_use_uobject_hook() ||
@@ -7450,9 +6743,10 @@ bool avowed_is_live_uobject(uintptr_t object, uintptr_t* out_vtable = nullptr, u
     }
 
     uintptr_t item_object{};
-    if (!safe_read_value((uintptr_t)item + sdk::FUObjectArray::get_item_object_offset(), item_object) || item_object != object) {
-        return false;
-    }
+    // [legacy-afw] sdk::FUObjectArray::get_item_object_offset is a
+    // Joey-Merged accessor; without it the item object cannot be read,
+    // so treat the object as not-live rather than guessing.
+    return false;
 
     if (out_vtable != nullptr) {
         *out_vtable = vtable;
@@ -7501,9 +6795,10 @@ bool dune_is_live_uobject(uintptr_t object, uintptr_t* out_class = nullptr) {
     }
 
     uintptr_t item_object{};
-    if (!safe_read_value((uintptr_t)item + sdk::FUObjectArray::get_item_object_offset(), item_object) || item_object != object) {
-        return false;
-    }
+    // [legacy-afw] sdk::FUObjectArray::get_item_object_offset is a
+    // Joey-Merged accessor; without it the item object cannot be read,
+    // so treat the object as not-live rather than guessing.
+    return false;
 
     if (out_class != nullptr) {
         *out_class = cls;
@@ -10632,326 +9927,6 @@ bool FFakeStereoRenderingHook::is_in_viewport_client_draw() const {
     return m_in_viewport_client_draw && GameThreadWorker::get().is_same_thread();
 }
 
-bool FFakeStereoRenderingHook::bind_ghosting_fix_owner(GhostingFixPair& pair, const char* log_label) {
-    GhostingFixOwnerCandidate candidate{};
-    GhostingOwnerResolveDiagnostic object_array_diagnostic{};
-    GhostingOwnerResolveDiagnostic object_hook_diagnostic{};
-    bool resolved = ghosting_resolve_current_owner(
-        pair.eye_state[0],
-        pair.eye_state[1],
-        candidate,
-        GhostingUObjectValidationMode::ObjectArray,
-        object_array_diagnostic);
-
-    const bool hook_fallback_available = ghosting_can_use_uobject_hook();
-    if (!resolved && hook_fallback_available) {
-        resolved = ghosting_resolve_current_owner(
-            pair.eye_state[0],
-            pair.eye_state[1],
-            candidate,
-            GhostingUObjectValidationMode::UObjectHook,
-            object_hook_diagnostic);
-    }
-
-    if (!resolved) {
-        if (!pair.logged_owner_unavailable) {
-            pair.logged_owner_unavailable = true;
-            SPDLOG_WARN(
-                "[{}] Scene-state owner resolution failed closed "
-                "direct_stage={} direct_player={}/{} hook_available={} hook_stage={} hook_player={}/{}",
-                log_label,
-                ghosting_owner_failure_name(object_array_diagnostic.failure),
-                object_array_diagnostic.local_player_index,
-                object_array_diagnostic.local_player_count,
-                hook_fallback_available,
-                hook_fallback_available
-                    ? ghosting_owner_failure_name(object_hook_diagnostic.failure)
-                    : "unavailable",
-                object_hook_diagnostic.local_player_index,
-                object_hook_diagnostic.local_player_count);
-        }
-        return false;
-    }
-
-    pair.owner = {
-        .engine = candidate.engine,
-        .engine_vtable = candidate.engine_vtable,
-        .engine_class = candidate.engine_class,
-        .engine_index = candidate.engine_index,
-        .engine_serial = candidate.engine_serial,
-        .game_instance_slot = candidate.game_instance_slot,
-        .game_instance = candidate.game_instance,
-        .game_instance_vtable = candidate.game_instance_vtable,
-        .game_instance_class = candidate.game_instance_class,
-        .game_instance_index = candidate.game_instance_index,
-        .game_instance_serial = candidate.game_instance_serial,
-        .local_players_header = candidate.local_players_header,
-        .local_players_data = candidate.local_players_data,
-        .local_players_count = candidate.local_players_count,
-        .local_players_capacity = candidate.local_players_capacity,
-        .local_player_slot = candidate.local_player_slot,
-        .local_player = candidate.local_player,
-        .local_player_vtable = candidate.local_player_vtable,
-        .local_player_class = candidate.local_player_class,
-        .local_player_index = candidate.local_player_index,
-        .local_player_serial = candidate.local_player_serial,
-        .view_states_header = candidate.view_states_header,
-        .view_states_data = candidate.view_states_data,
-        .view_states_count = candidate.view_states_count,
-        .view_states_capacity = candidate.view_states_capacity,
-        .view_state_stride = candidate.view_state_stride,
-        .view_state_reference_vtable = candidate.view_state_reference_vtable,
-        .eye_state_slot = {candidate.eye_state_slot[0], candidate.eye_state_slot[1]},
-        .viewport_client_slot = candidate.viewport_client_slot,
-        .viewport_client = candidate.viewport_client,
-        .viewport_client_vtable = candidate.viewport_client_vtable,
-        .viewport_client_class = candidate.viewport_client_class,
-        .viewport_client_index = candidate.viewport_client_index,
-        .viewport_client_serial = candidate.viewport_client_serial,
-        .world_slot = candidate.world_slot,
-        .world = candidate.world,
-        .world_vtable = candidate.world_vtable,
-        .world_class = candidate.world_class,
-        .world_index = candidate.world_index,
-        .world_serial = candidate.world_serial,
-        .last_validated_frame = g_frame_count,
-        .stable_frames = 1,
-        .view_states_are_array = candidate.view_states_are_array,
-        .uses_uobject_hook_validation = candidate.uses_uobject_hook_validation,
-        .verified = true,
-    };
-
-    if (candidate.uses_uobject_hook_validation) {
-        SPDLOG_WARN(
-            "[{}] Bound exact LocalPlayer scene-state ownership through the authoritative UObjectHook set "
-            "after direct FUObjectArray validation failed at stage={} owner={:x} storage={} stride=0x{:x}",
-            log_label,
-            ghosting_owner_failure_name(object_array_diagnostic.failure),
-            reinterpret_cast<uintptr_t>(candidate.local_player),
-            candidate.view_states_are_array ? "array" : "legacy pair",
-            candidate.view_state_stride);
-    }
-
-    pair.logged_owner_unavailable = false;
-    pair.logged_owner_stabilizing = false;
-    pair.logged_owner_validation_failed = false;
-    return true;
-}
-
-bool FFakeStereoRenderingHook::validate_ghosting_fix_owner(
-    const GhostingFixPair& pair,
-    const char** failure_stage)
-{
-    if (failure_stage != nullptr) {
-        *failure_stage = nullptr;
-    }
-
-    const auto fail = [&](const char* stage) {
-        if (failure_stage != nullptr) {
-            *failure_stage = stage;
-        }
-        return false;
-    };
-
-    const auto& owner = pair.owner;
-    if (!owner.verified ||
-        !ghosting_is_valid_scene_state(pair.eye_state[0]) ||
-        !ghosting_is_valid_scene_state(pair.eye_state[1]) ||
-        pair.eye_state[0] == pair.eye_state[1])
-    {
-        return fail("scene states");
-    }
-
-    const auto validation_mode = owner.uses_uobject_hook_validation
-        ? GhostingUObjectValidationMode::UObjectHook
-        : GhostingUObjectValidationMode::ObjectArray;
-    const bool validate_individual_membership = !owner.uses_uobject_hook_validation;
-
-    if (owner.uses_uobject_hook_validation) {
-        auto& object_hook = UObjectHook::get();
-        const std::array<sdk::UObjectBase*, 5> objects{
-            reinterpret_cast<sdk::UObjectBase*>(owner.engine),
-            reinterpret_cast<sdk::UObjectBase*>(owner.game_instance),
-            reinterpret_cast<sdk::UObjectBase*>(owner.local_player),
-            reinterpret_cast<sdk::UObjectBase*>(owner.viewport_client),
-            reinterpret_cast<sdk::UObjectBase*>(owner.world),
-        };
-        if (!ghosting_can_use_uobject_hook() ||
-            !object_hook->all_exist(objects.data(), objects.size()))
-        {
-            return fail("UObjectHook membership");
-        }
-    }
-
-    const GhostingUObjectIdentity engine_identity{
-        owner.engine_vtable,
-        owner.engine_class,
-        owner.engine_index,
-        owner.engine_serial,
-    };
-    const GhostingUObjectIdentity game_instance_identity{
-        owner.game_instance_vtable,
-        owner.game_instance_class,
-        owner.game_instance_index,
-        owner.game_instance_serial,
-    };
-    const GhostingUObjectIdentity local_player_identity{
-        owner.local_player_vtable,
-        owner.local_player_class,
-        owner.local_player_index,
-        owner.local_player_serial,
-    };
-    const GhostingUObjectIdentity viewport_client_identity{
-        owner.viewport_client_vtable,
-        owner.viewport_client_class,
-        owner.viewport_client_index,
-        owner.viewport_client_serial,
-    };
-    const GhostingUObjectIdentity world_identity{
-        owner.world_vtable,
-        owner.world_class,
-        owner.world_index,
-        owner.world_serial,
-    };
-
-    if (!ghosting_is_live_uobject(
-            owner.engine,
-            validation_mode,
-            &engine_identity,
-            nullptr,
-            validate_individual_membership) ||
-        !ghosting_is_live_uobject(
-            owner.game_instance,
-            validation_mode,
-            &game_instance_identity,
-            nullptr,
-            validate_individual_membership) ||
-        !ghosting_is_live_uobject(
-            owner.local_player,
-            validation_mode,
-            &local_player_identity,
-            nullptr,
-            validate_individual_membership) ||
-        !ghosting_is_live_uobject(
-            owner.viewport_client,
-            validation_mode,
-            &viewport_client_identity,
-            nullptr,
-            validate_individual_membership) ||
-        !ghosting_is_live_uobject(
-            owner.world,
-            validation_mode,
-            &world_identity,
-            nullptr,
-            validate_individual_membership))
-    {
-        return fail("UObject identity");
-    }
-
-    uintptr_t current_game_instance{};
-    uintptr_t current_local_player{};
-    uintptr_t current_viewport_client{};
-    uintptr_t current_world{};
-    if (!safe_read_value(owner.game_instance_slot, current_game_instance) ||
-        current_game_instance != reinterpret_cast<uintptr_t>(owner.game_instance) ||
-        !safe_read_value(owner.local_player_slot, current_local_player) ||
-        current_local_player != reinterpret_cast<uintptr_t>(owner.local_player) ||
-        !safe_read_value(owner.viewport_client_slot, current_viewport_client) ||
-        current_viewport_client != reinterpret_cast<uintptr_t>(owner.viewport_client) ||
-        !safe_read_value(owner.world_slot, current_world) ||
-        current_world != reinterpret_cast<uintptr_t>(owner.world))
-    {
-        return fail("owner pointer chain");
-    }
-
-    GhostingRawArrayHeader local_players{};
-    if (!ghosting_read_array_header(owner.local_players_header, 8, 32, local_players) ||
-        local_players.data != owner.local_players_data ||
-        local_players.count != owner.local_players_count ||
-        local_players.capacity != owner.local_players_capacity)
-    {
-        return fail("LocalPlayers array");
-    }
-
-    int32_t view_state_count = owner.view_states_count;
-    if (owner.view_states_are_array) {
-        GhostingRawArrayHeader view_states{};
-        if (!ghosting_read_array_header(owner.view_states_header, 8, 16, view_states) ||
-            view_states.data != owner.view_states_data ||
-            view_states.count != owner.view_states_count ||
-            view_states.capacity != owner.view_states_capacity)
-        {
-            return fail("ViewStates array");
-        }
-        view_state_count = view_states.count;
-    } else if (owner.view_states_header != 0 ||
-               owner.view_states_count != 2 ||
-               owner.view_states_capacity != 2)
-    {
-        return fail("legacy view-state pair");
-    }
-
-    const auto storage_size = static_cast<size_t>(view_state_count) * owner.view_state_stride;
-    if (owner.view_state_stride == 0 ||
-        storage_size / owner.view_state_stride != static_cast<size_t>(view_state_count) ||
-        !is_readable_process_range(owner.view_states_data, storage_size))
-    {
-        return fail("scene-state storage bounds");
-    }
-
-    uintptr_t current_eye_state[2]{};
-    uintptr_t current_reference_vtable[2]{};
-    if (!safe_read_value(owner.eye_state_slot[0], current_eye_state[0]) ||
-        !safe_read_value(owner.eye_state_slot[1], current_eye_state[1]) ||
-        !safe_read_value(owner.eye_state_slot[0] - sizeof(uintptr_t), current_reference_vtable[0]) ||
-        !safe_read_value(owner.eye_state_slot[1] - sizeof(uintptr_t), current_reference_vtable[1]) ||
-        current_reference_vtable[0] != owner.view_state_reference_vtable ||
-        current_reference_vtable[1] != owner.view_state_reference_vtable ||
-        current_eye_state[0] != reinterpret_cast<uintptr_t>(pair.eye_state[0]) ||
-        current_eye_state[1] != reinterpret_cast<uintptr_t>(pair.eye_state[1]))
-    {
-        return fail("eye-state slots");
-    }
-
-    return true;
-}
-
-bool FFakeStereoRenderingHook::refresh_ghosting_fix_owner(GhostingFixPair& pair, const char* log_label) {
-    if (!pair.owner.verified && !bind_ghosting_fix_owner(pair, log_label)) {
-        return false;
-    }
-
-    // UObject GC and LocalPlayer mutation run on the game thread. A successful
-    // validation remains authoritative for later views in this same engine frame.
-    if (pair.owner.last_validated_frame == g_frame_count) {
-        return true;
-    }
-
-    const char* failure_stage{};
-    if (!validate_ghosting_fix_owner(pair, &failure_stage)) {
-        if (!pair.logged_owner_validation_failed) {
-            pair.logged_owner_validation_failed = true;
-            SPDLOG_WARN(
-                "[{}] Verified owner became invalid at stage={}; keeping remap fail-closed "
-                "scene={:x} generation={} owner={:x}",
-                log_label,
-                failure_stage != nullptr ? failure_stage : "unknown",
-                pair.scene,
-                pair.generation,
-                reinterpret_cast<uintptr_t>(pair.owner.local_player));
-        }
-        return false;
-    }
-
-    pair.logged_owner_validation_failed = false;
-    pair.owner.last_validated_frame = g_frame_count;
-    if (pair.owner.stable_frames < std::numeric_limits<uint32_t>::max()) {
-        ++pair.owner.stable_frames;
-    }
-
-    return true;
-}
-
 namespace {
 // FSceneViewInitOptions::ViewFamily is reached through a SCANNED offset. When
 // that scan lands wrong the "family" is whatever bytes live there, and reading
@@ -11023,7 +9998,10 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     const auto init_options_scene_state = init_options->get_scene_state();
     auto* native_effective_scene_state = init_options_scene_state;
     const auto init_options_original_stereo_pass = init_options->get_stereo_pass();
-    const auto init_options_player_index = init_options->get_player_index();
+    // [legacy-afw] FSceneViewInitOptions::get_player_index/set_player_index are
+    // Joey-Merged UESDK accessors; the AFW SDK does not expose the field, so the
+    // player index is treated as unavailable here.
+    const std::optional<int32_t> init_options_player_index{};
     sdk::FSceneViewFamily* init_options_view_family = nullptr;
     sdk::FSceneInterface* init_options_scene = nullptr;
     if (!try_read_view_family_and_scene(init_options, &init_options_view_family, &init_options_scene)) {
@@ -11047,9 +10025,6 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
         init_options->set_scene_state(init_options_scene_state);
         init_options->set_stereo_pass(init_options_original_stereo_pass);
-        if (init_options_player_index.has_value()) {
-            init_options->set_player_index(*init_options_player_index);
-        }
     }};
 
     if (init_options_scene_state != nullptr) {
@@ -13513,10 +12488,6 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
             flat3d->set_game_projection((uint32_t)true_index, Matrix4x4f{dm}, tan_half_h, 1.0f / ys, near_z);
         }
 
-        return out;
-    }
-
-    if (medium_one_based_projection_pass && (view_index < 1 || view_index > 2)) {
         return out;
     }
 
