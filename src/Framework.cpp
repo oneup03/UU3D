@@ -852,9 +852,10 @@ void Framework::on_frame_d3d12() {
             ImGui::GetIO().BackendRendererUserData = m_d3d12.imgui_backend_datas[0];
             ImGui_ImplDX12_RenderDrawData(draw_data, cmd_ctx->cmd_list.Get());
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            cmd_ctx->cmd_list->ResourceBarrier(1, &barrier);
+        }
 
         cmd_ctx->execute();
     }
