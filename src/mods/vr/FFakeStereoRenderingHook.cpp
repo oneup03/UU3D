@@ -10041,6 +10041,37 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     auto& last_frame_count = g_hook->m_sceneview_data.last_frame_count;
     auto& last_index = g_hook->m_sceneview_data.last_index;
 
+    // Purge the remembered scene states when the rendering method changes.
+    //
+    // The Ghosting Fix below hands the constructor "the other" entry from
+    // known_scene_states so each eye gets its own temporal history. That set is
+    // otherwise only cleared in post_init_properties (LocalPlayer setup), but
+    // the engine destroys and recreates its FSceneViewStateInterfaces when the
+    // rendering method changes -- so after a switch the set still holds FREED
+    // pointers, and handing one to the game dereferences it. Observed as a
+    // process-killing AV inside the game going Native Stereo -> Synced
+    // Sequential in Hogwarts Legacy (the faulting address was exactly the value
+    // logged by "Setting scene state to").
+    {
+        const uint8_t mode_signature = (vr->is_using_afr() ? 1u : 0u) |
+                                       (vr->is_using_synchronized_afr() ? 2u : 0u);
+
+        if (mode_signature != g_hook->m_sceneview_data.ghosting_mode_signature) {
+            const auto stale = known_scene_states.size();
+            g_hook->m_sceneview_data.ghosting_mode_signature = mode_signature;
+            known_scene_states.clear();
+            g_hook->m_sceneview_data.m_ghosting_fix_pair = {};
+            g_hook->m_sceneview_data.view_init_options_ue4.clear();
+            g_hook->m_sceneview_data.view_init_options_ue5.clear();
+
+            SPDLOG_INFO(
+                "[GhostingFix] Rendering method changed (signature {}); dropped {} remembered scene state(s) "
+                "so a recreated view state is never swapped in from the old set",
+                mode_signature,
+                stale);
+        }
+    }
+
     if (last_frame_count != g_frame_count || last_index > 1) {
         last_index = 0;
     }

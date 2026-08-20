@@ -528,6 +528,12 @@ private:
 
         GhostingFixPair m_ghosting_fix_pair{};
 
+        // Rendering-method signature that known_scene_states was populated under.
+        // The engine destroys and recreates its FSceneViewStateInterfaces when the
+        // method changes, and the set is otherwise only cleared at LocalPlayer
+        // setup -- see sceneview_constructor. 0xFF = nothing observed yet.
+        uint8_t ghosting_mode_signature{0xFF};
+
         // For keeping track of what the states were before our modifications.
         std::unordered_map<sdk::FSceneViewStateInterface*, sdk::FSceneViewInitOptionsUE4> view_init_options_ue4{};
         std::unordered_map<sdk::FSceneViewStateInterface*, sdk::FSceneViewInitOptionsUE5> view_init_options_ue5{};
