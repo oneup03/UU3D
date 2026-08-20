@@ -12,7 +12,7 @@
 	url = https://github.com/joeyhodge/UESDK.git
 [submodule "dependencies/submodules/SR-lib"]
 	path = dependencies/submodules/SR-lib
-	url = https://github.com/oneup03/SR-lib.git
+	url = https://github.com/bo3b/SR-lib.git
 	branch = api_expansion
 [submodule "dependencies/submodules/nvapi"]
 	path = dependencies/submodules/nvapi
