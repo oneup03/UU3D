@@ -12270,14 +12270,6 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
             cam_pos_other = glm::vec3(cam_pos_d_other.y, cam_pos_d_other.z, -cam_pos_d_other.x);
         }
 
-        auto distance = glm::distance(vr->view_matrix_origin_offset, cam_pos);
-        if (distance > 100.0) {
-            vr->view_matrix_origin_offset = cam_pos;
-        }
-
-        cam_pos -= vr->view_matrix_origin_offset;
-        cam_pos_other -= vr->view_matrix_origin_offset;
-
         glm::mat4 view_inv_matrix = glm::translate(glm::mat4(1.0f), cam_pos) * view_to_world;
         glm::mat4 view_inv_matrix_other = glm::translate(glm::mat4(1.0f), cam_pos_other) * view_to_world_other;
         vr->render_view_inv_matrix[true_index][2] = vr->render_view_inv_matrix[true_index][1];

@@ -85,8 +85,6 @@ public:
     MatrixPair render_projection_matrix[2]{};
     int last_update_matrix_frame_count[2] = {0, 0};
 
-    glm::vec3 view_matrix_origin_offset{};
-
     int last_update_camera_data_frame_count = 0;
     void update_camera_data(int frame_count);
 
