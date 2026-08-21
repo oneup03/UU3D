@@ -1548,6 +1548,13 @@ private:
     // radius causes. Signed fraction of screen width (converted to tiles like
     // the radius): >0 stem hangs DOWN, <0 hangs UP, 0 = off.
     const ModSlider::Ptr m_flat3d_hud_stem_reach{ ModSlider::create(generate_name("Flat3D_HUDStemReach"), -0.25f, 0.25f, 0.0f) };
+    // DELIBERATELY absent from m_options, so it resets to off every session:
+    // a debug overlay should not persist into a normal play session. Note that
+    // absence from m_options is the ONLY way to express "do not save" - the
+    // trailing `true` here is advanced_option, which affects UI visibility and
+    // nothing else - so a deliberate omission is indistinguishable from the
+    // accidental kind that makes a setting silently revert on every injection.
+    // Leave it out on purpose; don't "fix" it.
     const ModToggle::Ptr m_flat3d_hud_debug{ ModToggle::create(generate_name("Flat3D_HUDDepthDebug"), false, true) };
     // Color-gated UI alpha: zero the redirected UI's alpha where it has ~no
     // color. Rescues the "UI Invert Alpha 0.5" workaround (P3R battles): that
@@ -1693,10 +1700,16 @@ public:
         m_options = {
             *m_flat3d_output_mode,
             *m_flat3d_render_scale,
+            // m_options is what config_save writes and config_load reads. A
+            // ModValue that is declared and drawn but missing here still works
+            // for the session and silently reverts to its default on the next
+            // injection, which reads as a save bug rather than a missing entry.
+            *m_flat3d_render_scale_stage,
             *m_flat3d_eye_swap,
             *m_flat3d_vsync,
             *m_flat3d_force_sdr,
             *m_flat3d_fov_multiplier,
+            *m_flat3d_fov_axis,
             *m_flat3d_depth,
             *m_flat3d_convergence,
             *m_flat3d_reference_fov,
