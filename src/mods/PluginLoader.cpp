@@ -1763,19 +1763,46 @@ void PluginLoader::early_init() try {
             auto&& path = entry.path();
 
             if (path.has_extension() && path.extension() == ".dll") {
+                // First directory to supply a given plugin name wins. Without this,
+                // the same plugin sitting in two of the directories below gets
+                // LoadLibrary'd twice: m_plugins.emplace silently drops the second
+                // bookkeeping entry, but the module is already in the process by
+                // then, so you end up with two live copies of it.
+                const auto stem = path.stem().string();
+
+                if (m_plugins.find(stem) != m_plugins.end()) {
+                    spdlog::info("[PluginLoader] Skipping {} ({} already loaded from an earlier directory)", path.string(), stem);
+                    continue;
+                }
+
                 auto module = LoadLibrary(path.string().c_str());
 
                 if (module == nullptr) {
                     spdlog::error("[PluginLoader] Failed to load {}", path.string());
-                    m_plugin_load_errors.emplace(path.stem().string(), "Failed to load");
+                    m_plugin_load_errors.emplace(stem, "Failed to load");
                     continue;
                 }
 
                 spdlog::info("[PluginLoader] Loaded {}", path.string());
-                m_plugins.emplace(path.stem().string(), module);
+                m_plugins.emplace(stem, module);
             }
         }
     };
+
+    // Plugins shipped next to this backend DLL, and they win over the %APPDATA%
+    // directories. UU3D ships two backends in one package (legacy at the package
+    // root, modern under modern\), each with its own LuaVR.dll built against that
+    // branch's plugin ABI — one shared %APPDATA% plugins directory can only ever
+    // match one of them.
+    //
+    // Deliberately a "plugins" SUBFOLDER and not the module directory itself: the
+    // loop above LoadLibrary's every .dll it finds, and the module directory also
+    // holds openvr_api.dll, PDAFWPlugin.dll and the frontend's runtime DLLs.
+    if (const auto module_dir = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"))) {
+        const auto module_plugins_path = std::filesystem::path{*module_dir} / L"plugins";
+        spdlog::info("[PluginLoader] Backend-local plugin dir {}", module_plugins_path.string());
+        load_plugins_from_dir(module_plugins_path);
+    }
 
     load_plugins_from_dir(global_plugins_path);
     load_plugins_from_dir(plugin_path);
