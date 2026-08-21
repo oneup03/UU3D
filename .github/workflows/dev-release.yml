@@ -4,15 +4,19 @@ name: Dev Release
 permissions:
   contents: read
 
-# Manual only. This used to run on every push to every branch with
-# makeLatest:true, so flat3d-afw / flat3d-legacy-afw / flat3d-dibr raced each
-# other for the "latest" release and whichever finished last won. Dispatching
-# by hand also means flat3d-dibr never publishes by accident.
+# Two ways in:
 #
-# NOTE: workflow_dispatch runs the copy of this file that exists on the branch
-# you pick in the UI, but the build below checks out BOTH release branches
-# explicitly by ref — so the result is identical whichever of them you run it
-# from. Keep this file in sync on both.
+#   workflow_dispatch - always builds and releases.
+#   schedule          - nightly, but only releases if either branch has moved
+#                       since the last release (see the check job).
+#
+# It deliberately does NOT run on push. It used to, on every branch, with
+# makeLatest:true - so flat3d-afw / flat3d-legacy-afw / flat3d-dibr raced each
+# other for "latest" and whichever finished last won.
+#
+# NOTE: both triggers run the copy of this file on the branch you dispatch from
+# (schedule uses the default branch), but the build checks out both release
+# branches explicitly. Keep this file in sync across them.
 on:
   workflow_dispatch:
     inputs:
@@ -24,29 +28,91 @@ on:
         description: "Branch for the MODERN backend (modern\\ subfolder)"
         required: true
         default: flat3d-afw
+  schedule:
+    - cron: "0 7 * * *"
 
 env:
   BUILD_TYPE: Release
 
 jobs:
+  # Resolves both branches to concrete commits and decides whether a scheduled
+  # run has anything new to publish.
+  #
+  # Pinning to a sha here rather than letting each build job resolve the branch
+  # itself means the two backends can't come from different moments, and the sha
+  # recorded in the release is exactly what was built.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      matrix: ${{ steps.decide.outputs.matrix }}
+      legacy_sha: ${{ steps.decide.outputs.legacy_sha }}
+      modern_sha: ${{ steps.decide.outputs.modern_sha }}
+    steps:
+      - name: Resolve branches and compare against the last release
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          LEGACY_REF="${{ github.event.inputs.legacy_ref || 'flat3d-legacy-afw' }}"
+          MODERN_REF="${{ github.event.inputs.modern_ref || 'flat3d-afw' }}"
+
+          # gh api rather than git ls-remote: it uses the workflow token, so this
+          # keeps working if the repo is private.
+          LEGACY_SHA=$(gh api "repos/$REPO/commits/$LEGACY_REF" --jq .sha 2>/dev/null || echo "")
+          MODERN_SHA=$(gh api "repos/$REPO/commits/$MODERN_REF" --jq .sha 2>/dev/null || echo "")
+
+          if [ -z "$LEGACY_SHA" ] || [ -z "$MODERN_SHA" ]; then
+            echo "::error::Could not resolve one of the branches (legacy=$LEGACY_REF -> '$LEGACY_SHA', modern=$MODERN_REF -> '$MODERN_SHA')"
+            exit 1
+          fi
+
+          echo "legacy $LEGACY_REF = $LEGACY_SHA"
+          echo "modern $MODERN_REF = $MODERN_SHA"
+
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            # Manual dispatch always publishes.
+            SHOULD=true
+          else
+            # The package job stamps the built commits into the release body as
+            # a marker comment. If the newest release already records both of
+            # today's commits, nothing has moved.
+            BODY=$(gh release view --repo "$REPO" --json body --jq .body 2>/dev/null || echo "")
+
+            if echo "$BODY" | grep -q "legacy=$LEGACY_SHA" && echo "$BODY" | grep -q "modern=$MODERN_SHA"; then
+              echo "Both branches already published in the latest release; skipping."
+              SHOULD=false
+            else
+              SHOULD=true
+            fi
+          fi
+
+          echo "should_release=$SHOULD" >> "$GITHUB_OUTPUT"
+          echo "legacy_sha=$LEGACY_SHA" >> "$GITHUB_OUTPUT"
+          echo "modern_sha=$MODERN_SHA" >> "$GITHUB_OUTPUT"
+
+          MATRIX=$(printf '[{"variant":"legacy","branch":"%s","sha":"%s"},{"variant":"modern","branch":"%s","sha":"%s"}]' \
+            "$LEGACY_REF" "$LEGACY_SHA" "$MODERN_REF" "$MODERN_SHA")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+        shell: bash
+
   # One job per backend, in parallel. They MUST be separate jobs rather than two
   # builds in one workspace: the branches pin different UESDK submodule commits,
   # and `git checkout` does not move submodules.
   build:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: legacy
-            ref: ${{ github.event.inputs.legacy_ref }}
-          - variant: modern
-            ref: ${{ github.event.inputs.modern_ref }}
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
     steps:
-      - name: Checkout backend (${{ matrix.variant }} = ${{ matrix.ref }})
+      - name: Checkout backend (${{ matrix.variant }} = ${{ matrix.branch }})
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
-          ref: ${{ matrix.ref }}
+          ref: ${{ matrix.sha }}
           token: ${{ secrets.UESDK_PULLER }}
           submodules: recursive
           persist-credentials: false
@@ -76,7 +142,7 @@ jobs:
           # backend-local plugins\ dir that PluginLoader scans first, not in the
           # shared %APPDATA% one where only one of the two could ever match.
           Copy-Item -Force ${{github.workspace}}/build/bin/LuaVR/LuaVR.dll $stage/plugins/
-          "${{ matrix.ref }} ${{ github.sha }}" | Out-File -Encoding ascii $stage/revision.txt
+          "${{ matrix.branch }} ${{ matrix.sha }}" | Out-File -Encoding ascii $stage/revision.txt
         shell: powershell
 
       - name: Upload ${{ matrix.variant }} artifact
@@ -87,7 +153,7 @@ jobs:
           if-no-files-found: error
 
   package:
-    needs: build
+    needs: [check, build]
     runs-on: windows-latest
     permissions:
       contents: write
@@ -104,7 +170,7 @@ jobs:
       - name: Checkout release notes
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
-          ref: ${{ github.event.inputs.legacy_ref }}
+          ref: ${{ needs.check.outputs.legacy_sha }}
           path: notes
           persist-credentials: false
 
@@ -138,7 +204,7 @@ jobs:
       # BYTE-IDENTICAL PDAFWPlugin.dll (only their own UEVRBackend.dll differs),
       # so one download serves both backends. The hash check is here so that if
       # PureDark ever diverges them this fails loudly instead of silently
-      # shipping the wrong plugin — AFW degrades to plain AFR without erroring,
+      # shipping the wrong plugin - AFW degrades to plain AFR without erroring,
       # which would be very easy to miss.
       - name: Bundle PDAFWPlugin from PureDark AFW release
         env:
@@ -197,13 +263,22 @@ jobs:
           echo "RUN_NUMBER=$paddedRunNumber" >> $env:GITHUB_ENV
         shell: powershell
 
+      # The trailing marker is what the nightly check reads to decide whether
+      # anything has moved. It is an HTML comment, so it does not render on the
+      # release page. Keep the "legacy=<sha> modern=<sha>" shape in sync with the
+      # grep in the check job.
+      - name: Compose release body
+        run: |
+          $body = Get-Content ${{github.workspace}}/notes/nightly-body.md -Raw
+          $marker = "`n`n<!-- uu3d-built legacy=${{ needs.check.outputs.legacy_sha }} modern=${{ needs.check.outputs.modern_sha }} -->`n"
+          Set-Content -Path ${{github.workspace}}/release-body.md -Value ($body + $marker) -Encoding utf8
+        shell: powershell
+
       - name: Create Release
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
-          # Quoted: an unquoted ": " inside the format string reads as a nested
-          # YAML mapping and fails to parse.
-          name: "${{ format('UU3D Nightly {0} (legacy {1} + modern {2})', env.RUN_NUMBER, github.event.inputs.legacy_ref, github.event.inputs.modern_ref) }}"
-          tag: ${{format('nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
+          name: ${{format('UU3D Nightly {0}', env.RUN_NUMBER)}}
+          tag: ${{format('nightly-{0}-{1}', env.RUN_NUMBER, needs.check.outputs.modern_sha)}}
           artifacts: "${{github.workspace}}/UU3D.zip,${{github.workspace}}/UU3D.zip.sha256"
           makeLatest: true
-          bodyFile: ${{github.workspace}}/notes/nightly-body.md
+          bodyFile: ${{github.workspace}}/release-body.md
