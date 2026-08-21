@@ -1,19 +1,48 @@
 name: Dev Release
-on: [push, workflow_dispatch]
+
+# Manual only. This used to run on every push to every branch with
+# makeLatest:true, so flat3d-afw / flat3d-legacy-afw / flat3d-dibr raced each
+# other for the "latest" release and whichever finished last won. Dispatching
+# by hand also means flat3d-dibr never publishes by accident.
+#
+# NOTE: workflow_dispatch runs the copy of this file that exists on the branch
+# you pick in the UI, but the build below checks out BOTH release branches
+# explicitly by ref — so the result is identical whichever of them you run it
+# from. Keep this file in sync on both.
+on:
+  workflow_dispatch:
+    inputs:
+      legacy_ref:
+        description: "Branch for the LEGACY backend (package root)"
+        required: true
+        default: flat3d-legacy-afw
+      modern_ref:
+        description: "Branch for the MODERN backend (modern\\ subfolder)"
+        required: true
+        default: flat3d-afw
+
 env:
   BUILD_TYPE: Release
+
 jobs:
-  dev-release:
+  # One job per backend, in parallel. They MUST be separate jobs rather than two
+  # builds in one workspace: the branches pin different UESDK submodule commits,
+  # and `git checkout` does not move submodules.
+  build:
     runs-on: windows-latest
-    permissions:
-      contents: write
     strategy:
+      fail-fast: false
       matrix:
-        target: [uevr]
+        include:
+          - variant: legacy
+            ref: ${{ github.event.inputs.legacy_ref }}
+          - variant: modern
+            ref: ${{ github.event.inputs.modern_ref }}
     steps:
-      - name: Checkout backend
+      - name: Checkout backend (${{ matrix.variant }} = ${{ matrix.ref }})
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
+          ref: ${{ matrix.ref }}
           token: ${{ secrets.UESDK_PULLER }}
           submodules: recursive
           persist-credentials: false
@@ -23,7 +52,7 @@ jobs:
         run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
 
       - name: Build backend
-        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target ${{matrix.target}}
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target uevr
 
       - name: Build plugin nullifier
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target vr-plugin-nullifier
@@ -31,11 +60,48 @@ jobs:
       - name: Build Lua API (shared DLL)
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target LuaVR
 
+      # Staged flat here; the package job decides whether this lands at the
+      # package root (legacy) or under modern\.
+      - name: Stage ${{ matrix.variant }} artifacts
+        run: |
+          $stage = "${{github.workspace}}/stage"
+          New-Item -ItemType Directory -Force -Path "$stage/plugins" | Out-Null
+          Copy-Item -Force ${{github.workspace}}/build/bin/uevr/UEVRBackend.dll $stage/
+          Copy-Item -Force ${{github.workspace}}/build/bin/vr-plugin-nullifier/UEVRPluginNullifier.dll $stage/
+          # LuaVR is built against THIS branch's plugin ABI, so it ships in the
+          # backend-local plugins\ dir that PluginLoader scans first, not in the
+          # shared %APPDATA% one where only one of the two could ever match.
+          Copy-Item -Force ${{github.workspace}}/build/bin/LuaVR/LuaVR.dll $stage/plugins/
+          "${{ matrix.ref }} ${{ github.sha }}" | Out-File -Encoding ascii $stage/revision.txt
+        shell: powershell
+
+      - name: Upload ${{ matrix.variant }} artifact
+        uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8
+        with:
+          name: backend-${{ matrix.variant }}
+          path: ${{github.workspace}}/stage/*
+          if-no-files-found: error
+
+  package:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
       - name: Checkout frontend
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           repository: oneup03/UU3DI
           path: frontend
+          persist-credentials: false
+
+      # Only for nightly-body.md. This job builds nothing from the backend repo,
+      # so no submodules and no UESDK_PULLER token are needed here.
+      - name: Checkout release notes
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          ref: ${{ github.event.inputs.legacy_ref }}
+          path: notes
           persist-credentials: false
 
       - name: Set up dotnet
@@ -44,32 +110,65 @@ jobs:
           dotnet-version: 6.0.x
 
       - name: Build frontend
-        run: dotnet publish '${{github.workspace}}/frontend' --output '${{github.workspace}}/build/bin/${{matrix.target}}' --configuration Release
+        run: dotnet publish '${{github.workspace}}/frontend' --output '${{github.workspace}}/UU3D' --configuration Release
 
-      - name: Stage artifacts
-        run: |
-          echo ${{github.sha}} > ${{github.workspace}}/revision.txt
-          New-Item -ItemType Directory -Force -Path ${{github.workspace}}/UU3D | Out-Null
-          Copy-Item -Recurse -Force ${{github.workspace}}/build/bin/${{matrix.target}}/* ${{github.workspace}}/UU3D/
-          Copy-Item -Force ${{github.workspace}}/build/bin/vr-plugin-nullifier/UEVRPluginNullifier.dll ${{github.workspace}}/UU3D/
-          Copy-Item -Force ${{github.workspace}}/build/bin/LuaVR/LuaVR.dll ${{github.workspace}}/UU3D/
-          Copy-Item -Force ${{github.workspace}}/revision.txt ${{github.workspace}}/UU3D/
+      - name: Download legacy backend
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-legacy
+          path: ${{github.workspace}}/UU3D
+
+      - name: Download modern backend
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-modern
+          path: ${{github.workspace}}/UU3D/modern
+
+      # The nullifier is injected by bare filename from the frontend's own
+      # directory, so only the root copy is ever used.
+      - name: Drop redundant nullifier from modern
+        run: Remove-Item -Force -ErrorAction SilentlyContinue ${{github.workspace}}/UU3D/modern/UEVRPluginNullifier.dll
         shell: powershell
 
+      # As of PureDark AFW v1.0-beta.6 the joeyhodge and nightly packages ship a
+      # BYTE-IDENTICAL PDAFWPlugin.dll (only their own UEVRBackend.dll differs),
+      # so one download serves both backends. The hash check is here so that if
+      # PureDark ever diverges them this fails loudly instead of silently
+      # shipping the wrong plugin — AFW degrades to plain AFR without erroring,
+      # which would be very easy to miss.
       - name: Bundle PDAFWPlugin from PureDark AFW release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $afwDir = "${{github.workspace}}/afw-plugin"
           New-Item -ItemType Directory -Force -Path $afwDir | Out-Null
-          gh release download --repo PureDark/UEVR --pattern "*joeyhodge*" --dir $afwDir
-          $zip = Get-ChildItem $afwDir -Filter *.zip | Select-Object -First 1
-          if (-not $zip) { throw "No 'joeyhodge' zip asset found in the latest PureDark/UEVR release" }
-          Expand-Archive -Path $zip.FullName -DestinationPath "$afwDir/extracted" -Force
-          $dll = Get-ChildItem "$afwDir/extracted" -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1
-          if (-not $dll) { throw "PDAFWPlugin.dll not found inside $($zip.Name)" }
-          Copy-Item -Force $dll.FullName ${{github.workspace}}/UU3D/
-          Write-Host "Bundled PDAFWPlugin.dll from $($zip.Name)"
+          gh release download --repo PureDark/UEVR --pattern "UEVR-*_AFW_*.zip" --dir $afwDir
+          $zips = Get-ChildItem $afwDir -Filter *.zip
+          if ($zips.Count -lt 1) { throw "No '*_AFW_*' zip assets found in the latest PureDark/UEVR release" }
+
+          $hashes = @{}
+          foreach ($zip in $zips) {
+            $dest = Join-Path $afwDir $zip.BaseName
+            Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
+            $dll = Get-ChildItem $dest -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1
+            if (-not $dll) { throw "PDAFWPlugin.dll not found inside $($zip.Name)" }
+            $hashes[$zip.Name] = (Get-FileHash -Algorithm SHA256 $dll.FullName).Hash
+            Write-Host "$($zip.Name): $($hashes[$zip.Name])"
+          }
+
+          $distinct = $hashes.Values | Sort-Object -Unique
+          if ($distinct.Count -gt 1) {
+            throw "PDAFWPlugin.dll now DIFFERS between PureDark's AFW packages. The workflow assumed they were identical - pick the right one per backend before releasing."
+          }
+
+          $src = (Get-ChildItem $afwDir -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1).FullName
+          Copy-Item -Force $src ${{github.workspace}}/UU3D/
+          Copy-Item -Force $src ${{github.workspace}}/UU3D/modern/
+          Write-Host "Bundled PDAFWPlugin.dll into both backends"
+        shell: powershell
+
+      - name: Show final layout
+        run: Get-ChildItem ${{github.workspace}}/UU3D -Recurse -File | ForEach-Object { $_.FullName.Replace("${{github.workspace}}/UU3D", "") }
         shell: powershell
 
       - name: Upload artifacts
@@ -80,8 +179,7 @@ jobs:
           if-no-files-found: error
 
       - name: Compress artifacts
-        run: |
-          7z a ${{github.workspace}}/UU3D.zip ${{github.workspace}}/UU3D
+        run: 7z a ${{github.workspace}}/UU3D.zip ${{github.workspace}}/UU3D
         shell: powershell
 
       - name: Hash zip
@@ -98,8 +196,10 @@ jobs:
       - name: Create Release
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
-          name: ${{format('UU3D Nightly {0} [{1}] ({2})', env.RUN_NUMBER, github.ref_name, github.sha)}}
+          # Quoted: an unquoted ": " inside the format string reads as a nested
+          # YAML mapping and fails to parse.
+          name: "${{ format('UU3D Nightly {0} (legacy {1} + modern {2})', env.RUN_NUMBER, github.event.inputs.legacy_ref, github.event.inputs.modern_ref) }}"
           tag: ${{format('nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
           artifacts: "${{github.workspace}}/UU3D.zip,${{github.workspace}}/UU3D.zip.sha256"
           makeLatest: true
-          bodyFile: ${{github.workspace}}/nightly-body.md
+          bodyFile: ${{github.workspace}}/notes/nightly-body.md
