@@ -34,6 +34,47 @@ import them via **Import Config** below.
    **UU3D menu** — press **Insert** to open or close it (rebindable via the
    menu key setting).
 
+### Legacy or Modern backend
+
+The package ships **two builds of UU3D**, and the radio pair on the inject row
+picks which one gets injected:
+
+| | Where it lives | Use it when |
+|---|---|---|
+| **Legacy** (default) | package root | The more stable of the two. Start here. |
+| **Modern** | `modern\` subfolder | A newer title doesn't work on Legacy. |
+
+They're built from different bases, so a game that misbehaves on one is worth
+retrying on the other before assuming it's unsupported.
+
+**The choice is saved per game**, in the game's profile folder, and the radios
+update to match whenever you select a different process. Injecting also writes
+the setting out the first time, so every profile ends up carrying an explicit
+choice you can see and edit rather than an implied default. It travels with
+**Export Config** / **Import Config** along with the rest of the profile.
+
+If you pick Modern on a package that predates the split, UU3DI falls back to
+Legacy for that injection, tells you once, and **keeps your saved choice** —
+so it starts working again as soon as you update rather than silently reverting.
+
+### Auto inject
+
+With **Auto inject** ticked, UU3DI watches for games once a second and injects
+on its own **20 seconds after one appears**, then sits idle until that game
+exits. It's a global setting, not per game.
+
+A game opts in simply by **having a saved profile** — that is, once you've
+injected into it or changed one of its settings at least once. Games you've
+never set up are ignored, so it won't fire on arbitrary programs.
+
+It stands down while a UU3D session is already running (including one you
+injected by hand) and while UU3DI was launched with `--attach=`, so the two
+never race for the same process.
+
+> The 20-second delay is deliberate — injecting into a title that is still
+> spinning up its renderer is a good way to get a crash. If a game needs longer
+> than that, inject it manually instead.
+
 ## The Unreal tab in one minute
 
 3D Display composites whatever stereo pair the **Unreal** tab produces, so
