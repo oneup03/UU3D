@@ -223,15 +223,36 @@ struct Flat3DFrameParams {
     int32_t colorspace{0};      // Flat3DColorSpace
     float paper_white_nits{200.0f};
 
-    // Display color correction (SDR only).
-    bool correction_enabled{false};
-    float lift[3]{0.0f, 0.0f, 0.0f};
-    float gamma[3]{1.0f, 1.0f, 1.0f};
-    float gain[3]{1.0f, 1.0f, 1.0f};
-    float curve{1.0f};
-    float off_low{0.0f};
-    float off_high{0.0f};
-    float off_both{0.0f};
+    // Ghost reduction (1.0 == off). Every stereo display leaks some of each
+    // eye's image into the other; the leak is visible in proportion to the
+    // luminance difference between the eyes, so compressing the signal range
+    // before it reaches the display reduces what you see. This is the standard
+    // range-compression approach from the stereo-crosstalk literature.
+    //
+    // A squeeze toward mid-grey shrinks |L - R| directly, and additionally
+    // leaves (1 - ghost_contrast)/2 of headroom at each end of the range. That
+    // second effect matters on displays that perform their own crosstalk
+    // cancellation: cancellation pre-subtracts a fraction of the opposite eye,
+    // which drives values past the ends of the range where the render target
+    // clamps them, and the clamped part is what survives as residual ghosting.
+    //
+    // Applied in LINEAR light with a 0.5 pivot via pow(2.2). Displays that
+    // cancel generally do so in linear light, so matching that keeps the two
+    // consistent; see ApplyGhostReduction.
+    //
+    // SDR only (the shader gates on colorspace), and deliberately not applied
+    // to 3D screenshots - a capture should not bake in a fix for one display.
+    float ghost_contrast{1.0f};
+
+    // The other half of the same knob: raise the black floor instead of
+    // squeezing the whole range. Cancellation clips at the BOTTOM, since
+    // subtracting the opposite eye drives dark pixels below zero, so lifting
+    // blacks targets that directly and trades black level rather than contrast.
+    // The stereo literature calls the resulting margin "foot-room".
+    //
+    // Only meaningful on displays that actually cancel; where nothing subtracts
+    // there is no clipping to relieve and only ghost_contrast helps.
+    float ghost_lift{0.0f};
 
     // Symmetric-projection mode: per-eye matrices identical (no shear);
     // convergence applied as a compositor image shift instead.
@@ -246,7 +267,10 @@ struct Flat3DFrameParams {
     bool want_depth{false};
 };
 
-// Matches the cbuffer in the repack shader below. 12 dwords (3x float4).
+// Matches the cbuffer in the repack shader below. 12 dwords (3x float4):
+// nine meaningful values, then the tail padding an HLSL cbuffer rounds up to.
+// The D3D11 path uses sizeof() directly as the buffer ByteWidth, which D3D11
+// requires to be a 16-byte multiple, so the padding is load-bearing.
 struct RepackConstants {
     int32_t out_size[2]{};
     int32_t mode{0};
@@ -254,19 +278,16 @@ struct RepackConstants {
     int32_t colorspace{0};   // Flat3DColorSpace of the OUTPUT (backbuffer)
     float paper_white{200.0f};
     int32_t src_srgb{0};     // eye textures are 8-bit sRGB while output is HDR
-    int32_t correction_enabled{0};
-    // Display color correction (VRto3D lift/gamma/gain + S-curve; SDR only).
-    float lift[3]{0.0f, 0.0f, 0.0f};
-    float curve{1.0f};
-    float gamma[3]{1.0f, 1.0f, 1.0f};
-    float off_low{0.0f};
-    float gain[3]{1.0f, 1.0f, 1.0f};
-    float off_high{0.0f};
-    float off_both{0.0f};
     // Symmetric-projection convergence (identity when the mode is off).
     float scene_shift_uv{0.0f};
     float scene_scale{1.0f};
-    float pad{0.0f};
+    // Ghost reduction; the defaults are exact no-ops, so any pass that wants the
+    // image untouched (3D screenshots) simply leaves them alone. ghost_lift takes
+    // one of the old padding slots, so the struct stays 48 bytes / 12 dwords and
+    // the D3D12 root-constant count is unchanged.
+    float ghost_contrast{1.0f};
+    float ghost_lift{0.0f};
+    float pad[1]{};
 };
 
 // Matches the cbuffer in the overlay shader below (16-byte aligned).
@@ -390,34 +411,38 @@ cbuffer RepackParams : register(b0) {
     int   colorspace;   // OUTPUT space: 0 = SDR, 1 = HDR10/PQ, 2 = scRGB
     float paper_white;  // nits
     int   src_srgb;     // eye textures are 8-bit sRGB while output is HDR
-    int   correction_enabled;
-    float3 lift;
-    float  curve;
-    float3 gamma_;
-    float  off_low;
-    float3 gain;
-    float  off_high;
-    float  off_both;
     // Symmetric-projection mode: convergence applied here instead of the
     // projection shear (identical per-eye matrices fix one-eye effects).
     float  scene_shift_uv; // LEFT-eye image shift in eye-UV units (right = -)
     float  scene_scale;    // mild zoom so the shifted image still fills the eye
-    float  pad;
+    float  ghost_contrast;   // ghost reduction, contrast squeeze (1.0 = no-op)
+    float  ghost_lift;       // ghost reduction, black lift    (0.0 = no-op)
 };
 
-// VRto3D display color correction (SCurve + LiftGammaGain), operating on
-// sRGB-encoded [0,1] color. 1:1 port of dx11_renderer kAdjustPsHlsl.
-float3 ApplyCorrection(float3 col) {
-    float3 low  = pow(abs(col), curve)       + off_low;
-    float3 high = pow(abs(col), 1.0 / curve) + off_high;
-    float3 t    = saturate(col + off_both);
-    col = lerp(low, high, t);
-
-    col = col * (1.5 - 0.5 * lift) + 0.5 * lift - 0.5;
-    col = saturate(col);
-    col *= gain;
-    col = pow(abs(col), 1.0 / gamma_);
-    return saturate(col);
+// Ghost reduction: standard range compression for stereo crosstalk. Linear
+// light, 0.5 pivot, pow(2.2) rather than the piecewise sRGB curve. Full
+// rationale is on Flat3DFrameParams::ghost_contrast (kept out of this string:
+// MSVC caps a literal at 16 KB and this one is already split).
+//
+// Two levers, both no-ops at their defaults, applied in that order:
+//
+//   ghost_contrast - squeeze toward mid-grey. Shrinks |L - R| AND opens headroom
+//                  at both ends of the range. Costs contrast across the image.
+//   ghost_lift     - raise the black floor, leaving white alone. Crosstalk
+//                  cancellation clips at the BOTTOM (it subtracts the opposite
+//                  eye and drives values below 0), so lift is the targeted fix
+//                  for that; the stereo literature calls the margin "foot-room".
+//                  Squeezing the highlights, as contrast does, is mostly wasted
+//                  on it. Costs black level rather than contrast.
+//
+// Lift only helps on displays that actually cancel. Where nothing subtracts
+// there is no clipping to give foot-room to, and only ghost_contrast (shrinking
+// |L - R|) reduces visible ghosting.
+float3 ApplyGhostReduction(float3 c) {
+    float3 lin = pow(saturate(c), 2.2);
+    lin = (lin - 0.5) * ghost_contrast + 0.5;
+    lin = lin * (1.0 - ghost_lift) + ghost_lift;
+    return pow(saturate(lin), 1.0 / 2.2);
 }
 
 float3 srgb_to_linear(float3 c) {
@@ -534,7 +559,7 @@ float4 SampleEye(int half_idx, float u, float v) {
 
     return (eye == 0) ? eye_left.Sample(samp, uv) : eye_right.Sample(samp, uv);
 }
-
+)" /* split: MSVC caps a single string literal at 16 KB; adjacent literals concatenate */ R"(
 float4 Repack(float2 uv, float2 pixel) {
     int m = mode;
 
@@ -723,10 +748,11 @@ float4 Repack(float2 uv, float2 pixel) {
 float4 ps_main(VSOut input) : SV_Target {
     float4 c = Repack(input.uv, input.pos.xy);
 
-    // Display color correction (SDR only — it's defined in sRGB byte space;
-    // for SDR every mode returns sRGB-encoded [0,1] here).
-    if (correction_enabled != 0 && colorspace == 0) {
-        c.rgb = ApplyCorrection(c.rgb);
+    // Ghost reduction. SDR only: the remap is defined on sRGB-encoded [0,1],
+    // which is what every mode returns here when colorspace == 0. 1.0 is the
+    // default everywhere, which makes the branch free.
+    if ((ghost_contrast != 1.0 || ghost_lift != 0.0) && colorspace == 0) {
+        c.rgb = ApplyGhostReduction(c.rgb);
     }
 
     // Pass-through / resampling modes with an sRGB source and an HDR output

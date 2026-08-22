@@ -2350,18 +2350,9 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
                  || m_flat3d_autoconv_enabled->value()
                  || cursor_mode == 2; // geometry cursor needs SceneDepthZ
 
-    // Display color correction (SDR only; the shader gates on colorspace).
-    p.correction_enabled = m_flat3d_correction_enabled->value();
-    p.lift[0] = m_flat3d_lift_r->value();
-    p.lift[1] = m_flat3d_lift_g->value();
-    p.lift[2] = m_flat3d_lift_b->value();
-    p.gamma[0] = m_flat3d_gamma_r->value();
-    p.gamma[1] = m_flat3d_gamma_g->value();
-    p.gamma[2] = m_flat3d_gamma_b->value();
-    p.gain[0] = m_flat3d_gain_r->value();
-    p.gain[1] = m_flat3d_gain_g->value();
-    p.gain[2] = m_flat3d_gain_b->value();
-    p.curve = m_flat3d_curve->value();
+    // Ghost reduction (SDR only; the shader gates on colorspace).
+    p.ghost_contrast = m_flat3d_ghost_contrast->value();
+    p.ghost_lift = m_flat3d_ghost_lift->value();
 
     return p;
 }
@@ -2453,14 +2444,14 @@ void VR::on_draw_sidebar_flat3d() {
             text_disabled_wrapped("LeiaSR needs a build with the SR SDK and a running SRService "
                                   "(D3D11 or D3D12). Falls back to Side-by-Side otherwise.");
         } else if (mode == Flat3DOutputMode::KATANGA) {
-            text_disabled_wrapped("Katanga — shares a side-by-side stereo texture with Katanga.exe / "
+            text_disabled_wrapped("Katanga - shares a side-by-side stereo texture with Katanga.exe / "
                                   "VRScreenCap (launch either, any order). Forces the game into a normal "
                                   "window; the local window shows a left-eye preview.");
         } else if (mode >= Flat3DOutputMode::FRAMEPACKED_720P60 && mode <= Flat3DOutputMode::FRAMEPACKED_1080P60) {
-            text_disabled_wrapped("Frame-packed HDMI 1.4 — auto-applies a custom display timing via "
+            text_disabled_wrapped("Frame-packed HDMI 1.4 - auto-applies a custom display timing via "
                                   "NVIDIA/AMD (or a CRU-preconfigured mode); reverts on mode change/exit.");
         } else if (mode == Flat3DOutputMode::DUAL_DISPLAY || mode == Flat3DOutputMode::DUAL_DISPLAY_FLIP) {
-            text_disabled_wrapped("Dual Display — set the game to span both monitors side by side.");
+            text_disabled_wrapped("Dual Display - set the game to span both monitors side by side.");
         }
 
         // Pixel-exact modes need a display-native output chain: the pattern /
@@ -2478,12 +2469,12 @@ void VR::on_draw_sidebar_flat3d() {
                 if (display_scaled || window_scaled) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.2f, 1.0f));
                     if (display_scaled) {
-                        ImGui::TextWrapped("WARNING: display is running %dx%d but its native mode is %dx%d — "
+                        ImGui::TextWrapped("WARNING: display is running %dx%d but its native mode is %dx%d - "
                                            "this mode needs the native display mode (no 3D otherwise).",
                                            di->cur_w, di->cur_h, di->native_w, di->native_h);
                     }
                     if (window_scaled) {
-                        ImGui::TextWrapped("WARNING: game output is %dx%d but the display area is %dx%d — "
+                        ImGui::TextWrapped("WARNING: game output is %dx%d but the display area is %dx%d - "
                                            "set the in-game resolution to match (use render/resolution SCALE "
                                            "to lower GPU cost instead; that path is upscaled correctly).",
                                            (int)rt.x, (int)rt.y, di->cur_w, di->cur_h);
@@ -2513,7 +2504,7 @@ void VR::on_draw_sidebar_flat3d() {
     m_flat3d_force_sdr->draw("Force SDR Output");
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("HDR output (PQ/scRGB swapchains) washes out the 3D modes and\n"
-                          "disables color correction — this switches the game back to SDR.\n"
+                          "disables ghost reduction - this switches the game back to SDR.\n"
                           "Turn off to experiment with HDR passthrough.");
     }
 
@@ -2524,7 +2515,7 @@ void VR::on_draw_sidebar_flat3d() {
     if (m_flat3d_render_scale->value() != 0) {
         m_flat3d_render_scale_stage->draw("Applied To");
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Primary is the upscaler's own input resolution — DLSS/TSR set it themselves,\n"
+            ImGui::SetTooltip("Primary is the upscaler's own input resolution - DLSS/TSR set it themselves,\n"
                               "so a preset overrides this instead of stacking.\n"
                               "Secondary runs after the upscale and multiplies with it.\n"
                               "Legacy shrinks our render target for games that ignore both cvars;\n"
@@ -2723,7 +2714,7 @@ void VR::on_draw_sidebar_flat3d() {
         m_flat3d_fullscreen_coverage->draw("Full-Screen UI Coverage %");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Flatten the HUD/crosshair depth once the game's UI covers at least\n"
-                              "this %% of the screen — catches full-screen menus that DON'T show a\n"
+                              "this %% of the screen - catches full-screen menus that DON'T show a\n"
                               "mouse cursor (map/inventory/controller menus). Raise it if a busy\n"
                               "gameplay HUD trips it; lower it if a full-screen menu isn't caught.\n"
                               "0 disables coverage (mouse-cursor + game-paused detection still apply).");
@@ -2790,7 +2781,7 @@ void VR::on_draw_sidebar_flat3d() {
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("Occupancy is DISABLED inside this central box (half-size\n"
                                           "from screen center), so world markers that linger there are\n"
-                                          "never flattened — panels live outside it. Shrink to suppress\n"
+                                          "never flattened - panels live outside it. Shrink to suppress\n"
                                           "a more central panel; 0.5 protects the whole screen.");
                     }
                     ImGui::Unindent();
@@ -2799,7 +2790,7 @@ void VR::on_draw_sidebar_flat3d() {
                 m_flat3d_hud_reject_fills->draw("Reject Large UI Fills");
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("A big contiguous UI fill (menu backdrop, blurred scene scrim)\n"
-                                      "is never a world marker — a marker is a small island. Forces\n"
+                                      "is never a world marker - a marker is a small island. Forces\n"
                                       "flat immediately (no occupancy delay) and works dead-center,\n"
                                       "unlike the safe zone. Fixes menu backdrops warping the HUD.");
                 }
@@ -2946,19 +2937,53 @@ void VR::on_draw_sidebar_flat3d() {
         ImGui::TreePop();
     }
 
-    if (ImGui::TreeNode("Color Correction (SDR)")) {
-        m_flat3d_correction_enabled->draw("Enable");
-        m_flat3d_curve->draw("S-Curve Contrast");
-        m_flat3d_lift_r->draw("Lift R"); m_flat3d_lift_g->draw("Lift G"); m_flat3d_lift_b->draw("Lift B");
-        m_flat3d_gamma_r->draw("Gamma R"); m_flat3d_gamma_g->draw("Gamma G"); m_flat3d_gamma_b->draw("Gamma B");
-        m_flat3d_gain_r->draw("Gain R"); m_flat3d_gain_g->draw("Gain G"); m_flat3d_gain_b->draw("Gain B");
+    if (ImGui::TreeNode("Ghost Reduction (Crosstalk)")) {
+        m_flat3d_ghost_contrast->draw("Contrast");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Reduces ghosting (crosstalk) by compressing both eyes toward mid-grey\n"
+                "before they reach the display.\n\n"
+                "Every stereo display leaks some of each eye's image into the other, and how\n"
+                "visible that leak is depends on the brightness difference between the eyes.\n"
+                "Shrinking that difference makes what leaks through harder to see.\n\n"
+                "On displays that cancel crosstalk themselves, it does a second job: the\n"
+                "cancellation pre-subtracts part of the opposite eye, which pushes values\n"
+                "past the ends of the range where they get clipped - and the clipped part is\n"
+                "what survives as a ghost. Compressing first leaves room for it to land.\n\n"
+                "The cost is real: less contrast and lifted blacks across the whole image.\n"
+                "Turn it down only until the ghosting stops.\n\n"
+                "1.00 = off. Try 0.90 first, and go lower only if edges still ghost.\n\n"
+                "Runs in linear light with a 0.5 pivot.");
+        }
 
-        if (ImGui::Button("Reset to Defaults##flat3d_color")) {
-            m_flat3d_correction_enabled->value() = false;
-            m_flat3d_curve->value() = 1.0f;
-            m_flat3d_lift_r->value() = 0.0f;  m_flat3d_lift_g->value() = 0.0f;  m_flat3d_lift_b->value() = 0.0f;
-            m_flat3d_gamma_r->value() = 1.0f; m_flat3d_gamma_g->value() = 1.0f; m_flat3d_gamma_b->value() = 1.0f;
-            m_flat3d_gain_r->value() = 1.0f;  m_flat3d_gain_g->value() = 1.0f;  m_flat3d_gain_b->value() = 1.0f;
+        m_flat3d_ghost_lift->draw("Black Lift");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "The other way to give a display's own crosstalk cancellation room to work:\n"
+                "raise the black floor instead of squeezing the whole range. White is left\n"
+                "alone, so it costs black level rather than contrast.\n\n"
+                "Cancellation clips at the BOTTOM - it subtracts part of the opposite eye,\n"
+                "driving dark pixels below zero where they get clamped. Lifting blacks\n"
+                "targets that directly, while Contrast spends most of its effect squeezing\n"
+                "highlights that were never the problem. The stereo literature calls the\n"
+                "resulting margin 'foot-room'.\n\n"
+                "Only helps on displays that actually cancel. Where nothing subtracts there\n"
+                "is no clipping to relieve and this will mostly just wash out blacks - use\n"
+                "Contrast there.\n\n"
+                "0.00 = off. Try 0.02 to 0.05; blacks turn grey quickly above that.\n\n"
+                "Applied after Contrast, so the two stack. Test one at a time.");
+        }
+
+        text_disabled_wrapped("Two levers for the same problem. Contrast shrinks the difference "
+                              "between the eyes; Black Lift gives a display's own crosstalk "
+                              "cancellation room to land. SDR only, and 3D screenshots are "
+                              "captured without either.");
+        text_disabled_wrapped("SDR only - no effect while the game is outputting HDR. "
+                              "3D screenshots are captured without it.");
+
+        if (ImGui::Button("Reset to Defaults##flat3d_act")) {
+            m_flat3d_ghost_contrast->value() = 1.0f;
+            m_flat3d_ghost_lift->value() = 0.0f;
         }
 
         ImGui::TreePop();

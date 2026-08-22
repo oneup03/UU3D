@@ -285,12 +285,35 @@ Point OpenTrack's **UDP over network** output at `127.0.0.1:<port>` (default
 Use OpenTrack's own **Center** hotkey to zero the neutral pose. Off by
 default and a pure no-op when disabled.
 
-## Color Correction (SDR)
+## Ghost Reduction (Crosstalk)
 
-Adjust lift / gamma / gain plus an S-curve contrast, applied as a post step in
-the weave shader — handy for compensating for the dimming/tint of glasses or
-reducing crosstalk. **Enable**, then adjust **S-Curve Contrast** and the per-
-channel **Lift / Gamma / Gain** sliders. SDR output only (ignored under HDR).
+Two sliders that reduce ghosting by compressing the signal range before it
+reaches the display — the standard range-compression approach from the stereo
+crosstalk literature. Both are off by default and both run in linear light.
+
+Every stereo display leaks some of each eye's image into the other, and how
+visible that leak is depends on the brightness difference between the eyes.
+Some displays also cancel crosstalk themselves, pre-subtracting part of the
+opposite eye; that pushes values past the ends of the range, where they get
+clipped, and the clipped part is what survives as a ghost.
+
+- **Contrast** (`1.00` = off) — squeezes both eyes toward mid-grey. Shrinks the
+  inter-eye difference directly, and leaves headroom at both ends of the range.
+  Try `0.90` first and go lower only if edges still ghost.
+- **Black Lift** (`0.00` = off) — raises the black floor and leaves white alone.
+  Cancellation clips at the *bottom*, so this targets that specifically and pays
+  in black level rather than contrast; the literature calls the resulting margin
+  "foot-room". Only helps on displays that actually cancel. Try `0.02`–`0.05`.
+
+Black Lift is applied after Contrast, so the two stack — test one at a time. The
+cost is real either way, so turn them only as far as the ghosting requires. SDR
+output only (ignored under HDR), and 3D screenshots are captured without them.
+
+> Replaces the old **Color Correction (SDR)** section (lift / gamma / gain plus
+> an S-curve). That existed to fight ghosting, which this does with one slider
+> instead of eleven. Its `Flat3D_ColorCorrection`, `Flat3D_Lift*`,
+> `Flat3D_Gamma*`, `Flat3D_Gain*` and `Flat3D_SCurve` config entries are simply
+> ignored now and are dropped the next time settings are saved.
 
 ## Advanced
 
