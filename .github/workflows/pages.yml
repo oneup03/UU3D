@@ -13,6 +13,7 @@ on:
     branches: [flat3d-afw]
     paths:
       - README.md
+      - CHANGELOG.md
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -50,15 +51,31 @@ jobs:
         run: |
           mkdir -p site
 
-          # Drop the leading "# Unreal Universal 3D": the theme already prints it
-          # as the header banner, so keeping it stacks the title twice.
-          tail -n +2 README.md > site/body.md
+          # Explicit front matter on both pages. The github-pages gem enables
+          # jekyll-optional-front-matter, so a bare .md would render anyway, but
+          # relying on that means a page silently ships as raw markdown if the
+          # plugin set ever changes. Front matter also sets the banner heading,
+          # which Cayman takes from page.title.
+          #
+          # Both drop their leading H1 for the same reason: the theme already
+          # prints the title as the header banner, so keeping it renders twice.
 
-          # Insert a contents list ahead of the first section. 400+ lines and
-          # ~14 sections is past the point where a reader can scan it.
+          # --- index (the README) ---
+          cat > site/body.md <<'FRONTMATTER'
+          ---
+          title: Unreal Universal 3D
+          ---
+          FRONTMATTER
+          tail -n +2 README.md >> site/body.md
+
+          # Contents list plus a link across to the changelog, inserted ahead of
+          # the first section. 400+ lines and ~14 sections is past the point
+          # where a reader can scan it.
           awk '
             BEGIN { inserted = 0 }
             /^## / && !inserted {
+              print "[**Changelog**](changelog/) - what changed in each nightly."
+              print ""
               print "## Contents"
               print "{:.no_toc}"
               print ""
@@ -70,6 +87,21 @@ jobs:
             { print }
           ' site/body.md > site/index.md
           rm site/body.md
+
+          # --- changelog ---
+          # permalink is set explicitly so the link above stays correct
+          # regardless of the site's permalink style.
+          cat > site/changelog.md <<'FRONTMATTER'
+          ---
+          title: Changelog
+          description: What changed in each UU3D nightly
+          permalink: /changelog/
+          ---
+
+          [&larr; Back to the README](../)
+
+          FRONTMATTER
+          tail -n +2 CHANGELOG.md >> site/changelog.md
 
           cat > site/_config.yml <<'CONFIG'
           title: Unreal Universal 3D
