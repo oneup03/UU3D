@@ -906,23 +906,42 @@ bool VR::sample_flat3d_show_cursor(bool fallback) {
     return prop->get_value_from_object(controller);
 }
 
+// Reads one reflected byte under SEH. Its own function because the caller has
+// std::string temporaries in its logging, and MSVC refuses __try in any frame
+// that needs object unwinding (C2712). Returns 0xFF on a fault, which the axis
+// resolver already treats as "not a usable constraint".
+static uint8_t read_reflected_byte(sdk::FProperty* prop, void* object) {
+    __try {
+        return *prop->get_data<uint8_t>(object);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0xFF;
+    }
+}
+
 // Which axis does the camera's FoV angle refer to?
 //
-// UE picks this in ULocalPlayer::GetProjectionData from EAspectRatioAxisConstraint:
-//
-//   (landscape viewport && MajorAxisFOV) || MaintainXFOV -> HORIZONTAL
-//     XAxisMultiplier = 1, YAxisMultiplier = W/H
-//   otherwise (MaintainYFOV, or a portrait viewport)     -> VERTICAL
-//     XAxisMultiplier = H/W, YAxisMultiplier = 1
-//
 // GetFOVAngle returns POV.FOV either way — the same number, a different meaning.
-// Treating a vertical FoV as horizontal renders a much narrower frustum: at 16:9
+// Treating a vertical FoV as horizontal renders a much narrower frustum (at 16:9
 // a 70 deg vertical FoV is a 102 deg horizontal one, so the scene comes out
-// heavily zoomed in (Jedi Survivor). The Flat3D output is always landscape, so
-// only the constraint matters here.
+// heavily zoomed in — Jedi Survivor); treating a horizontal one as vertical does
+// the opposite and the scene comes out far too wide.
+//
+// UE decides it in FMinimalViewInfo::CalculateProjectionMatrixGivenViewRectangle,
+// and there are THREE branches, not one:
+//
+//   1. ViewInfo.bConstrainAspectRatio -> HORIZONTAL, unconditionally. UE builds
+//      FReversedZPerspectiveMatrix(FOV/2, ViewInfo.AspectRatio, 1, NearZ) and
+//      never looks at EAspectRatioAxisConstraint. Cine cameras default to this.
+//   2. else (SizeX > SizeY && MajorAxisFOV) || MaintainXFOV -> HORIZONTAL
+//        XAxisMultiplier = 1, YAxisMultiplier = W/H
+//   3. else (MaintainYFOV, or MajorAxisFOV on a portrait viewport) -> VERTICAL
+//        XAxisMultiplier = H/W, YAxisMultiplier = 1
 //
 // Game thread only, sampled once per frame with the FoV itself.
-bool VR::sample_flat3d_fov_is_vertical(bool fallback) {
+// Takes no `fallback`: it used to take the PREVIOUS frame's answer and return it
+// from every give-up path, so one bad read or one cutscene camera latched
+// VERTICAL for the rest of the session — every later frame just re-returned it.
+bool VR::sample_flat3d_fov_is_vertical() {
     // Manual override first — the property can be absent, and a game may
     // override the constraint per camera component.
     switch (m_flat3d_fov_axis->value()) {
@@ -931,29 +950,136 @@ bool VR::sample_flat3d_fov_is_vertical(bool fallback) {
     default: break;       // auto
     }
 
-    // A cutscene camera can override the axis per CameraComponent without ever
-    // touching the local player's value, so the component wins when it opts in.
-    // Re-checked every frame, which is what makes the switch automatic.
-    if (const auto component_axis = camera_component_fov_is_vertical(); component_axis.has_value()) {
-        static int32_t last_logged_component = -1;
+    // Every give-up path below returns HORIZONTAL. BaseEngine.ini ships
+    // [/Script/Engine.LocalPlayer] AspectRatioAxisConstraint=AspectRatio_MaintainXFOV,
+    // so horizontal is the engine's own default and the right guess when a probe
+    // comes up empty.
+    constexpr bool kHorizontal = false;
 
-        if (last_logged_component != (int32_t)*component_axis) {
-            last_logged_component = (int32_t)*component_axis;
-            spdlog::info("[Flat3D] Camera FoV axis: {} (CameraComponent override)",
-                         *component_axis ? "VERTICAL" : "horizontal");
+    // The live FoV and the per-eye aspect, needed both by the diagnostic below
+    // and by the plausibility gate inside resolve().
+    const auto* flat3d_rt = get_flat3d_runtime();
+    const float sampled_fov = flat3d_rt != nullptr ? flat3d_rt->game_fov_deg.load() : 0.0f;
+    const float rt_w = flat3d_rt != nullptr ? (float)flat3d_rt->get_width() : 0.0f;
+    const float rt_h = flat3d_rt != nullptr ? (float)flat3d_rt->get_height() : 0.0f;
+    const float aspect = (rt_w > 0.0f && rt_h > 0.0f) ? (rt_w / rt_h) : (16.0f / 9.0f);
+    const float hfov_if_vertical =
+        glm::degrees(2.0f * std::atan(std::tan(glm::radians(sampled_fov) * 0.5f) * aspect));
+
+    // Resolved axis plus everything it was derived from, so a single log line
+    // settles "why is this game vertical?" without another instrumented build.
+    struct Resolution {
+        bool is_vertical{false};
+        const char* source{"default"};
+        uint8_t constraint{0xFF};
+    };
+
+    const auto log_once = [](const Resolution& r) {
+        static int32_t last_axis = -1;
+        static const char* last_source = nullptr;
+
+        if (last_axis == (int32_t)r.is_vertical && last_source == r.source) {
+            return;
         }
 
-        return *component_axis;
+        last_axis = (int32_t)r.is_vertical;
+        last_source = r.source;
+
+        spdlog::info("[Flat3D] Camera FoV axis: {} (source={} constraint={})",
+                     r.is_vertical ? "VERTICAL" : "horizontal", r.source,
+                     r.constraint == 0xFF ? std::string{"n/a"} : std::to_string(r.constraint));
+    };
+
+    // A VERTICAL verdict from EAspectRatioAxisConstraint is only ever as good as
+    // that byte, and the byte is ambiguous: MaintainYFOV is 0, which is ALSO the
+    // zero-initialised value a ULocalPlayer carries when BaseEngine.ini's
+    // MaintainXFOV never reached it. Nothing in the reflection data separates
+    // "this game chose vertical" from "nobody set this".
+    //
+    // The rendered result does separate them. Widening the sampled angle by the
+    // output aspect has to leave a sane horizontal FoV, and vertical FoVs in
+    // shipped games sit around 50-75 deg (78-107 deg horizontal at 16:9). Above
+    // the ceiling below the vertical reading is not a camera anyone authored:
+    //
+    //   Jedi Survivor   70 deg vertical -> 102 deg horizontal   accepted
+    //   Denshattack     90 deg vertical -> 121 deg horizontal   rejected
+    //
+    // 90 deg is the giveaway: it is UCameraComponent::FieldOfView's own default,
+    // so a camera reporting exactly it, with AspectRatio still at 1.3333, was
+    // never configured at all - and neither was the axis constraint sitting next
+    // to it. Auto only; a forced Vertical is the user's call and returns above.
+    constexpr float kMaxPlausibleHFov = 110.0f;
+
+    const auto resolve = [&](Resolution r) {
+        if (r.is_vertical && sampled_fov > 0.0f && hfov_if_vertical > kMaxPlausibleHFov) {
+            static bool warned = false;
+
+            if (!warned) {
+                warned = true;
+                spdlog::warn("[Flat3D] {} says VERTICAL, but a {:.1f} deg vertical FoV means {:.1f} deg "
+                             "horizontal at aspect {:.3f}, which no game ships. Treating the constraint as "
+                             "uninitialised and using a horizontal FoV. Force Vertical in the 3D settings if "
+                             "this game really is that wide.",
+                             r.source, sampled_fov, hfov_if_vertical, aspect);
+            }
+
+            r.is_vertical = kHorizontal;
+            r.source = "vertical implausible";
+        }
+
+        log_once(r);
+        return r.is_vertical;
+    };
+
+    const auto probe = probe_camera_fov_axis();
+
+    // UE branch 1. The camera manager's POV is the exact FMinimalViewInfo that
+    // reaches the projection builder, so bConstrainAspectRatio here outranks
+    // EAspectRatioAxisConstraint completely: the constraint is never consulted.
+    // Logged once with the values it was decided from, because this branch
+    // silently contradicts the engine's own axis setting.
+    if (probe.pov_found) {
+        // Logged on any change to the FoV itself, not just the flag: this is the
+        // line that says what each interpretation would actually render, which is
+        // what tells us whether a VERTICAL verdict is the right one. The sampled
+        // angle comes from GetFOVAngle and POV.FOV from the struct UE uses; if
+        // they disagree the game is not driving the view through the camera
+        // manager's cached POV and neither axis rule applies to it.
+        static int32_t last_key = -1;
+
+        const auto key = (int32_t)std::lround(sampled_fov * 10.0f) ^ ((int32_t)probe.pov_constrains_aspect << 20);
+
+        if (last_key != key) {
+            last_key = key;
+            spdlog::info("[Flat3D] Camera POV: FOV={:.2f} (GetFOVAngle={:.2f}) bConstrainAspectRatio={} "
+                         "AspectRatio={:.4f} ProjectionMode={} | rt={}x{} aspect={:.4f} -> hFoV {:.2f} if horizontal, "
+                         "{:.2f} if vertical",
+                         probe.pov_fov, sampled_fov, probe.pov_constrains_aspect ? 1 : 0, probe.pov_aspect_ratio,
+                         probe.pov_projection_mode == 0xFF ? std::string{"n/a"}
+                                                           : std::to_string(probe.pov_projection_mode),
+                         (uint32_t)rt_w, (uint32_t)rt_h, aspect, sampled_fov, hfov_if_vertical);
+        }
+
+        if (probe.pov_constrains_aspect) {
+            return resolve({kHorizontal, "POV.bConstrainAspectRatio"});
+        }
+    }
+
+    // A cutscene camera can carry its own axis without ever touching the local
+    // player's value. Re-checked every frame, which is what makes the switch
+    // automatic — and now unlatches again when the cutscene ends.
+    if (probe.has_axis_override && probe.override_constraint <= 2) {
+        return resolve({probe.override_constraint == 0, "CameraComponent override", probe.override_constraint});
     }
 
     const auto engine = sdk::UEngine::get();
     if (engine == nullptr) {
-        return fallback;
+        return resolve({kHorizontal, "no engine"});
     }
 
     const auto local_player = (sdk::UObject*)engine->get_localplayer(0);
     if (local_player == nullptr) {
-        return fallback;
+        return resolve({kHorizontal, "no local player"});
     }
 
     static sdk::UClass* cached_class = nullptr;
@@ -961,36 +1087,66 @@ bool VR::sample_flat3d_fov_is_vertical(bool fallback) {
 
     const auto c = local_player->get_class();
     if (c == nullptr) {
-        return fallback;
+        return resolve({kHorizontal, "no local player class"});
     }
 
     if (c != cached_class) {
         cached_class = c;
         prop = c->find_property(L"AspectRatioAxisConstraint");
 
-        if (prop == nullptr) {
-            spdlog::warn("[Flat3D] ULocalPlayer::AspectRatioAxisConstraint not found — assuming a horizontal "
-                         "camera FoV. If the view looks zoomed in, force the axis in the 3D settings.");
+        // The property is a TEnumAsByte, so it reflects as a ByteProperty (or an
+        // EnumProperty on the games that declare it as a typed enum). Anything
+        // else means find_property matched something we must not read as a byte.
+        if (prop != nullptr && prop->get_class() != nullptr) {
+            const auto type = prop->get_class()->get_name().to_string();
+
+            if (type != L"ByteProperty" && type != L"EnumProperty") {
+                spdlog::warn("[Flat3D] ULocalPlayer::AspectRatioAxisConstraint is a {}, not readable as an "
+                             "axis constraint. Assuming a horizontal camera FoV.",
+                             utility::narrow(type));
+                prop = nullptr;
+            }
         }
+
+        spdlog::info("[Flat3D] Camera FoV axis probe: local player class '{}', AspectRatioAxisConstraint {}",
+                     utility::narrow(c->get_fname().to_string()),
+                     prop != nullptr ? "found" : "NOT FOUND");
     }
 
     if (prop == nullptr) {
-        return fallback;
+        return resolve({kHorizontal, "constraint property missing"});
     }
 
-    // TEnumAsByte<EAspectRatioAxisConstraint>: 0 MaintainYFOV, 1 MaintainXFOV,
-    // 2 MajorAxisFOV (the UE default, horizontal on a landscape viewport).
-    const auto constraint = *prop->get_data<uint8_t>(local_player);
-    const bool is_vertical = constraint == 0;
+    // TEnumAsByte<EAspectRatioAxisConstraint>: 0 MaintainYFOV, 1 MaintainXFOV
+    // (the engine default), 2 MajorAxisFOV. Anything else is a bad read — the
+    // offset landed on a neighbouring field — and must not be trusted, least of
+    // all when the bogus byte happens to be 0 and would mean VERTICAL.
+    const uint8_t constraint = read_reflected_byte(prop, local_player);
 
-    static int32_t last_logged = -1;
-    if (last_logged != (int32_t)constraint) {
-        last_logged = (int32_t)constraint;
-        spdlog::info("[Flat3D] Camera FoV axis: {} (AspectRatioAxisConstraint={})",
-                     is_vertical ? "VERTICAL" : "horizontal", constraint);
+    if (constraint > 2) {
+        static bool warned = false;
+
+        if (!warned) {
+            warned = true;
+            spdlog::warn("[Flat3D] ULocalPlayer::AspectRatioAxisConstraint read back {} (only 0-2 are valid). "
+                         "Ignoring it and assuming a horizontal camera FoV.", constraint);
+        }
+
+        return resolve({kHorizontal, "constraint out of range"});
     }
 
-    return is_vertical;
+    // MajorAxisFOV follows the viewport's orientation, so it is only horizontal
+    // while the per-eye render target is landscape. Flat3D's is, in every output
+    // mode, but the runtime knows for sure and the check is free.
+    bool landscape = true;
+
+    if (const auto* flat3d = get_flat3d_runtime(); flat3d != nullptr && flat3d->get_height() != 0) {
+        landscape = flat3d->get_width() >= flat3d->get_height();
+    }
+
+    const bool is_vertical = constraint == 0 || (constraint == 2 && !landscape);
+
+    return resolve({is_vertical, "ULocalPlayer", constraint});
 }
 
 // Reads UGameplayStatics::IsGamePaused — a full-screen-menu signal that does not
@@ -2522,8 +2678,10 @@ void VR::on_draw_sidebar_flat3d() {
     }
     m_flat3d_fov_axis->draw("Camera FoV Axis");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Which axis the game's FoV angle means. Auto reads the engine's constraint.\n"
-                          "Force Vertical if the view is zoomed in, Horizontal if it is too wide.");
+        ImGui::SetTooltip("Which axis the game's FoV angle means. Horizontal is correct for most titles.\n"
+                          "Switch to Vertical if the view is zoomed in, Horizontal if it is too wide.\n"
+                          "Auto reads the engine's own constraint, but that value alone does not always\n"
+                          "match what the game renders - use it only if the fixed choices both look wrong.");
     }
     m_flat3d_fov_multiplier->draw("3D FoV Multiplier");
     if (m_flat3d_fov_multiplier->value() != 1.0f) {

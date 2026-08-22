@@ -20672,7 +20672,7 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         if (fov_sample_frame != (uint32_t)g_frame_count) {
             fov_sample_frame = (uint32_t)g_frame_count;
             flat3d->game_fov_deg.store(vr->sample_flat3d_game_fov(flat3d->game_fov_deg.load()));
-            flat3d->game_fov_is_vertical.store(vr->sample_flat3d_fov_is_vertical(flat3d->game_fov_is_vertical.load()));
+            flat3d->game_fov_is_vertical.store(vr->sample_flat3d_fov_is_vertical());
             flat3d->game_wants_cursor.store(vr->sample_flat3d_show_cursor(flat3d->game_wants_cursor.load()));
             flat3d->game_paused.store(vr->sample_flat3d_game_paused(flat3d->game_paused.load()));
             vr->sample_flat3d_camera_and_publish_anchors();

@@ -1230,8 +1230,41 @@ private:
     // Reads APlayerController::bShowMouseCursor (drives the stereo cursor).
     // Game thread only; returns fallback when no world/controller yet.
     bool sample_flat3d_show_cursor(bool fallback);
-    bool sample_flat3d_fov_is_vertical(bool fallback);
-    std::optional<bool> camera_component_fov_is_vertical();
+    // Resolves whether APlayerCameraManager::GetFOVAngle's angle is a VERTICAL
+    // one. Self-contained on purpose — it never carries the previous frame's
+    // answer forward, so a failed probe cannot latch the wrong axis.
+    bool sample_flat3d_fov_is_vertical();
+
+    // Everything the live camera says about the FoV axis. Split out from the
+    // answer itself because several independent things matter and the caller has
+    // to weigh them in UE's order (see VR::sample_flat3d_fov_is_vertical).
+    struct Flat3DCameraAxisProbe {
+        // --- APlayerCameraManager's cached POV (FMinimalViewInfo) -----------
+        // This is the exact struct UE hands to
+        // FMinimalViewInfo::CalculateProjectionMatrixGivenViewRectangle, so it
+        // is authoritative where it is available. Reached by reflection through
+        // ViewTarget -> POV, which needs no non-stock UFunction.
+        bool pov_found{false};
+        // POV.bConstrainAspectRatio. When set, UE builds the projection from
+        // FOV/2 as a HORIZONTAL half-angle and never consults
+        // EAspectRatioAxisConstraint at all.
+        bool pov_constrains_aspect{false};
+        float pov_aspect_ratio{0.0f};
+        uint8_t pov_projection_mode{0xFF}; // ECameraProjectionMode: 0 Perspective
+        // POV.FOV, the number UE itself feeds to the projection builder. Worth
+        // reading separately from GetFOVAngle: if the two disagree, the game is
+        // not driving the view through the camera manager's cached POV.
+        float pov_fov{0.0f};
+
+        // --- the ACTIVE camera component, when reachable --------------------
+        // Only adds the per-component axis override; its own
+        // bConstrainAspectRatio is the same value the POV already carries.
+        bool component_found{false};
+        bool has_axis_override{false};
+        uint8_t override_constraint{0xFF};
+    };
+
+    Flat3DCameraAxisProbe probe_camera_fov_axis();
 
     // Screen-percentage state: the value we last wrote (0 = we are not managing
     // it, so Auto leaves whatever the game does alone) and the stage we wrote it
@@ -2044,14 +2077,25 @@ private:
     // NOTE: it is a tangent scale, not a degree scale — at a 90 deg hFoV, 2.0
     // gives ~127 deg, not 180.
     // Which axis APlayerCameraManager::GetFOVAngle refers to. Auto reads UE's own
-    // EAspectRatioAxisConstraint; the forced options are the escape hatch for
-    // games that override it per camera component.
+    // EAspectRatioAxisConstraint; the forced options are the escape hatch.
+    //
+    // Defaults to HORIZONTAL (index 1), not Auto. BaseEngine.ini ships
+    // [/Script/Engine.LocalPlayer] AspectRatioAxisConstraint=AspectRatio_MaintainXFOV,
+    // so horizontal is right for the large majority of titles, whereas Auto was
+    // observed resolving to VERTICAL in games that are plainly horizontal — and a
+    // wrongly-vertical frustum is very visible (the scene renders far too wide).
+    // Auto is kept as an option, not as the default, until that is understood.
+    // Vertical-FoV titles (Jedi Survivor) now need one manual switch, which
+    // persists per game since Flat3D_FOVAxis is in m_options.
+    //
+    // The order of these names is load-bearing: saved configs store the INDEX, so
+    // Auto has to stay at 0 or existing config.txt files change meaning.
     static const inline std::vector<std::string> s_flat3d_fov_axis_names{
         "Auto (engine constraint)",
         "Horizontal",
         "Vertical",
     };
-    const ModCombo::Ptr m_flat3d_fov_axis{ ModCombo::create(generate_name("Flat3D_FOVAxis"), s_flat3d_fov_axis_names, 0) };
+    const ModCombo::Ptr m_flat3d_fov_axis{ ModCombo::create(generate_name("Flat3D_FOVAxis"), s_flat3d_fov_axis_names, 1) };
     const ModSlider::Ptr m_flat3d_fov_multiplier{ ModSlider::create(generate_name("Flat3D_FOVMultiplier"), 0.5f, 3.0f, 1.0f) };
     const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 0.5f, 0.1f) };
     const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };

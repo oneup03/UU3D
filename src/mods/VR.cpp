@@ -25,6 +25,7 @@
 #include <sdk/Globals.hpp>
 #include <sdk/CVar.hpp>
 #include <sdk/ConsoleManager.hpp>
+#include <sdk/FProperty.hpp> // read_object_property needs the complete type
 #include <sdk/threading/GameThreadWorker.hpp>
 #include <sdk/UGameplayStatics.hpp>
 #include <sdk/APlayerController.hpp>
@@ -6473,82 +6474,247 @@ std::string VR::get_windrose_meta_ui_2d_status_text() const {
     return out.str();
 }
 
-// The ACTIVE camera component's own FoV-axis override, if it has one.
+// Reads APlayerCameraManager's cached POV (FMinimalViewInfo) into the probe.
 //
-// A CameraComponent can set bOverrideAspectRatioAxisConstraint and carry its own
-// AspectRatioAxisConstraint, so a cutscene camera can use a different axis than
-// the local player without ever touching the local player's value. This is
-// checked first; nullopt means "no override in play", and the caller falls back
-// to the global ULocalPlayer constraint.
+// This is the struct UE feeds to
+// FMinimalViewInfo::CalculateProjectionMatrixGivenViewRectangle, so its
+// bConstrainAspectRatio is the real answer to "did UE use FOV as a horizontal
+// half-angle?" — it outranks EAspectRatioAxisConstraint entirely.
+//
+// Reached purely by reflection (APlayerCameraManager -> ViewTarget -> POV), so
+// unlike the GetCurrentCamera path it works in stock titles. ViewTarget is
+// protected in UE5 but still a UPROPERTY, so it reflects. CameraCachePrivate
+// (UE5) / CameraCache (UE4) are tried as fallbacks; both are an
+// FCameraCacheEntry whose view-info member is likewise named POV.
+//
+// EVERY name lookup and type check is cached per camera-manager class. They call
+// FName::to_string(), which on the non-inlined path re-enters the engine's own
+// FName::ToString from inside the projection hook — doing that per frame is what
+// this must never become.
+// File-local mirror of the POV fields, so this stays a free function rather than
+// reaching into VR's private Flat3DCameraAxisProbe (and dragging the SDK into
+// VR.hpp to declare it as a member).
+struct CameraManagerPov {
+    bool found{false};
+    bool constrains_aspect{false};
+    float aspect_ratio{0.0f};
+    uint8_t projection_mode{0xFF};
+    float fov{0.0f};
+};
+
+static CameraManagerPov read_camera_manager_pov(sdk::UObject* pcm) {
+    CameraManagerPov out{};
+
+    const auto klass = pcm->get_class();
+    if (klass == nullptr) {
+        return out;
+    }
+
+    static sdk::UClass* cached_class = nullptr;
+    static int32_t pov_base_offset = -1; // ViewTarget offset + POV offset
+    static sdk::FBoolProperty* constrain_prop = nullptr;
+    static sdk::FProperty* aspect_prop = nullptr;
+    static sdk::FProperty* proj_mode_prop = nullptr;
+    static sdk::FProperty* fov_prop = nullptr;
+
+    if (klass != cached_class) {
+        cached_class = klass;
+        pov_base_offset = -1;
+        constrain_prop = nullptr;
+        aspect_prop = nullptr;
+        proj_mode_prop = nullptr;
+        fov_prop = nullptr;
+
+        const auto typed = [](sdk::FProperty* prop, std::wstring_view a, std::wstring_view b) -> sdk::FProperty* {
+            if (prop == nullptr || prop->get_class() == nullptr) {
+                return nullptr;
+            }
+
+            const auto name = prop->get_class()->get_name().to_string();
+            return (name == a || name == b) ? prop : nullptr;
+        };
+
+        const auto as_struct = [&typed](sdk::FProperty* prop) -> sdk::FStructProperty* {
+            return (sdk::FStructProperty*)typed(prop, L"StructProperty", L"StructProperty");
+        };
+
+        // FTViewTarget (ViewTarget) or FCameraCacheEntry (CameraCache*); both
+        // hold the FMinimalViewInfo under the name POV.
+        for (const auto* outer_name : {L"ViewTarget", L"CameraCachePrivate", L"CameraCache"}) {
+            const auto outer = as_struct(klass->find_property(outer_name));
+            if (outer == nullptr || outer->get_struct() == nullptr) {
+                continue;
+            }
+
+            const auto pov = as_struct(outer->get_struct()->find_property(L"POV"));
+            if (pov == nullptr || pov->get_struct() == nullptr) {
+                continue;
+            }
+
+            auto* view_info = pov->get_struct();
+
+            // bConstrainAspectRatio is the whole point; without it this outer
+            // candidate is not the struct we are looking for.
+            constrain_prop = (sdk::FBoolProperty*)typed(
+                view_info->find_property(L"bConstrainAspectRatio"), L"BoolProperty", L"BoolProperty");
+
+            if (constrain_prop == nullptr) {
+                continue;
+            }
+
+            aspect_prop = typed(view_info->find_property(L"AspectRatio"), L"FloatProperty", L"FloatProperty");
+            proj_mode_prop = typed(view_info->find_property(L"ProjectionMode"), L"ByteProperty", L"EnumProperty");
+            fov_prop = typed(view_info->find_property(L"FOV"), L"FloatProperty", L"FloatProperty");
+            pov_base_offset = outer->get_offset() + pov->get_offset();
+
+            spdlog::info("[Flat3D] Camera POV probe: {}.POV at +0x{:X} on '{}' (AspectRatio={}, ProjectionMode={})",
+                         utility::narrow(outer_name), (uint32_t)pov_base_offset,
+                         utility::narrow(klass->get_fname().to_string()),
+                         aspect_prop != nullptr ? "found" : "absent",
+                         proj_mode_prop != nullptr ? "found" : "absent");
+            break;
+        }
+
+        if (pov_base_offset < 0) {
+            spdlog::warn("[Flat3D] Camera POV probe: no reflected ViewTarget/CameraCache POV on '{}'. "
+                         "Falling back to the local player's axis constraint alone.",
+                         utility::narrow(klass->get_fname().to_string()));
+        }
+    }
+
+    if (pov_base_offset < 0 || constrain_prop == nullptr) {
+        return out;
+    }
+
+    auto* pov = (uint8_t*)pcm + pov_base_offset;
+
+    out.found = true;
+    out.constrains_aspect = constrain_prop->get_value_from_object(pov);
+
+    if (aspect_prop != nullptr) {
+        out.aspect_ratio = *aspect_prop->get_data<float>(pov);
+    }
+
+    if (proj_mode_prop != nullptr) {
+        out.projection_mode = *proj_mode_prop->get_data<uint8_t>(pov);
+    }
+
+    if (fov_prop != nullptr) {
+        out.fov = *fov_prop->get_data<float>(pov);
+    }
+
+    return out;
+}
+
+// What the live camera says about the FoV axis.
+//
+// Two separate levers, and they are NOT the same thing:
+//
+//   bConstrainAspectRatio — the view pins its own aspect ratio, and UE then
+//     builds FReversedZPerspectiveMatrix(FOV/2, AspectRatio, 1, NearZ) — a
+//     HORIZONTAL half-angle — without ever reading EAspectRatioAxisConstraint.
+//     Read from the camera manager's POV above; works in stock titles.
+//   bOverrideAspectRatioAxisConstraint + AspectRatioAxisConstraint — the ACTIVE
+//     camera component carries its own axis, so a cutscene camera can use a
+//     different one than the local player without touching the local player's
+//     value. Only reachable through GetCurrentCamera, which is not stock.
+//
+// Only reports what it read; the caller applies UE's precedence.
 //
 // Lives here (not in VR_Flat3D.cpp) because the object/function helpers it needs
 // are internal to this TU — the same pair the 16:9 camera compat path uses to
 // reach the live camera component.
-std::optional<bool> VR::camera_component_fov_is_vertical() try {
+VR::Flat3DCameraAxisProbe VR::probe_camera_fov_axis() try {
+    Flat3DCameraAxisProbe probe{};
+
     const auto engine = sdk::UEngine::get();
     if (engine == nullptr) {
-        return std::nullopt;
+        return probe;
     }
 
     const auto world = engine->get_world();
     const auto gameplay = sdk::UGameplayStatics::get();
     if (world == nullptr || gameplay == nullptr) {
-        return std::nullopt;
+        return probe;
     }
 
     const auto pc = gameplay->get_player_controller(world, 0);
     if (pc == nullptr) {
-        return std::nullopt;
+        return probe;
     }
 
     const auto pcm = pc->get_player_camera_manager();
     if (pcm == nullptr) {
-        return std::nullopt;
+        return probe;
     }
 
+    // The authoritative half: stock reflection, no non-stock UFunction needed.
+    const auto pov = read_camera_manager_pov((sdk::UObject*)pcm);
+
+    probe.pov_found = pov.found;
+    probe.pov_constrains_aspect = pov.constrains_aspect;
+    probe.pov_aspect_ratio = pov.aspect_ratio;
+    probe.pov_projection_mode = pov.projection_mode;
+    probe.pov_fov = pov.fov;
+
     // Not a stock UE function — plenty of titles won't have it, in which case
-    // there is no per-camera override to find and the global value stands.
+    // there is no per-camera axis override and the global value stands.
     const auto camera = call_object_object_function((sdk::UObject*)pcm, L"GetCurrentCamera");
     if (!camera.has_value()) {
-        return std::nullopt;
+        return probe;
     }
 
     const auto component = read_object_property(*camera, L"CameraComponent");
     if (!component.has_value()) {
-        return std::nullopt;
+        return probe;
     }
 
     auto* comp = *component;
     const auto klass = comp->get_class();
     if (klass == nullptr) {
-        return std::nullopt;
+        return probe;
     }
 
+    probe.component_found = true;
+
+    // Resolved once per camera-component class. The type checks below call
+    // FName::to_string(), which on the non-inlined path re-enters the ENGINE's
+    // FName::ToString from inside the projection hook — so they must happen here
+    // and never per frame. A property's type cannot change anyway.
     static sdk::UClass* cached_class = nullptr;
-    static sdk::FProperty* override_prop = nullptr;
+    static sdk::FBoolProperty* override_prop = nullptr;
     static sdk::FProperty* constraint_prop = nullptr;
 
     if (klass != cached_class) {
         cached_class = klass;
-        override_prop = klass->find_property(L"bOverrideAspectRatioAxisConstraint");
+
+        // bOverrideAspectRatioAxisConstraint is a C++ bitfield, so it only reads
+        // correctly through FBoolProperty's byte-offset/mask pair — a plain byte
+        // read lands on whichever neighbouring bool shares the storage.
+        auto* prop = klass->find_property(L"bOverrideAspectRatioAxisConstraint");
+
+        override_prop = (prop != nullptr && prop->get_class() != nullptr &&
+                         prop->get_class()->get_name().to_string() == L"BoolProperty")
+                      ? (sdk::FBoolProperty*)prop
+                      : nullptr;
+
+        // The component's own bConstrainAspectRatio is deliberately not read
+        // here: UCameraComponent::GetCameraView copies it straight into the POV,
+        // so read_camera_manager_pov already has that value from a source that
+        // does not depend on GetCurrentCamera existing.
         constraint_prop = klass->find_property(L"AspectRatioAxisConstraint");
     }
 
-    if (override_prop == nullptr || constraint_prop == nullptr ||
-        override_prop->get_class() == nullptr ||
-        override_prop->get_class()->get_name().to_string() != L"BoolProperty")
+    if (constraint_prop != nullptr && override_prop != nullptr &&
+        override_prop->get_value_from_object(comp))
     {
-        return std::nullopt;
+        probe.has_axis_override = true;
+        probe.override_constraint = *constraint_prop->get_data<uint8_t>(comp);
     }
 
-    if (!((sdk::FBoolProperty*)override_prop)->get_value_from_object(comp)) {
-        return std::nullopt; // component defers to the local player
-    }
-
-    // TEnumAsByte<EAspectRatioAxisConstraint>: 0 MaintainYFOV = vertical.
-    return *constraint_prop->get_data<uint8_t>(comp) == 0;
+    return probe;
 } catch (...) {
-    return std::nullopt;
+    return Flat3DCameraAxisProbe{};
 }
 
 void VR::update_fullscreen_16x9_camera_compatibility(sdk::UGameEngine* engine) {
