@@ -41,14 +41,46 @@ jobs:
 
       # Jekyll turns index.md into the site root. Staging it rather than
       # pointing Jekyll at the repo keeps the build to two files.
+      #
+      # The Pages-only presentation tweaks happen HERE rather than in README.md
+      # on purpose: the theme renders its own title banner, and kramdown's {:toc}
+      # is not GitHub-flavoured markdown. Doing either in the README itself would
+      # give a duplicated heading and a stray "{:toc}" line on the repo page.
       - name: Stage the site
         run: |
           mkdir -p site
-          cp README.md site/index.md
+
+          # Drop the leading "# Unreal Universal 3D": the theme already prints it
+          # as the header banner, so keeping it stacks the title twice.
+          tail -n +2 README.md > site/body.md
+
+          # Insert a contents list ahead of the first section. 400+ lines and
+          # ~14 sections is past the point where a reader can scan it.
+          awk '
+            BEGIN { inserted = 0 }
+            /^## / && !inserted {
+              print "## Contents"
+              print "{:.no_toc}"
+              print ""
+              print "* TOC"
+              print "{:toc}"
+              print ""
+              inserted = 1
+            }
+            { print }
+          ' site/body.md > site/index.md
+          rm site/body.md
+
           cat > site/_config.yml <<'CONFIG'
-          title: UU3D
-          description: Stereoscopic 3D output for Unreal Engine games, no headset required
+          title: Unreal Universal 3D
+          description: Stereo 3D output for Unreal Engine games - no headset, no SteamVR or OpenXR
           theme: jekyll-theme-cayman
+          # Cayman gates its header button on is_project_page. Set explicitly:
+          # the metadata plugin that would normally infer this is not populated
+          # when Jekyll runs against a staging directory rather than the repo.
+          github:
+            is_project_page: true
+            repository_url: https://github.com/oneup03/UU3D
           CONFIG
 
       - name: Build with Jekyll
