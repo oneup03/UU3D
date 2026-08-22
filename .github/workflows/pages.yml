@@ -1,0 +1,72 @@
+name: Pages
+
+# Publishes README.md as https://oneup03.github.io/UU3D/.
+#
+# Uses Actions as the Pages source rather than the classic "build from a branch"
+# setting, for one hard reason: that path runs Jekyll over a checkout WITH
+# submodules, and dependencies/submodules/UESDK is private, so the build fails
+# with no access. Here the checkout takes no submodules and Jekyll only ever
+# sees a staging directory holding the README - it never walks src/, cmake/ or
+# dependencies/ at all.
+on:
+  push:
+    branches: [flat3d-afw]
+    paths:
+      - README.md
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a half-finished deploy; let it land and queue the next one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      # Jekyll turns index.md into the site root. Staging it rather than
+      # pointing Jekyll at the repo keeps the build to two files.
+      - name: Stage the site
+        run: |
+          mkdir -p site
+          cp README.md site/index.md
+          cat > site/_config.yml <<'CONFIG'
+          title: UU3D
+          description: Stereoscopic 3D output for Unreal Engine games, no headset required
+          theme: jekyll-theme-cayman
+          CONFIG
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./site
+          destination: ./_site
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
