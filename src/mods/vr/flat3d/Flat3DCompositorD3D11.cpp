@@ -1181,16 +1181,11 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
     constants.colorspace = (int32_t)m_colorspace;
     constants.paper_white = params.paper_white_nits;
     constants.src_srgb = m_src_srgb ? 1 : 0;
-    constants.correction_enabled = params.correction_enabled ? 1 : 0;
-    for (int i = 0; i < 3; ++i) {
-        constants.lift[i] = params.lift[i];
-        constants.gamma[i] = params.gamma[i];
-        constants.gain[i] = params.gain[i];
-    }
-    constants.curve = params.curve;
-    constants.off_low = params.off_low;
-    constants.off_high = params.off_high;
-    constants.off_both = params.off_both;
+    // Ghost reduction for the panel/glasses (SDR only; the shader gates on
+    // colorspace). On the LeiaSR path this is ACT headroom instead — see
+    // build_sbs.
+    constants.ghost_contrast = params.ghost_contrast;
+    constants.ghost_lift = params.ghost_lift;
     constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
     constants.scene_scale = params.scene_scale;
     context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
@@ -1802,7 +1797,9 @@ bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3D
 
     // Render the pair with the repack shader in SBS mode instead of copying:
     // honors eye swap and applies the SDR color correction (the LeiaSR weaver
-    // and the screenshot PNG both consume SDR sRGB).
+    // and the screenshot PNG both consume SDR sRGB). This is also the one
+    // repack that feeds the LeiaSR weaver, so it is where the anti-crosstalk
+    // headroom belongs.
     RepackConstants constants{};
     constants.out_size[0] = (int32_t)(m_sbs_w * 2);
     constants.out_size[1] = (int32_t)m_sbs_h;
@@ -1811,16 +1808,8 @@ bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3D
     constants.colorspace = 0; // SDR sRGB
     constants.paper_white = params.paper_white_nits;
     constants.src_srgb = 0;
-    constants.correction_enabled = params.correction_enabled ? 1 : 0;
-    for (int i = 0; i < 3; ++i) {
-        constants.lift[i] = params.lift[i];
-        constants.gamma[i] = params.gamma[i];
-        constants.gain[i] = params.gain[i];
-    }
-    constants.curve = params.curve;
-    constants.off_low = params.off_low;
-    constants.off_high = params.off_high;
-    constants.off_both = params.off_both;
+    constants.ghost_contrast = params.ghost_contrast;
+    constants.ghost_lift = params.ghost_lift;
     constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
     constants.scene_scale = params.scene_scale;
     context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
@@ -1934,16 +1923,6 @@ bool Flat3DCompositorD3D11::save_screenshot(ID3D11DeviceContext* context, const 
         constants.colorspace = (int32_t)m_colorspace;
         constants.paper_white = params.paper_white_nits;
         constants.src_srgb = m_src_srgb ? 1 : 0;
-        constants.correction_enabled = params.correction_enabled ? 1 : 0;
-        for (int i = 0; i < 3; ++i) {
-            constants.lift[i] = params.lift[i];
-            constants.gamma[i] = params.gamma[i];
-            constants.gain[i] = params.gain[i];
-        }
-        constants.curve = params.curve;
-        constants.off_low = params.off_low;
-        constants.off_high = params.off_high;
-        constants.off_both = params.off_both;
         constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
         constants.scene_scale = params.scene_scale;
         context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);

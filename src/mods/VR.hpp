@@ -2178,18 +2178,15 @@ private:
     // SceneDepthZ barrier mismatch behind the depth-feature crashes.
     const ModToggle::Ptr m_flat3d_d3d12_debug_layer{ ModToggle::create(generate_name("Flat3D_D3D12DebugLayer"), false, true) };
 
-    // Display color correction (VRto3D-style; SDR only).
-    const ModToggle::Ptr m_flat3d_correction_enabled{ ModToggle::create(generate_name("Flat3D_ColorCorrection"), false) };
-    const ModSlider::Ptr m_flat3d_lift_r{ ModSlider::create(generate_name("Flat3D_LiftR"), -1.0f, 1.0f, 0.0f) };
-    const ModSlider::Ptr m_flat3d_lift_g{ ModSlider::create(generate_name("Flat3D_LiftG"), -1.0f, 1.0f, 0.0f) };
-    const ModSlider::Ptr m_flat3d_lift_b{ ModSlider::create(generate_name("Flat3D_LiftB"), -1.0f, 1.0f, 0.0f) };
-    const ModSlider::Ptr m_flat3d_gamma_r{ ModSlider::create(generate_name("Flat3D_GammaR"), 0.1f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_gamma_g{ ModSlider::create(generate_name("Flat3D_GammaG"), 0.1f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_gamma_b{ ModSlider::create(generate_name("Flat3D_GammaB"), 0.1f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_gain_r{ ModSlider::create(generate_name("Flat3D_GainR"), 0.0f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_gain_g{ ModSlider::create(generate_name("Flat3D_GainG"), 0.0f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_gain_b{ ModSlider::create(generate_name("Flat3D_GainB"), 0.0f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_curve{ ModSlider::create(generate_name("Flat3D_SCurve"), 0.33f, 3.0f, 1.0f) };
+    // Ghost reduction: range compression in the compose shader to reduce visible
+    // stereo crosstalk. 1.0 == off (exact no-op). This replaced the VRto3D-style
+    // lift/gamma/gain colour correction, which existed to fight ghosting and
+    // needed eleven sliders to do what this does with one.
+    const ModSlider::Ptr m_flat3d_ghost_contrast{ ModSlider::create(generate_name("Flat3D_GhostContrast"), 0.5f, 1.0f, 1.0f) };
+    // Black lift - the other way to give a display's own crosstalk cancellation
+    // room to work. Cancellation clips at the bottom, so lifting the floor
+    // targets that directly and costs black level instead of contrast. 0.0 == off.
+    const ModSlider::Ptr m_flat3d_ghost_lift{ ModSlider::create(generate_name("Flat3D_GhostLift"), 0.0f, 0.25f, 0.0f) };
 
     // OpenTrack head tracking (v2). UDP receiver feeds a small head-coupled
     // perspective offset; separate look (yaw/pitch coupling) + parallax gains.
@@ -2367,11 +2364,8 @@ public:
             *m_flat3d_cursor_size,
             *m_flat3d_hdr_paper_white,
             *m_flat3d_d3d12_debug_layer,
-            *m_flat3d_correction_enabled,
-            *m_flat3d_lift_r, *m_flat3d_lift_g, *m_flat3d_lift_b,
-            *m_flat3d_gamma_r, *m_flat3d_gamma_g, *m_flat3d_gamma_b,
-            *m_flat3d_gain_r, *m_flat3d_gain_g, *m_flat3d_gain_b,
-            *m_flat3d_curve,
+            *m_flat3d_ghost_contrast,
+            *m_flat3d_ghost_lift,
             *m_flat3d_opentrack_enabled,
             *m_flat3d_opentrack_port,
             *m_flat3d_opentrack_pos_scale,
