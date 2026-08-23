@@ -48,14 +48,7 @@ They're built from different bases, so a game that misbehaves on one is worth
 retrying on the other before assuming it's unsupported.
 
 **The choice is saved per game**, in the game's profile folder, and the radios
-update to match whenever you select a different process. Injecting also writes
-the setting out the first time, so every profile ends up carrying an explicit
-choice you can see and edit rather than an implied default. It travels with
-**Export Config** / **Import Config** along with the rest of the profile.
-
-If you pick Modern on a package that predates the split, UU3DI falls back to
-Legacy for that injection, tells you once, and **keeps your saved choice** —
-so it starts working again as soon as you update rather than silently reverting.
+update to match whenever you select a different process.
 
 ### Auto inject
 
