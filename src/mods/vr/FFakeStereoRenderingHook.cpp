@@ -6170,41 +6170,71 @@ static sdk::TArray<sdk::FSceneView*>* nsf_resolve_verified_views(sdk::FSceneView
     return scanned;
 }
 
-// Same resolve, but for the callers that MUTATE the array header. Returns
-// nullptr unless the offset both verified and is structurally possible.
+// Same resolve, but for the callers that MUTATE the array header.
 //
 // Jedi Survivor (SwGame, UE4) crashed on Native Stereo and only on Native
 // Stereo, every run, within seconds of the first view family. Its views resolve
 // to family+0 -- the log prints "family 8edc72d8b0, scanned 8edc72d8b0", i.e.
-// the scanner latched offset 0 exactly as it did on Returnal. The old
-// hide/restore pair then wrote a zero into the TArray count at that offset,
-// which lands 8 bytes into the FSceneViewFamily itself and scribbles whatever
-// really lives there. The two observed crashes are both what that produces: a
-// call through a dead code pointer (execute AV at an unmapped address) on one
-// backend, and a null-base field read inside the game's render code on the
-// other. Synchronized Sequential, which never takes this path, does not crash.
+// the scanner latched offset 0 exactly as it did on Returnal. The hide/restore
+// pair around the FSceneView constructor then wrote a zero into the TArray count
+// at that offset, which lands 8 bytes into the FSceneViewFamily itself and
+// scribbles whatever really lives there. The two observed crashes are both what
+// that produces: a call through a dead code pointer (execute AV at an unmapped
+// address) on one backend, and a null-base field read inside the game's render
+// code on the other. Synchronized Sequential never takes this path and never
+// crashed.
 //
-// Offset 0 can never be right: UE always places at least the RenderTarget and
-// Scene pointers (and on UE5 a vtable) ahead of Views, so a +0 "verification" is
-// a false positive from a header that merely looks TArray-shaped. Reads may
-// still use it -- being wrong there only makes NSF inert -- but a write must
-// not, so writes reject it outright.
+// The bar is deliberately NOT "must have verified". Verification failing does
+// not mean the offset is wrong -- a cloned family back-points at the ORIGINAL
+// family, so it misses by design, and demanding verification here would drop the
+// multi-view hide on titles that have always had it and needed it (the hide is
+// what keeps >1 visible view from crashing the constructor on UE5). Rejecting
+// only what is provably bad keeps every title that works today working:
+//
+//   1. Offset 0, always, verified or not. UE places at least RenderTarget and
+//      Scene (and on UE5 a vtable) ahead of Views, so +0 cannot be a real Views
+//      offset and a "verification" there is a false positive off a header that
+//      merely looks TArray-shaped. This alone is what Jedi Survivor tripped.
+//   2. A header that does not read like a TArray at all, when unverified.
+//
+// Reads keep using the unfiltered resolver: being wrong there only makes NSF
+// inert, which is not worth a behaviour change.
 static sdk::TArray<sdk::FSceneView*>* nsf_resolve_writable_views(sdk::FSceneViewFamily* view_family) {
     bool verified = false;
     auto* views = nsf_resolve_verified_views(view_family, &verified);
 
-    if (views == nullptr || !verified) {
-        SPDLOG_INFO_ONCE("[NativeStereoFix] Declining to mutate an unverified views array "
-                         "(family {:x}); leaving the view count alone.",
-                         (uintptr_t)view_family);
+    if (views == nullptr) {
         return nullptr;
     }
 
     if ((uintptr_t)views == (uintptr_t)view_family) {
-        SPDLOG_WARN_ONCE("[NativeStereoFix] Views verified at family+0, which cannot be a real "
-                         "Views offset (RenderTarget/Scene precede it). Treating it as a false "
-                         "positive and leaving the view count alone (family {:x}).",
-                         (uintptr_t)view_family);
+        SPDLOG_WARN_ONCE("[NativeStereoFix] Views resolved to family+0, which cannot be a real Views "
+                         "offset (RenderTarget/Scene precede it). Treating it as a false positive and "
+                         "leaving the view count alone (family {:x}, verified={}).",
+                         (uintptr_t)view_family, verified);
+        return nullptr;
+    }
+
+    if (verified) {
+        return views;
+    }
+
+    // Unverified: this is the scanned fallback, so demand the header at least
+    // look like a TArray before writing into it.
+    struct ViewsProbe {
+        void* data;
+        uint32_t count;
+        uint32_t capacity;
+    } probe{};
+
+    const bool plausible = nsf_seh_read(views, &probe, sizeof(probe)) &&
+                           probe.count <= 8 && probe.capacity >= probe.count &&
+                           (probe.count == 0 || probe.data != nullptr);
+
+    if (!plausible) {
+        SPDLOG_WARN_ONCE("[NativeStereoFix] NOT mutating views at the scanned offset: header fails "
+                         "plausibility (count={} cap={} data={:x}, family {:x})",
+                         probe.count, probe.capacity, (uintptr_t)probe.data, (uintptr_t)view_family);
         return nullptr;
     }
 
