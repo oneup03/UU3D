@@ -4,10 +4,12 @@ Notable changes to UU3D, newest first. Nightly builds are tagged by run number
 (`00024`, `00025`, …) — see the
 [releases page](https://github.com/oneup03/UU3D/releases).
 
-A release ships **both backends** in one package (Legacy at the root, Modern
-under `modern\`), so entries apply to both unless a heading says otherwise.
+From **00037** a release ships **both backends** in one package (Legacy at the
+root, Modern under `modern\`), so entries apply to both unless a heading says
+otherwise. Earlier nightlies were a single build, alternating between the two
+bases depending on which branch produced them.
 
-## Unreleased
+## Nightly 00037
 
 ### Added
 - **Legacy and Modern backends in a single package.** Legacy at the package
@@ -39,9 +41,45 @@ under `modern\`), so entries apply to both unless a heading says otherwise.
   so they reverted to their defaults each time. Affected every game.
 - Auto camera FoV axis detection, which now defaults to Horizontal.
 
+## Nightly 00035
+
+### Added
+- **Legacy backend.** First build on the plain praydog nightly + PureDark AFW
+  base, rather than the Joey Hodge merged fork everything before this was built
+  from. It is the more conservative of the two and is what later became the
+  **Legacy** half of the dual-backend package.
+
+## Nightly 00028
+
+### Added
+- **Render resolution now runs through `r.ScreenPercentage`**, with an
+  **Applied To** selector choosing where it lands: *Primary* (the upscaler's own
+  input resolution, which is what DLSS/TSR set), *Secondary* (stacks on top of
+  DLSS/TSR), or *Stereo Render Target* (the previous behaviour). Lets you render
+  below native and let the game's own upscaler do the work.
+
+### Fixed
+- Alternating/AFR rendering only filling half the frame at some resolutions.
+- Camera FoV axis detection.
+
+## Nightly 00026
+
+### Added
+- **LeiaSR now releases the display's switchable lens when you stop weaving.**
+  Leaving LeiaSR - by switching output mode, or by the weaver failing - used to
+  leave the panel lensed over every other 3D mode, other applications, and the
+  desktop.
+- LeiaSR is driven through SR-lib's wrapper rather than the SR SDK directly,
+  which brings the DLL preflight and exception containment with it.
+
+### Fixed
+- **Engine-version misdetection on some UE5.6 titles.** A game reporting its own
+  version instead of the engine's made every version gate take the wrong branch,
+  which could hang the render thread for a minute at startup before failing.
+- Eye parity (frames latching to one eye) and the Native Stereo Fix hook.
+
 ## Initial Release - 00024
 
-## Unreal Universal 3D (UU3D) - a fork of UEVR for 3D displays
 ### Features:
 - Based on Upstream PureDark AFW Joey Hodge fork
 - Additional Alternate Frame Warp render mode - a geometric 3D mode with only 20-30% render cost but some artifacts
@@ -54,7 +92,6 @@ under `modern\`), so entries apply to both unless a heading says otherwise.
 - Stereo Cursor with either static or dynamic depth
 - Open Track (Untested)
 - Color Correction - adjust brightness/contrast/colors to help with games that are too dark or have too much crosstalk on your display
-### Full readme and download: https://github.com/oneup03/UU3D#unreal-universal-3d
 ### Created profiles for: 
 Black Myth Wukong, Final Fantasy 7 Rebirth, The Plucky Squire, Expedition 33, Shin Megami Tensei 5V, Stellar Blade, Returnal, Palworld, Persona 3R, Jedi Survivor, Hogwarts Legacy, Hellblade 2, Gotham Knights, and Denshattack
 https://github.com/oneup03/UU3D-Profiles
