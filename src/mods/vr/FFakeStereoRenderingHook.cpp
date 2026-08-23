@@ -6076,7 +6076,16 @@ static bool s_nsf_flow_disabled = false;
 // pointer is essentially impossible, which keeps the test definitive. Returns
 // nullptr when nothing verifies, so callers fall back rather than act on
 // garbage. Every read goes through nsf_seh_read.
-static sdk::TArray<sdk::FSceneView*>* nsf_resolve_verified_views(sdk::FSceneViewFamily* view_family) {
+//
+// out_verified distinguishes a VERIFIED hit from the scanned fallback below.
+// Reading through the fallback is fine (it is what the engine-side code always
+// did); WRITING through it is not - see nsf_resolve_writable_views.
+static sdk::TArray<sdk::FSceneView*>* nsf_resolve_verified_views(sdk::FSceneViewFamily* view_family,
+                                                                bool* out_verified = nullptr) {
+    if (out_verified != nullptr) {
+        *out_verified = false;
+    }
+
     if (view_family == nullptr) {
         return nullptr;
     }
@@ -6133,9 +6142,14 @@ static sdk::TArray<sdk::FSceneView*>* nsf_resolve_verified_views(sdk::FSceneView
 
         if (all_backptrs_ok) {
             SPDLOG_INFO_ONCE(
-                "[NativeStereoFix] Views verified at family+{:x} (count={}, scanned offset {})",
-                cand - base, probe.count,
+                "[NativeStereoFix] Views verified at family+{:x} (family {:x}, count={}, scanned offset {})",
+                cand - base, base, probe.count,
                 scanned != nullptr ? (int64_t)((uintptr_t)scanned - base) : -1);
+
+            if (out_verified != nullptr) {
+                *out_verified = true;
+            }
+
             return (sdk::TArray<sdk::FSceneView*>*)cand;
         }
     }
@@ -6154,6 +6168,47 @@ static sdk::TArray<sdk::FSceneView*>* nsf_resolve_verified_views(sdk::FSceneView
         "using the scanned offset (family {:x}, scanned {:x})",
         base, (uintptr_t)scanned);
     return scanned;
+}
+
+// Same resolve, but for the callers that MUTATE the array header. Returns
+// nullptr unless the offset both verified and is structurally possible.
+//
+// Jedi Survivor (SwGame, UE4) crashed on Native Stereo and only on Native
+// Stereo, every run, within seconds of the first view family. Its views resolve
+// to family+0 -- the log prints "family 8edc72d8b0, scanned 8edc72d8b0", i.e.
+// the scanner latched offset 0 exactly as it did on Returnal. The old
+// hide/restore pair then wrote a zero into the TArray count at that offset,
+// which lands 8 bytes into the FSceneViewFamily itself and scribbles whatever
+// really lives there. The two observed crashes are both what that produces: a
+// call through a dead code pointer (execute AV at an unmapped address) on one
+// backend, and a null-base field read inside the game's render code on the
+// other. Synchronized Sequential, which never takes this path, does not crash.
+//
+// Offset 0 can never be right: UE always places at least the RenderTarget and
+// Scene pointers (and on UE5 a vtable) ahead of Views, so a +0 "verification" is
+// a false positive from a header that merely looks TArray-shaped. Reads may
+// still use it -- being wrong there only makes NSF inert -- but a write must
+// not, so writes reject it outright.
+static sdk::TArray<sdk::FSceneView*>* nsf_resolve_writable_views(sdk::FSceneViewFamily* view_family) {
+    bool verified = false;
+    auto* views = nsf_resolve_verified_views(view_family, &verified);
+
+    if (views == nullptr || !verified) {
+        SPDLOG_INFO_ONCE("[NativeStereoFix] Declining to mutate an unverified views array "
+                         "(family {:x}); leaving the view count alone.",
+                         (uintptr_t)view_family);
+        return nullptr;
+    }
+
+    if ((uintptr_t)views == (uintptr_t)view_family) {
+        SPDLOG_WARN_ONCE("[NativeStereoFix] Views verified at family+0, which cannot be a real "
+                         "Views offset (RenderTarget/Scene precede it). Treating it as a false "
+                         "positive and leaving the view count alone (family {:x}).",
+                         (uintptr_t)view_family);
+        return nullptr;
+    }
+
+    return views;
 }
 
 
@@ -14891,6 +14946,11 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
     native_projection_valid = native_projection_valid && native_projection_nonzero && native_projection_hash != 0;
 
     std::optional<uint32_t> views_original_count{};
+    // The EXACT array we zeroed, so the restore below cannot put the count back
+    // somewhere else. These two used to disagree: the hide wrote through the raw
+    // scanned pointer while the restore re-resolved through the verified one, so
+    // whenever those differed the hidden location stayed zeroed forever.
+    sdk::TArray<sdk::FSceneView*>* hidden_views = nullptr;
 
     if (vr->is_native_stereo_fix_enabled() && init_options_stereo_pass == EStereoscopicPass::eSSP_SECONDARY) {
         const auto rtm = g_hook->get_render_target_manager();
@@ -14935,8 +14995,15 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 // Verified offset: this path WRITES count = 0, and Returnal's
                 // family layout puts another member where the scan points, so a
                 // raw get_views() write would scribble the family.
+                //
+                // nsf_resolve_verified_views falls back to the scanned offset
+                // when nothing verifies, so it was still handing this write an
+                // unverified pointer -- on Jedi Survivor family+0, which the
+                // plausibility probe below happily accepts because the family
+                // header merely looks TArray-shaped. Take the write-only
+                // resolver, which demands a real verification and rejects +0.
                 auto view_family = init_options->get_view_family();
-                auto views = nsf_resolve_verified_views(view_family);
+                auto views = nsf_resolve_writable_views(view_family);
 
                 if (views != nullptr && use_primary_constructor_pass) {
                     // A relabeled PRIMARY constructed with the multi-view family
@@ -14964,12 +15031,14 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     if (hide_plausible) {
                         views_original_count = views->count;
                         views->count = 0;
+                        // Restore through this exact pointer, never a re-resolve.
+                        hidden_views = views;
                         SPDLOG_INFO_ONCE(
                             "[NativeStereoFix] Hiding FSceneViewFamily views during secondary-view construction");
                     } else {
                         SPDLOG_WARN_ONCE(
                             "[NativeStereoFix] NOT hiding views: array at scanned offset fails plausibility "
-                            "(count={} cap={} data={:x}) — family layout differs from scan",
+                            "(count={} cap={} data={:x}) - family layout differs from scan",
                             hide_probe.count, hide_probe.capacity, (uintptr_t)hide_probe.data);
                     }
                 }
@@ -15637,16 +15706,12 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         g_hook->m_sceneview_data.splitscreen_state = SplitScreenCompatibilityState::Off;
     }
 
-    // Reset the view count back to what it was. Must resolve the array exactly
-    // like the hiding path above did — restoring through a different offset
-    // would write the count into an unrelated family member.
-    if (views_original_count.has_value()) {
-        auto view_family = init_options->get_view_family();
-        auto views = nsf_resolve_verified_views(view_family);
-
-        if (views != nullptr) {
-            views->count = views_original_count.value();
-        }
+    // Reset the view count back to what it was, through the SAME pointer we
+    // zeroed. This used to re-resolve, which the comment here already flagged as
+    // needing to match the hiding path exactly - it did not have to, so whenever
+    // the two resolves disagreed the hidden location stayed zeroed for good.
+    if (views_original_count.has_value() && hidden_views != nullptr) {
+        hidden_views->count = views_original_count.value();
     }
 
     return result;
