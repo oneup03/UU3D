@@ -1,5 +1,25 @@
 # Unreal Universal 3D
 
+## Terms of Use
+
+**Non-commercial use only.** Unreal Universal 3D (UU3D) is provided free of
+charge for personal, non-commercial use. It may not be sold, licensed, rented,
+sublicensed, or otherwise distributed for a fee or other consideration, nor
+used to derive commercial gain.
+
+**No commercial affiliation or incorporation.** UU3D may not be bundled with,
+integrated into, redistributed as part of, or otherwise presented as a
+component of any commercial product, service, hardware, or software offering,
+whether paid or provided at no cost. No company, product, or service may
+represent UU3D as its own work, as an official feature, or as being endorsed
+by, affiliated with, or supported by this project or its contributors.
+
+All rights not expressly granted are reserved. The full terms are in
+[LICENSE-UU3D.md](LICENSE-UU3D.md); [LICENSE](LICENSE) is the notice governing
+the underlying UEVR framework and is unchanged by them.
+
+## Overview
+
 UU3D can output stereo 3D directly to a screen — no headset, no SteamVR
 or OpenXR install — as a third runtime alongside OpenVR/OpenXR. The game
 renders in stereo through its normal render pipeline; instead of submitting to a
