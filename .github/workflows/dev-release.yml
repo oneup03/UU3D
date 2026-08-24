@@ -165,12 +165,13 @@ jobs:
           path: frontend
           persist-credentials: false
 
-      # Supplies nightly-body.md (the release body) and CHANGELOG.md (shipped in
-      # the zip). Checked out from the MODERN ref because CHANGELOG.md lives only
-      # on that branch - a release contains both backends, so the changelog
-      # describes the release rather than either branch, and keeping one copy
-      # avoids the drift a second would bring. nightly-body.md exists on both
-      # refs, so nothing else changes by sourcing it here.
+      # Supplies nightly-body.md (the release body), CHANGELOG.md and the two
+      # license files (all shipped in the zip). Checked out from the MODERN ref
+      # because CHANGELOG.md lives only on that branch - a release contains both
+      # backends, so the changelog describes the release rather than either
+      # branch, and keeping one copy avoids the drift a second would bring.
+      # nightly-body.md and the license files exist on both refs, so nothing
+      # else changes by sourcing them here.
       #
       # This job builds nothing from the backend repo, so no submodules and no
       # UESDK_PULLER token are needed.
@@ -209,6 +210,18 @@ jobs:
 
       - name: Bundle the changelog
         run: Copy-Item -Force ${{github.workspace}}/notes/CHANGELOG.md ${{github.workspace}}/UU3D/
+        shell: powershell
+
+      # LICENSE-UU3D.md is the terms-of-use document users are bound by, so it
+      # ships with the binaries rather than living only in the repo. LICENSE is
+      # the upstream UEVR notice it refers to; shipping both keeps that
+      # reference resolvable offline. Copy-Item fails the job if either is
+      # missing, which is the wanted behaviour - a package with no terms in it
+      # should not be published.
+      - name: Bundle the license files
+        run: |
+          Copy-Item -Force ${{github.workspace}}/notes/LICENSE-UU3D.md ${{github.workspace}}/UU3D/
+          Copy-Item -Force ${{github.workspace}}/notes/LICENSE ${{github.workspace}}/UU3D/LICENSE-UEVR.txt
         shell: powershell
 
       # As of PureDark AFW v1.0-beta.6 the joeyhodge and nightly packages ship a
