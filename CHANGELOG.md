@@ -9,6 +9,51 @@ root, Modern under `modern\`), so entries apply to both unless a heading says
 otherwise. Earlier nightlies were a single build, alternating between the two
 bases depending on which branch produced them.
 
+## Nightly 00040
+
+### Changed
+- **Depth is now Separation, and it means something you can see.** The old
+  Depth slider was an eye separation in metres, which is not a quantity anyone
+  perceives, and it needed a **Reference FoV** slider beside it to stay
+  consistent when a game zoomed. Separation replaces both: it is the background
+  3D strength expressed as a fraction of your screen's width, so a value of
+  0.05 puts distant objects 5% of the screen apart. Your existing Depth,
+  Convergence and Reference FoV settings are converted automatically the first
+  time a profile loads, and the picture is unchanged - nothing to re-tune.
+  **Reference FoV is gone**; it no longer has anything to calibrate.
+- **The 3D effect now holds through zoom/ADS instantly.** It was already meant
+  to, but the old scaling settled over several frames after a hard FoV cut, so
+  depth was briefly wrong every time you aimed down sights. Separation is
+  independent of FoV by construction, so there is nothing left to settle.
+- **Convergence no longer changes background depth.** Moving the screen plane
+  used to quietly weaken or strengthen the whole image; now it only moves what
+  sits in front of the screen, and the background stays where Separation put
+  it. Worth knowing if you are used to compensating for the old coupling. On
+  autostereo panels this also makes Separation a directly comparable crosstalk
+  budget across games - lower it if you see ghosting.
+- **World Scale and Depth Scale are hidden in 3D mode.** Neither did anything
+  useful there. World Scale had become a second, invisible depth multiplier
+  that fought the Separation slider, and Depth Scale only ever affected OpenXR
+  headset submission.
+- **L3+R3 now needs a deliberate long press by default**, so an incidental
+  stick click no longer opens the menu.
+
+### Fixed
+- **The menu no longer clips at larger font sizes.** The window and its sidebar
+  were both sized for the old 16px font, so raising the font size ate the page
+  area and cut off the longer sidebar labels. Both now scale with the font, and
+  the window stays fully on screen at 1080p.
+- **Jedi Survivor no longer crashes in Native Stereo (Legacy backend).** Its
+  view array resolved to a bogus offset, and the multi-view hide then wrote a
+  zero over unrelated engine data. The write is now rejected when the offset
+  cannot be real. **The Modern backend still crashes here** - the same fix did
+  not address its failure, so it is not applied there; use Legacy, or
+  Synchronized Sequential, for this title.
+- **3D Render Resolution had no tooltip and the 3D FoV Multiplier showed the
+  wrong one.** The render-resolution help had drifted onto the FoV control, and
+  the multiplier's own explanation only appeared after you had already changed
+  it. Both now describe what they actually do.
+
 ## Nightly 00037
 
 ### Added
