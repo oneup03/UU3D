@@ -823,6 +823,34 @@ int HudMode() { return hud_mode & 15; }
 int HudTiles()  { return max((hud_mode >> 4) & 15, 1); }
 int HudTilesY() { return max((hud_mode >> 8) & 15, 1); }
 
+// Safety limits on the HUD depth shift, in eye-U units (per eye, so the
+// on-screen disparity is twice these).
+//
+// BEHIND the screen plane the constraint is physical: uncrossed disparity
+// larger than the viewer's IPD forces the eyes to diverge, which cannot be
+// fused at all. 0.05 per eye = 0.10 screen widths, which is about
+// IPD / screen_width on a 27in 16:9 panel - the right place to stop.
+//
+// IN FRONT the eyes converge inward, which is never divergence, so that hard
+// limit does not apply and reusing it just clips valid pop-out. Both sides
+// used to share the 0.05 cap, which made near HUD content saturate and stop
+// tracking depth entirely once convergence got large (anything nearer than
+// conv/(1 + 0.1/separation) - at separation 0.05 that is conv/3, so a 5m
+// convergence broke everything closer than about 1.7m). The near side gets
+// 3x the room; it stays a backstop against a bad depth sample flinging an
+// icon off, rather than a limit normal geometry runs into.
+static const float kHudShiftLimitBehind = 0.05;
+static const float kHudShiftLimitNear   = 0.15;
+
+// raw = invz - hud_inv_conv_uu, POSITIVE when the sample is nearer than the
+// screen plane. Note the sign of s_px cannot be used for this test: hud_k_px
+// carries the per-eye direction, so s_px flips sign between eyes while the
+// near/far sense does not.
+float ClampHudShiftUV(float s_px, float raw, float extra) {
+    float lim = ((raw > 0.0) ? kHudShiftLimitNear : kHudShiftLimitBehind) + extra;
+    return clamp(s_px / max(eye_width_px, 1.0), -lim, lim);
+}
+
 // Per-pixel HUD shift (eye-U units) for the depth modes. For depth-adaptive
 // the depth is sampled in a short strip BELOW the pixel — world markers
 // float above the thing they track, so the object is usually underneath.
@@ -886,8 +914,9 @@ float ComputeHudShiftUV(float2 uv) {
             return hud_flat_shift_uv;
         }
 
-        float s_px = hud_k_px * (invz - hud_inv_conv_uu) - hud_bias_px;
-        float depth_shift = clamp(s_px / max(eye_width_px, 1.0), -0.05, 0.05);
+        float raw = invz - hud_inv_conv_uu;
+        float s_px = hud_k_px * raw - hud_bias_px;
+        float depth_shift = ClampHudShiftUV(s_px, raw, 0.0);
         return lerp(hud_flat_shift_uv, depth_shift, world_ness);
     }
 
@@ -906,8 +935,9 @@ float ComputeHudShiftUV(float2 uv) {
     }
 
     if (best_inv_z > 0.0 && best_d < anchor_radius_uv + anchor_feather_uv) {
-        float s_px = hud_k_px * (best_inv_z - hud_inv_conv_uu) - hud_bias_px;
-        float a_shift = clamp(s_px / max(eye_width_px, 1.0), -0.05, 0.05);
+        float raw = best_inv_z - hud_inv_conv_uu;
+        float s_px = hud_k_px * raw - hud_bias_px;
+        float a_shift = ClampHudShiftUV(s_px, raw, 0.0);
         float t = saturate((anchor_radius_uv + anchor_feather_uv - best_d) / max(anchor_feather_uv, 1e-4));
         return lerp(hud_flat_shift_uv, a_shift, t);
     }
@@ -996,8 +1026,9 @@ float4 ps_main(VSOut input) : SV_Target {
         if (cursor_depth != 0) {
             float dev = scene_depth.SampleLevel(samp, float2(region_center.x * hud_depth_uscale, region_center.y), 0).r;
             float invz = (dev > 1e-7) ? (dev / max(hud_nearz_uu, 1e-6)) : hud_inv_conv_uu;
-            float s_px = hud_k_px * (invz - hud_inv_conv_uu) - hud_bias_px;
-            d.x -= clamp(s_px / max(eye_width_px, 1.0), -0.06, 0.06);
+            float raw = invz - hud_inv_conv_uu;
+            float s_px = hud_k_px * raw - hud_bias_px;
+            d.x -= ClampHudShiftUV(s_px, raw, 0.01); // cursor keeps its extra headroom
         }
 
         // Stereo cursor: folded 3D navigation arrow. dot_radius_px = arrow height.
