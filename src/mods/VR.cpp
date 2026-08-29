@@ -1,5 +1,7 @@
 #define NOMINMAX
 
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <cmath>
 #include <algorithm>
@@ -8173,6 +8175,57 @@ void VR::update_dpad_gestures() {
     }
 }
 
+// One-shot conversion from the pre-clip-space Flat3D knobs.
+//
+// The old parameterization stored an eye separation in metres, then multiplied
+// it by tan_half_game/tan_half_ref before the projection hook divided it back
+// out via P00. tan_half_game cancels, so the effective shear those three
+// sliders produced was exactly
+//
+//     depth / (2 * convergence * tan(reference_fov/2)) * world_scale
+//
+// which is precisely the clip-space separation we now store directly. Applying
+// that gives a migrated user a pixel-identical image at their saved
+// convergence. World Scale is folded in because it is inert under Flat3D now
+// (see VR::get_world_scale) - this is what lets us retire it silently.
+//
+// Detected by the new key being absent while the old one is present, so it runs
+// exactly once and never touches a config that has already been converted.
+void VR::migrate_flat3d_separation(const utility::Config& cfg, bool set_defaults) {
+    if (set_defaults) {
+        return;
+    }
+
+    if (cfg.get<float>(m_flat3d_separation->get_config_name()).has_value()) {
+        return; // already on the new parameterization
+    }
+
+    const auto old_depth = cfg.get<float>(generate_name("Flat3D_Depth"));
+
+    if (!old_depth.has_value()) {
+        return; // fresh config - the slider default already applies
+    }
+
+    const float depth = *old_depth;
+    const float conv = cfg.get<float>(generate_name("Flat3D_Convergence")).value_or(1.0f);
+    const float ref_fov = cfg.get<float>(generate_name("Flat3D_ReferenceFOV")).value_or(90.0f);
+    const float world_scale = cfg.get<float>(generate_name("WorldScale")).value_or(1.0f);
+
+    const float tan_half_ref = std::tan(glm::radians(ref_fov) * 0.5f);
+
+    if (conv <= 0.0f || tan_half_ref <= 0.0f) {
+        return; // nonsense saved values - leave the default in place
+    }
+
+    const float converted = std::clamp(depth / (2.0f * conv * tan_half_ref) * world_scale, 0.0f, 0.15f);
+
+    m_flat3d_separation->value() = converted;
+
+    spdlog::info("[Flat3D] Migrated stereo settings to the clip-space parameterization: "
+                 "depth={:.4f}m conv={:.3f}m refFoV={:.1f}deg worldScale={:.3f} -> separation={:.4f}",
+                 depth, conv, ref_fov, world_scale, converted);
+}
+
 void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
     ZoneScopedN(__FUNCTION__);
 
@@ -8186,6 +8239,8 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
         m_compatibility_subnautica2_native_water->value() = true;
         m_subnautica2_native_water_mode->value() = SUBNAUTICA2_NATIVE_WATER_SAFE_REFLECTIONS;
     }
+
+    migrate_flat3d_separation(cfg, set_defaults);
 
     if (get_runtime() != nullptr && get_runtime()->loaded) {
         get_runtime()->on_config_load(cfg, set_defaults);
@@ -9481,8 +9536,15 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         ImGui::Separator();
         ImGui::Spacing();
 
-        m_world_scale->draw("World Scale");
-        m_depth_scale->draw("Depth Scale");
+        // World Scale is meaningless in Flat3D (no head translation to scale) and
+        // get_world_scale() forces it to 1 there, so don't offer a dead control.
+        // Depth Scale is likewise dead: its only consumer is the OpenXR depth
+        // submission layer (OpenXR.cpp, depth_layers[].farZ), which Flat3D never
+        // reaches.
+        if (!is_using_flat3d()) {
+            m_world_scale->draw("World Scale");
+            m_depth_scale->draw("Depth Scale");
+        }
 
         m_disable_hzbocclusion->draw("Disable HZBOcclusion");
         m_disable_instance_culling->draw("Disable Instance Culling");

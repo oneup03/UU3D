@@ -599,8 +599,13 @@ public:
         return m_camera_up_offset->value();
     }
 
+    // World Scale has no meaning in Flat3D: there is no head translation for it
+    // to scale, so it degrades to a silent second separation multiplier that
+    // breaks the "separation == on-screen disparity fraction" invariant. Force
+    // it to 1 there. This also covers get_world_to_meters() below, so the AFW
+    // warp camera data stays consistent with the projection we hand the engine.
     auto get_world_scale() const {
-        return m_world_scale->value();
+        return is_using_flat3d() ? 1.0f : m_world_scale->value();
     }
 
     auto is_stereo_emulation_enabled() const {
@@ -1222,6 +1227,8 @@ private:
     void on_draw_sidebar_flat3d();
     void handle_flat3d_keybinds();
     void update_flat3d_params(); // per-frame effective separation/convergence
+    // One-shot config conversion from the pre-clip-space Depth/ReferenceFOV knobs.
+    void migrate_flat3d_separation(const utility::Config& cfg, bool set_defaults);
     void update_flat3d_ensure_windowed(); // Katanga: force the game into a normal window
     // Samples the game camera's live FoV (deg, horizontal) via
     // APlayerCameraManager::GetFOVAngle. Game thread only (ProcessEvent);
@@ -2097,9 +2104,11 @@ private:
     };
     const ModCombo::Ptr m_flat3d_fov_axis{ ModCombo::create(generate_name("Flat3D_FOVAxis"), s_flat3d_fov_axis_names, 1) };
     const ModSlider::Ptr m_flat3d_fov_multiplier{ ModSlider::create(generate_name("Flat3D_FOVMultiplier"), 0.5f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 0.5f, 0.1f) };
+    // Background disparity as a fraction of screen width (clip-space / NVIDIA
+    // convention). See Flat3D::separation. 0.05 reproduces the old
+    // 0.1m / 1.0m / 90deg default exactly.
+    const ModSlider::Ptr m_flat3d_separation{ ModSlider::create(generate_name("Flat3D_Separation"), 0.0f, 0.15f, 0.05f) };
     const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };
-    const ModSlider::Ptr m_flat3d_reference_fov{ ModSlider::create(generate_name("Flat3D_ReferenceFOV"), 40.0f, 140.0f, 90.0f) };
     const ModToggle::Ptr m_flat3d_autoconv_enabled{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
     const ModSlider::Ptr m_flat3d_autoconv_target_disparity{ ModSlider::create(generate_name("Flat3D_AutoConvTargetDisparity"), 0.001f, 0.03f, 0.005f) };
     const ModSlider::Ptr m_flat3d_autoconv_smoothing{ ModSlider::create(generate_name("Flat3D_AutoConvSmoothing"), 0.005f, 0.25f, 0.08f) };
@@ -2377,9 +2386,8 @@ public:
             *m_flat3d_force_sdr,
             *m_flat3d_fov_multiplier,
             *m_flat3d_fov_axis,
-            *m_flat3d_depth,
+            *m_flat3d_separation,
             *m_flat3d_convergence,
-            *m_flat3d_reference_fov,
             *m_flat3d_autoconv_enabled,
             *m_flat3d_autoconv_target_disparity,
             *m_flat3d_autoconv_smoothing,

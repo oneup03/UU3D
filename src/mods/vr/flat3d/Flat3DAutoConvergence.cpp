@@ -8,20 +8,19 @@
 namespace vrmod::flat3d {
 
 Flat3DAutoConvergence::Output Flat3DAutoConvergence::update(
-    float nearest_z_uu, float sep_uu, float p00,
+    float nearest_z_uu, float separation,
     float manual_conv_m, float conv_floor_m, float w2m,
     const Settings& s) {
 
     Output out{};
     out.convergence_m = manual_conv_m;
-    out.depth_scale = 1.0f;
 
     if (!s.enabled) {
         reset();
         return out; // snap back to the manual value
     }
 
-    if (w2m <= 0.0f || p00 <= 0.0f) {
+    if (w2m <= 0.0f || separation <= 0.0f) {
         return out;
     }
 
@@ -70,20 +69,18 @@ Flat3DAutoConvergence::Output Flat3DAutoConvergence::update(
 
     // Pop-out (crossed) disparity of the nearest object at a given
     // convergence, as a fraction of eye width — POSITIVE when the object is
-    // nearer than the screen plane: d(conv) = (sep_uu * p00 / 4) * (1/z - 1/conv).
-    const float k = sep_uu * p00 * 0.25f;
+    // nearer than the screen plane. Background disparity is `separation` and
+    // is invariant under convergence, so the whole family is simply
+    //     d(conv) = (separation/2) * (conv/z - 1)
+    // and the convergence that puts the nearest object exactly at the budget
+    // has the closed form conv = z * (1 + 2*target/separation).
+    const float half_sep = separation * 0.5f;
 
-    // The pull-in ALWAYS scales separation by conv/manual so the background
-    // (far-object) disparity stays locked at the user's at-manual
-    // calibration (bg disparity = sep/conv). With that constraint the
-    // nearest object's pop-out is d = (k/manual)*(conv/z - 1), so the
-    // convergence that puts it exactly at the disparity budget has the
-    // closed form conv = z * (1 + target*manual/k).
     float conv_target_uu = manual_conv_uu;
-    const float d_at_manual = k * (1.0f / z - 1.0f / manual_conv_uu);
+    const float d_at_manual = half_sep * (manual_conv_uu / z - 1.0f);
 
     if (d_at_manual > s.target_disparity) {
-        conv_target_uu = z * (1.0f + s.target_disparity * manual_conv_uu / k);
+        conv_target_uu = z * (1.0f + 2.0f * s.target_disparity / separation);
         conv_target_uu = std::min(conv_target_uu, manual_conv_uu); // ceiling
     }
 
@@ -108,23 +105,17 @@ Flat3DAutoConvergence::Output Flat3DAutoConvergence::update(
     }
 
     out.convergence_m = std::min(1.0f / std::max(m_inv_conv, 1e-6f), manual_conv_m);
-    // Derive the separation scale from the SAME smoothed convergence that is
-    // actually applied this frame — smoothing it independently let the
-    // background disparity unlock during transients.
-    out.depth_scale = manual_conv_m > 0.0f
-        ? std::clamp(out.convergence_m / manual_conv_m, 0.1f, 1.0f)
-        : 1.0f;
 
     if (s.logging && (++m_frames % 60) == 0) {
         // Full decision trace: the raw input, the filtered z the solve used,
         // the pop-out it computed at manual convergence vs the target budget,
         // and where the target landed before/after the floor clamp.
-        spdlog::info("[Flat3D][autoconv] z_in={:.1f} z_med={:.1f} z_ema={:.1f}uu k={:.2f} d_manual={:.4f} target={:.4f} "
+        spdlog::info("[Flat3D][autoconv] z_in={:.1f} z_med={:.1f} z_ema={:.1f}uu sep={:.4f} d_manual={:.4f} target={:.4f} "
                      "conv_target={:.3f}m (pre-floor {:.3f}m) -> conv={:.3f}m (manual {:.3f}m, floor {:.3f}m) "
-                     "depth_scale={:.3f} w2m={:.0f}",
-                     nearest_z_uu, z_median, m_z_ema_uu, k, d_at_manual, s.target_disparity,
+                     "w2m={:.0f}",
+                     nearest_z_uu, z_median, m_z_ema_uu, separation, d_at_manual, s.target_disparity,
                      conv_target_uu / w2m, conv_pre_floor_uu / w2m, out.convergence_m,
-                     manual_conv_m, conv_floor_uu / w2m, out.depth_scale, w2m);
+                     manual_conv_m, conv_floor_uu / w2m, w2m);
     }
 
     return out;

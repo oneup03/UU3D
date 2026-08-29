@@ -20716,12 +20716,23 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         // default) so the UESDK submodule stays pristine. See VR::flat3d_effective_nearz.
         const float near_z = vr->flat3d_effective_nearz();
 
-        // Effective separation must match the eye translation the view path
-        // applies (eyes[] x world_to_meters x world_scale); convergence stays
-        // in game meters, so only world_scale enters the ratio.
-        const float sep = flat3d->separation_m.load() * vr->get_world_scale(); // meters
-        const float conv = std::max(flat3d->convergence_m.load(), 0.001f);     // meters
-        const float o = sep * 0.5f / conv; // frustum shear offset (tangent units)
+        // The stereo knob is the clip-space separation (NVIDIA / 3Dmigoto
+        // convention): per-eye NDC x is offset by +/- separation at infinity, so
+        // it IS the total background disparity as a fraction of screen width.
+        // Being a clip-space quantity it needs no FoV rescaling - the eye-space
+        // shear coefficient below picks tan_half_h back up so the two agree.
+        // The matching eye translation is applied by the view path from
+        // Flat3D::eye_baseline_m, which update_flat3d_params() derives from
+        // these same two values.
+        // Convergence deliberately does not appear here: under this
+        // parameterization the shear IS `separation` and is invariant under it.
+        // The convergence dependence lives entirely in the eye translation
+        // (Flat3D::eye_baseline_m), which is what places the zero-parallax plane.
+        const float separation = flat3d->separation.load();
+        // Frustum shear offset in tangent units. Derived from the ORIGINAL
+        // tangent, never the symmetric-widened one below, so there is no
+        // circular dependency between o and xs.
+        const float o = separation * tan_half_h;
 
         // Symmetric-projection compat — driven by the same Compatibility page
         // setting the HMD paths use (Horizontal Projection = Symmetrical in
@@ -20732,7 +20743,8 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         // eyes, so the Vertical override and Mirrored are inherently no-ops.
         const bool symmetric = vr->get_horizontal_projection_override() == VR::HORIZONTAL_PROJECTION_OVERRIDE::HORIZONTAL_SYMMETRIC;
 
-        // Horizontal scale: original tangent, widened by |o| when symmetric.
+        // Horizontal scale: original tangent, widened by |o| when symmetric —
+        // which under this parameterization is just tan_half_h * (1 + separation).
         const float xs_tan = symmetric ? (tan_half_h + o) : tan_half_h;
         const float xs = xs_tan > 0.0f ? (1.0f / xs_tan) : 1.0f;
         // Vertical FoV is unchanged in either mode.
@@ -20741,10 +20753,14 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
         // Sign: in UE's projection convention (z forward, w = z) the LEFT eye
         // shear is NEGATIVE. Proof via the HMD chain this mode mirrors:
         // VRto3D returns left-eye tangents {l = -t+o, r = t+o} with
-        // o = +sep/2/conv, and OpenVR.cpp's get_mat maps raw tangents into
-        // [2][0] = (l'+r')/(l'-r') with l' = -l, r' = -r, giving -o*P00.
+        // o = +separation*tan_half_h, and OpenVR.cpp's get_mat maps raw tangents
+        // into [2][0] = (l'+r')/(l'-r') with l' = -l, r' = -r, giving -o*P00.
+        // This matches 3Dmigoto, whose params texture carries the left eye's
+        // separation negated (nvstereo.h: leftEye[0] = -finalSeparation).
         const float dir = (true_index == 0) ? -1.0f : 1.0f;                    // left -, right +
-        const float shear = symmetric ? 0.0f : dir * o * xs;
+        // o * xs collapses to exactly `separation` in the non-symmetric branch
+        // (xs == 1/tan_half_h there), which is the clip-space form directly.
+        const float shear = symmetric ? 0.0f : dir * separation;
 
         vr->m_nearz = near_z;
         flat3d->update_matrices(near_z, 10000.0f);
