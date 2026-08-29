@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 
@@ -1541,8 +1542,14 @@ void Framework::draw_ui() {
 
     // Center the window
     const auto rt_size = get_rt_size();
-    constexpr auto window_w = 700.0f;
-    constexpr auto window_h = 700.0f;
+
+    // The default 700x700 was sized for the old 16px font. Scale the default
+    // window with the configured font size so a larger font does not simply eat
+    // the page area, but never let it grow past most of the output so it stays
+    // fully on screen at 1080p.
+    const auto ui_scale = std::max(1.0f, (float)m_font_size / 16.0f);
+    const auto window_w = std::min(700.0f * ui_scale, std::max(700.0f, rt_size.x * 0.8f));
+    const auto window_h = std::min(700.0f * ui_scale, std::max(700.0f, rt_size.y * 0.8f));
 
     const auto centered_x = (rt_size.x / 2) - (window_w / 2);
     const auto centered_y = (rt_size.y / 2) - (window_h / 2);
@@ -1620,7 +1627,14 @@ void Framework::draw_ui() {
     sidebar_entries.emplace_back("About", false);
 
     if (ImGui::BeginTable("UEVRTable", 2, ImGuiTableFlags_::ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_::ImGuiTableFlags_BordersOuterV | ImGuiTableFlags_::ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("UEVRLeftPaneColumn", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        // Font-relative so the sidebar labels ("Console/CVars", "Compatibility")
+        // are not clipped at larger font sizes. 150.0f was the old fixed width,
+        // which only ever fit the 16px font.
+        const auto& sidebar_style = ImGui::GetStyle();
+        const auto sidebar_width = std::max(150.0f,
+            (ImGui::GetFontSize() * 8.0f) + sidebar_style.ScrollbarSize + (sidebar_style.WindowPadding.x * 2.0f));
+
+        ImGui::TableSetupColumn("UEVRLeftPaneColumn", ImGuiTableColumnFlags_WidthFixed, sidebar_width);
         ImGui::TableSetupColumn("UEVRRightPaneColumn", ImGuiTableColumnFlags_WidthStretch);
 
         ImGui::TableNextRow();

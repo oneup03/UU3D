@@ -118,7 +118,7 @@ private:
     ModToggle::Ptr m_menu_open{ ModToggle::create(generate_name("MenuOpen"), true) };
     ModToggle::Ptr m_remember_menu_state{ ModToggle::create(generate_name("RememberMenuState"), false) };
     ModToggle::Ptr m_enable_l3_r3_toggle{ ModToggle::create(generate_name("EnableL3R3Toggle"), true) };
-    ModToggle::Ptr m_l3_r3_long_press{ ModToggle::create(generate_name("L3R3LongPress"), false) };
+    ModToggle::Ptr m_l3_r3_long_press{ ModToggle::create(generate_name("L3R3LongPress"), true) };
     ModToggle::Ptr m_always_show_cursor{ ModToggle::create(generate_name("AlwaysShowCursor"), false) };
     ModToggle::Ptr m_advanced_mode{ ModToggle::create(generate_name("AdvancedMode"), false) };
     
