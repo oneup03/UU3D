@@ -2515,33 +2515,59 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     return p;
 }
 
-// VRto3D-matching hotkeys (always polled while flat3d is active, held-repeat):
-//   Ctrl+F3 / Ctrl+F4  = separation -/+ 0.0005 per frame (screen-width fraction)
-//   Ctrl+F5 / Ctrl+F6  = convergence -/+ 0.005 m per frame
-// The remappable single-key binds are checked as well.
+// Held-repeat hotkeys, polled while flat3d is active. Rates are per SECOND,
+// not per frame, so a 144Hz title does not sweep five times faster than a 30fps
+// one - the steps used to be per-frame and did exactly that.
+//
+//   Ctrl+F3 / Ctrl+F4  = separation -/+ 0.03 per second (linear)
+//   Ctrl+F5 / Ctrl+F6  = convergence x/ e^0.6 per second (proportional)
+//
+// Separation stays linear: its range is narrow (0..0.15) and a constant rate
+// crosses it in 5s. Convergence spans three orders of magnitude (0.001..25m),
+// where no single linear step works - fine enough to tune around 1m means well
+// over a minute to reach 25m, and fast enough to cross the range means blowing
+// straight through the useful 0.5-3m band. A constant RELATIVE rate fixes both:
+// ~13s end to end, while still moving only ~0.01m per frame at 1m.
+//
+// These were originally chosen to match VRto3D's, but both have since diverged:
+// separation changed units with the clip-space parameterization, and convergence
+// went proportional when its ceiling moved to 25m.
 void VR::handle_flat3d_keybinds() {
     const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
-    const auto adjust_depth = [this](float delta) {
+    // Frame delta without a timer thread: this runs exactly once per frame, so
+    // the wall time since the previous call IS the frame time. Clamped so the
+    // first call, an alt-tab, or a load-hitch cannot jump the value in one step.
+    static auto s_last_tick = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = std::clamp(std::chrono::duration<float>(now - s_last_tick).count(), 0.0f, 0.05f);
+    s_last_tick = now;
+
+    constexpr float kSeparationPerSec = 0.03f; // full 0..0.15 sweep in 5s
+    constexpr float kConvergenceRate = 0.6f;   // e^0.6/s: 0.001..25m in ~17s
+
+    const auto adjust_depth = [&](float dir) {
         auto& v = m_flat3d_separation->value();
-        v = std::clamp(v + delta, 0.0f, 0.15f);
+        v = std::clamp(v + dir * kSeparationPerSec * dt, 0.0f, 0.15f);
     };
-    const auto adjust_conv = [this](float delta) {
+    // Multiplicative, so up and down are exact inverses (e^+k and e^-k) and
+    // holding one then the other returns to where you started.
+    const auto adjust_conv = [&](float dir) {
         auto& v = m_flat3d_convergence->value();
-        v = std::clamp(v + delta, 0.01f, 25.0f);
+        v = std::clamp(v * std::exp(dir * kConvergenceRate * dt), 0.001f, 25.0f);
     };
 
     if (ctrl && (GetAsyncKeyState(VK_F3) & 0x8000)) {
-        adjust_depth(-0.0005f);
+        adjust_depth(-1.0f);
     }
     if (ctrl && (GetAsyncKeyState(VK_F4) & 0x8000)) {
-        adjust_depth(0.0005f);
+        adjust_depth(1.0f);
     }
     if (ctrl && (GetAsyncKeyState(VK_F5) & 0x8000)) {
-        adjust_conv(-0.005f);
+        adjust_conv(-1.0f);
     }
     if (ctrl && (GetAsyncKeyState(VK_F6) & 0x8000)) {
-        adjust_conv(0.005f);
+        adjust_conv(1.0f);
     }
 
     // 3D screenshot: fixed hotkey Ctrl+F12 (also a button in the menu header).
