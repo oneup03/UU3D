@@ -2108,7 +2108,10 @@ private:
     // convention). See Flat3D::separation. 0.05 reproduces the old
     // 0.1m / 1.0m / 90deg default exactly.
     const ModSlider::Ptr m_flat3d_separation{ ModSlider::create(generate_name("Flat3D_Separation"), 0.0f, 0.15f, 0.05f) };
-    const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 5.0f, 1.0f) };
+    // Max matches the Ctrl+F5/F6 hotkey clamp in handle_flat3d_keybinds; they
+    // used to disagree (slider 5m, hotkeys 25m), so the hotkeys could drive
+    // convergence into a range the slider could not display or recover from.
+    const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 25.0f, 1.0f) };
     const ModToggle::Ptr m_flat3d_autoconv_enabled{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
     const ModSlider::Ptr m_flat3d_autoconv_target_disparity{ ModSlider::create(generate_name("Flat3D_AutoConvTargetDisparity"), 0.001f, 0.03f, 0.005f) };
     const ModSlider::Ptr m_flat3d_autoconv_smoothing{ ModSlider::create(generate_name("Flat3D_AutoConvSmoothing"), 0.005f, 0.25f, 0.08f) };
