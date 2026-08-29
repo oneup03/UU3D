@@ -148,13 +148,13 @@ VRRuntime::Error Flat3D::update_render_target_size() {
 
 VRRuntime::Error Flat3D::update_matrices(float nearz, float farz) {
     // Only the eye-to-head transforms live here: pure horizontal translation
-    // of +/- separation/2 (matches the OpenVR eye-to-head sign convention;
+    // of +/- eye_baseline_m/2 (matches the OpenVR eye-to-head sign convention;
     // calculate_stereo_view_offset negates it and applies world scale).
     // projections[] is NOT built here -- the projection hook keeps the game's
     // own matrix and publishes it through set_game_projection().
     std::unique_lock __{ this->eyes_mtx };
 
-    const auto sep = this->separation_m.load();
+    const auto sep = this->eye_baseline_m.load();
 
     // Index 0 = left, 1 = right (matches vr::Eye_Left/Right and true_index).
     this->eyes[0] = glm::identity<Matrix4x4f>();

@@ -797,9 +797,14 @@ std::optional<std::string> VR::initialize_flat3d() {
     m_flat3d->error = std::nullopt;
     m_flat3d->update_render_target_size();
 
-    // Seed the live params from config before the first frame.
-    m_flat3d->separation_m.store(m_flat3d_depth->value());
+    // Seed the live params from config before the first frame. eye_baseline_m
+    // is derived in update_flat3d_params(); seed it consistently here using the
+    // default tangent so eyes[] is never built from a stale value.
+    m_flat3d->separation.store(m_flat3d_separation->value());
     m_flat3d->convergence_m.store(m_flat3d_convergence->value());
+    m_flat3d->eye_baseline_m.store(2.0f * m_flat3d_separation->value()
+                                   * m_flat3d->game_tan_half_h.load()
+                                   * m_flat3d_convergence->value());
 
     m_runtime = m_flat3d;
 
@@ -1466,28 +1471,26 @@ void VR::update_flat3d_params() {
 
     flat3d_apply_screen_percentage();
 
-    // --- FoV auto-scale (always on) -----------------------------------------
-    // Screen disparity is proportional to sep * P00 = sep / tan_half_h, so a
-    // zoom (smaller tan_half) would inflate the 3D effect. Scaling separation
-    // by tan(gameFov/2)/tan(refFov/2) keeps perceived depth constant through
-    // zoom/ADS. EMA smooths hard FoV cuts.
+    // Separation is a clip-space quantity (background disparity as a fraction of
+    // screen width), so it is FoV-independent by construction — there is no
+    // reference FoV to calibrate against and nothing to rescale or smooth when
+    // the game zooms. The old form stored metres and multiplied by
+    // tan_half_game/tan_half_ref here only for the projection hook to divide it
+    // straight back out via P00; that round trip, and the EMA it needed to hide
+    // its own settling, are both gone.
     const auto tan_half_game = flat3d->game_tan_half_h.load();
-    const auto tan_half_ref = std::tan(glm::radians(m_flat3d_reference_fov->value()) * 0.5f);
 
-    float fov_scale = (tan_half_ref > 0.0f && tan_half_game > 0.0f) ? (tan_half_game / tan_half_ref) : 1.0f;
-
-    static float fov_scale_ema = 1.0f;
-    constexpr float kFovEmaAlpha = 0.2f;
-    fov_scale_ema += (fov_scale - fov_scale_ema) * kFovEmaAlpha;
-
-    float separation = m_flat3d_depth->value() * fov_scale_ema;
+    const float separation = m_flat3d_separation->value();
 
     // --- Convergence: manual value is the ceiling; auto-convergence pulls
     // it in toward the nearest object's depth budget when enabled. ----------
     const auto w2m = m_world_to_meters != 0.0f ? m_world_to_meters : 100.0f;
     const auto nearz_m = flat3d->game_nearz.load() / w2m;
-    // perfect_dark-style near clamp: convergence below ~1.5x near plane makes
-    // the shear explode.
+    // Comfort clamp only. (This used to also be a numerical guard: with the old
+    // metres parameterization the shear was sep/2/conv and exploded as
+    // convergence approached zero. It is now just `separation`, so there is no
+    // blow-up left to protect against — but a screen plane inside the near
+    // plane is still not something to hand the user.)
     const float conv_floor_m = std::max(nearz_m * 1.5f, 0.001f);
 
     const float manual_conv = std::max(m_flat3d_convergence->value(), conv_floor_m);
@@ -1499,16 +1502,17 @@ void VR::update_flat3d_params() {
     acs.min_convergence_m = m_flat3d_autoconv_min_conv->value();
     acs.logging = m_flat3d_autoconv_logging->value();
 
-    const float p00 = tan_half_game > 0.0f ? 1.0f / tan_half_game : 1.0f;
-    const auto ac = g_autoconv.update(flat3d->nearest_depth_uu.load(),
-                                      separation * w2m * get_world_scale(), p00,
+    const auto ac = g_autoconv.update(flat3d->nearest_depth_uu.load(), separation,
                                       manual_conv, conv_floor_m, w2m, acs);
 
-    separation *= ac.depth_scale;
     const float convergence = std::max(ac.convergence_m, conv_floor_m);
 
-    flat3d->separation_m.store(separation);
+    flat3d->separation.store(separation);
     flat3d->convergence_m.store(convergence);
+    // Derived: the physical baseline the view path needs so zero parallax lands
+    // at `convergence` given `separation`. Must be stored BEFORE
+    // update_matrices() below, which reads it to build eyes[].
+    flat3d->eye_baseline_m.store(2.0f * separation * tan_half_game * convergence);
 
     // Keep eyes[] in sync with the (possibly rescaled) separation.
     flat3d->update_matrices(m_nearz, m_farz);
@@ -2271,21 +2275,21 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     }
 
     const float w2m = m_world_to_meters != 0.0f ? m_world_to_meters : 100.0f;
-    // Same effective separation the view path applies (w2m x world scale).
-    const float sep_uu = flat3d->separation_m.load() * w2m * get_world_scale();
+    // The same clip-space separation the projection hook shears by.
+    const float separation = flat3d->separation.load();
     const float conv_uu = std::max(flat3d->convergence_m.load() * w2m, 1e-3f);
-    const float tan_half = flat3d->game_tan_half_h.load();
-    const float p00 = tan_half > 0.0f ? 1.0f / tan_half : 1.0f;
 
     // Per-eye pixel displacement of world content at view depth z (matches
     // the shear+translation pair the world rendering uses, so a UI/crosshair
     // layer shifted by this lands at exactly depth z):
-    //   px(z) = dir * (sep_uu * p00 / 2) * (1/z - 1/conv) * eye_w/2
+    //   px(z) = dir * separation * (conv/z - 1) * eye_w/2
     // with dir = +1 for the LEFT eye (negative for z > conv: the left image
-    // moves left -> uncrossed disparity behind the screen).
+    // moves left -> uncrossed disparity behind the screen). At z -> infinity
+    // this is -separation * eye_w/2, i.e. half the background disparity per
+    // eye, which is what `separation` means by definition.
     const auto shift_px_at = [&](float z_uu) {
-        const float inv_z = z_uu > 0.0f ? 1.0f / z_uu : 0.0f; // invalid -> infinity
-        return (sep_uu * p00 * 0.5f) * (inv_z - 1.0f / conv_uu) * ((float)eye_w * 0.5f);
+        const float ratio = z_uu > 0.0f ? (conv_uu / z_uu) : 0.0f; // invalid -> infinity
+        return separation * (ratio - 1.0f) * ((float)eye_w * 0.5f);
     };
 
     // Symmetric-projection compat (the Compatibility page's Horizontal
@@ -2406,7 +2410,7 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     }
 
     p.hud_depth_mode = in_menus ? 0 : m_flat3d_hud_depth_mode->value();
-    p.hud_k_px = (sep_uu * p00 * 0.25f) * (float)eye_w; // px per (1/z - 1/conv)
+    p.hud_k_px = separation * conv_uu * 0.5f * (float)eye_w; // px per (1/z - 1/conv)
     p.hud_inv_conv_uu = 1.0f / conv_uu;
     p.hud_nearz_uu = flat3d->game_nearz.load();
     p.hud_marker_radius = m_flat3d_hud_marker_radius->value();
@@ -2416,7 +2420,7 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     // yaw moves it horizontally, pitch vertically (markers track both).
     if (p.hud_depth_mode == 1) {
         const float tan_half_v = std::max(flat3d->game_tan_half_v.load(), 1e-3f);
-        const float safe_tan_h = std::max(tan_half, 1e-3f);
+        const float safe_tan_h = std::max(flat3d->game_tan_half_h.load(), 1e-3f);
 
         p.hud_flow_du = -flat3d->cam_dyaw.load() / (2.0f * safe_tan_h);
         p.hud_flow_dv = flat3d->cam_dpitch.load() / (2.0f * tan_half_v);
@@ -2514,15 +2518,15 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
 }
 
 // VRto3D-matching hotkeys (always polled while flat3d is active, held-repeat):
-//   Ctrl+F3 / Ctrl+F4  = depth -/+ 0.001 m per frame
+//   Ctrl+F3 / Ctrl+F4  = separation -/+ 0.0005 per frame (screen-width fraction)
 //   Ctrl+F5 / Ctrl+F6  = convergence -/+ 0.005 m per frame
 // The remappable single-key binds are checked as well.
 void VR::handle_flat3d_keybinds() {
     const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
     const auto adjust_depth = [this](float delta) {
-        auto& v = m_flat3d_depth->value();
-        v = std::clamp(v + delta, 0.0f, 0.5f);
+        auto& v = m_flat3d_separation->value();
+        v = std::clamp(v + delta, 0.0f, 0.15f);
     };
     const auto adjust_conv = [this](float delta) {
         auto& v = m_flat3d_convergence->value();
@@ -2530,10 +2534,10 @@ void VR::handle_flat3d_keybinds() {
     };
 
     if (ctrl && (GetAsyncKeyState(VK_F3) & 0x8000)) {
-        adjust_depth(-0.001f);
+        adjust_depth(-0.0005f);
     }
     if (ctrl && (GetAsyncKeyState(VK_F4) & 0x8000)) {
-        adjust_depth(0.001f);
+        adjust_depth(0.0005f);
     }
     if (ctrl && (GetAsyncKeyState(VK_F5) & 0x8000)) {
         adjust_conv(-0.005f);
@@ -2668,6 +2672,10 @@ void VR::on_draw_sidebar_flat3d() {
                           "resolution setting controls the 3D render resolution (upscaled).");
 
     m_flat3d_render_scale->draw("3D Render Resolution");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Scene render resolution, applied via r.ScreenPercentage.\n"
+                          "Auto leaves the game's own value alone.");
+    }
     if (m_flat3d_render_scale->value() != 0) {
         m_flat3d_render_scale_stage->draw("Applied To");
         if (ImGui::IsItemHovered()) {
@@ -2686,12 +2694,18 @@ void VR::on_draw_sidebar_flat3d() {
                           "match what the game renders - use it only if the fixed choices both look wrong.");
     }
     m_flat3d_fov_multiplier->draw("3D FoV Multiplier");
-    if (m_flat3d_fov_multiplier->value() != 1.0f) {
-        ImGui::TextWrapped("Scales the game's FoV. 1.0 = as-is, higher widens.");
-    }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Scene render resolution, applied via r.ScreenPercentage.\n"
-                          "Auto leaves the game's own value alone.");
+        ImGui::SetTooltip("Scales the game's FoV. 1.0 = as-is.\n"
+                          "Applied on top of the live camera FoV, so the game keeps driving\n"
+                          "ADS zoom and cine cameras - this only widens or narrows the result.\n"
+                          "Above 1.0 widens the frustum, which zooms the scene OUT.");
+    }
+
+    if (flat3d != nullptr) {
+        const auto tan_half = flat3d->game_tan_half_h.load();
+        if (tan_half > 0.0f) {
+            ImGui::Text("Live game hFoV: %.1f deg", glm::degrees(2.0f * std::atan(tan_half)));
+        }
     }
 
     if (flat3d != nullptr && flat3d->get_width() != 0) {
@@ -2700,26 +2714,28 @@ void VR::on_draw_sidebar_flat3d() {
 
     ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
     if (ImGui::TreeNode("3D Calibration")) {
-        text_disabled_wrapped("Depth & Convergence are calibrated AT the Reference FoV. "
-                              "Separation auto-scales with the game's live FoV (always on). "
-                              "Hotkeys: Ctrl+F3/F4 depth, Ctrl+F5/F6 convergence.");
-        m_flat3d_depth->draw("Depth");
+        text_disabled_wrapped("Separation is the background 3D strength and holds through "
+                              "zoom/ADS on its own - no reference FoV to calibrate. "
+                              "Hotkeys: Ctrl+F3/F4 separation, Ctrl+F5/F6 convergence.");
+        m_flat3d_separation->draw("Separation");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Background separation as a fraction of screen width.\n"
+                              "Values above roughly your IPD divided by your screen width\n"
+                              "(about 0.10 on a 27in 16:9 monitor) will diverge and cannot\n"
+                              "be fused. Lower it if an autostereo panel shows ghosting.");
+        }
         m_flat3d_convergence->draw("Convergence");
-        m_flat3d_reference_fov->draw("Reference FoV (deg)");
 
         if (flat3d != nullptr) {
-            ImGui::Text("Effective separation: %.4f m  convergence: %.3f m",
-                        flat3d->separation_m.load(), flat3d->convergence_m.load());
-            const auto tan_half = flat3d->game_tan_half_h.load();
-            if (tan_half > 0.0f) {
-                ImGui::Text("Live game hFoV: %.1f deg", glm::degrees(2.0f * std::atan(tan_half)));
-            }
+            // Only convergence is worth reporting: auto-convergence moves it out
+            // from under the slider, so the live value is not knowable from the UI.
+            // Separation is always exactly what the slider says.
+            ImGui::Text("Effective convergence: %.3f m", flat3d->convergence_m.load());
         }
 
         if (ImGui::Button("Reset to Defaults##flat3d_calib")) {
-            m_flat3d_depth->value() = 0.1f;
+            m_flat3d_separation->value() = 0.05f;
             m_flat3d_convergence->value() = 1.0f;
-            m_flat3d_reference_fov->value() = 90.0f;
         }
 
         ImGui::TreePop();

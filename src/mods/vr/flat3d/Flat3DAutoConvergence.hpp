@@ -6,11 +6,14 @@
 // nearest-scene-depth input comes from the compositors' SceneDepthZ readback.
 //
 // Control law: choose convergence so the NEAREST significant object's screen
-// disparity does not exceed target_disparity (fraction of eye width), while
-// separation is scaled by conv/manual_conv so the BACKGROUND disparity stays
-// locked at the user's at-manual calibration. Under that constraint the
-// pop-out is d = (k/manual)*(conv/z - 1) with k = sep_uu*P00/4, giving the
-// closed-form target conv = z * (1 + target*manual/k).
+// disparity does not exceed target_disparity (fraction of eye width). The
+// BACKGROUND disparity needs no protection here — under the clip-space
+// parameterization it is just `separation` and is invariant under convergence
+// by construction, so unlike the old metres-based form this loop no longer has
+// to counter-scale separation to hold it. Pop-out at a given convergence is
+//     d = (separation/2) * (conv/z - 1)
+// giving the closed-form target
+//     conv = z * (1 + 2*target/separation).
 // The manual convergence value is the CEILING; auto only pulls closer, and
 // snaps back to manual on disable — VRto3D manual_depth_ semantics.
 
@@ -28,18 +31,14 @@ public:
 
     struct Output {
         float convergence_m{1.0f};
-        // Separation multiplier that keeps the BACKGROUND disparity locked
-        // at its at-manual-convergence value while the screen plane pulls in
-        // (bg disparity is sep/conv, so scale = conv/manual_conv). 1.0 when
-        // auto-convergence is idle.
-        float depth_scale{1.0f};
     };
 
     // nearest_z_uu: robust nearest scene depth this frame (UE units, < 0 =
-    // no valid sample). sep_uu: effective separation in UE units. p00: game
-    // projection [0][0] (= 1/tan_half_h). manual_conv_m: the user's value
-    // (ceiling). conv_floor_m: near-plane clamp. w2m: world-to-meters.
-    Output update(float nearest_z_uu, float sep_uu, float p00,
+    // no valid sample). separation: the clip-space stereo knob (background
+    // disparity as a fraction of screen width — see Flat3D::separation).
+    // manual_conv_m: the user's value (ceiling). conv_floor_m: near-plane
+    // clamp. w2m: world-to-meters.
+    Output update(float nearest_z_uu, float separation,
                   float manual_conv_m, float conv_floor_m, float w2m,
                   const Settings& s);
 

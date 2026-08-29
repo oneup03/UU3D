@@ -100,11 +100,25 @@ struct Flat3D final : public VRRuntime {
     // --- live stereo parameters -------------------------------------------
     // Written on the game/UI threads, read on the render thread each frame.
     //
-    // separation_m: EFFECTIVE eye separation in meters (user depth x FoV
-    // auto-scale). convergence_m: EFFECTIVE zero-parallax distance in meters
-    // (manual value or auto-convergence output).
-    std::atomic<float> separation_m{0.1f};
+    // separation: THE stereo knob, in clip space (NVIDIA/3Dmigoto convention).
+    // Per-eye NDC x is offset by +/- separation at infinity, and NDC x spans the
+    // full screen width over [-1,+1], so this is directly the total background
+    // disparity as a FRACTION OF SCREEN WIDTH. The comfort ceiling is
+    // IPD / screen_width (~0.105 on a 27in 16:9 panel); beyond it the eyes
+    // diverge and cannot fuse. Being a clip-space quantity it is inherently
+    // FoV-independent - no reference-FoV calibration or rescaling is needed.
+    //
+    // convergence_m: EFFECTIVE zero-parallax distance in meters (manual value
+    // or auto-convergence output).
+    //
+    // eye_baseline_m: DERIVED, not a setting. The physical camera baseline the
+    // view path needs to make zero parallax land at convergence_m given the
+    // separation above:  2 * separation * tan_half_h * convergence_m.  It moves
+    // with both FoV and convergence by design - do not treat it as a constant.
+    // Written by update_flat3d_params(), consumed only by update_matrices().
+    std::atomic<float> separation{0.05f};
     std::atomic<float> convergence_m{1.0f};
+    std::atomic<float> eye_baseline_m{0.1f};
 
     // Live game-camera FoV in degrees, sampled on the game thread via
     // APlayerCameraManager::GetFOVAngle (includes ADS zoom and cine cameras).
