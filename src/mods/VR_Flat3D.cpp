@@ -2431,11 +2431,24 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
 
         // Coarse locomotion signal: lateral camera translation slides world
         // markers across the screen via parallax even with no look-rotation.
-        // Expressed at the convergence depth so its floor matches the rotation
-        // flow's; the shader treats "moved while translating" as world-evidence
-        // rather than modelling the (depth-dependent) parallax vector per pixel.
+        // The shader treats "moved while translating" as world-evidence rather
+        // than modelling the (depth-dependent) parallax vector per pixel.
+        //
+        // Normalised at a fixed ONE METRE reference depth, NOT at the
+        // convergence distance. Convergence is a stereo comfort setting and has
+        // nothing to do with how far away the scene is, but dividing by it made
+        // a further screen plane silently raise the bar for translation
+        // evidence in proportion - at 10m convergence you needed ~1.8 m/s of
+        // lateral movement instead of ~0.18 m/s, so world-anchored icons
+        // stopped being classified as world during ordinary movement and fell
+        // back to flat HUD depth. That was invisible while convergence topped
+        // out at 5m and became obvious once it could reach 25m.
+        //
+        // 1m reproduces the previous behaviour exactly at the default 1m
+        // convergence, so existing HUDTransFloor tuning carries over unchanged.
+        const float ref_z_uu = std::max(w2m, 1.0f);
         const float trans_mag = flat3d->cam_dtrans_lat.load()
-                                / std::max(conv_uu, 1.0f) / (2.0f * safe_tan_h);
+                                / ref_z_uu / (2.0f * safe_tan_h);
         p.hud_translating = trans_mag > m_flat3d_hud_trans_floor->value() && trans_mag < 0.5f;
         p.hud_debug = m_flat3d_hud_debug->value();
         p.hud_icon_radius = m_flat3d_hud_icon_radius->value();
