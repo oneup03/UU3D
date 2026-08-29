@@ -37,8 +37,35 @@ bases depending on which branch produced them.
   headset submission.
 - **L3+R3 now needs a deliberate long press by default**, so an incidental
   stick click no longer opens the menu.
+- **Convergence now goes up to 25m** instead of 5m. The Ctrl+F5/F6 hotkeys
+  already reached 25m, so the slider simply could not show or recover from
+  where they could put you.
+- **The adjust hotkeys are time-based, and convergence moves proportionally.**
+  Ctrl+F3..F6 used to apply a fixed step per rendered frame, so a 144Hz game
+  swept nearly five times faster than a 30fps one. They are now rates per
+  second and behave identically at any framerate. Convergence also scales its
+  step with the current value, which is what makes a 0.001-25m range usable:
+  about 13 seconds end to end while still moving in ~1cm increments down at
+  1m, where you actually tune it.
 
 ### Fixed
+- **World-anchored HUD icons no longer fall back to flat at higher
+  convergence.** Reported in SMT5V: icons held their world depth below 5m
+  convergence and popped back to HUD depth somewhere between 5 and 10. The
+  classifier's "the camera is moving sideways, so world-anchored UI should
+  slide" test was measuring that motion against the convergence distance, so
+  pushing the screen plane out raised the bar in proportion - about 0.18 m/s
+  of sideways movement at 1m, but 1.8 m/s at 10m, which ordinary walking never
+  reaches. It now measures against a fixed reference depth, so convergence has
+  no say in it.
+- **The HUD no longer stops tracking depth for close-up content.** Its depth
+  shift was capped at the same limit in both directions. That limit is right
+  for things behind the screen, where too much separation forces your eyes
+  apart and the image stops fusing, but in front of the screen your eyes turn
+  inward instead and the cap only clipped valid pop-out. Anything nearer than
+  about a third of the convergence distance simply stopped tracking. The
+  in-front limit is now three times larger; the behind-the-screen one is
+  unchanged.
 - **The menu no longer clips at larger font sizes.** The window and its sidebar
   were both sized for the old 16px font, so raising the font size ate the page
   area and cut off the longer sidebar labels. Both now scale with the font, and
