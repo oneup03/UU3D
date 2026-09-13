@@ -39,6 +39,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # carry the embedded-RenderDoc crash fix. Apply it to the builder's own checkout
 # before UESDK is added/compiled. Idempotent; warns (never fails) on drift.
 include(cmake/ApplyUESDKPatch.cmake)
+option(UEVR_BUILD_COMPATIBILITY_TESTS "Build the offline compatibility policy tests" OFF)
+if(UEVR_BUILD_COMPATIBILITY_TESTS)
+    enable_testing()
+endif()
 
 add_subdirectory(dependencies/submodules/UESDK)
 
@@ -65,6 +69,9 @@ else()
     message(STATUS "SR-lib: submodule not checked out (or on a branch without the CMake package); LeiaSR disabled.")
 endif()
 """
+
+[conditions]
+compatibility-policy-tests = "UEVR_BUILD_COMPATIBILITY_TESTS"
 
 [target.spdlog]
 type = "static"
@@ -195,6 +202,47 @@ link-libraries = [
     "kananlib",
     "uesdk"
 ]
+
+[target.compatibility-policy-tests]
+condition = "compatibility-policy-tests"
+type = "executable"
+sources = ["tests/CompatibilityPolicyTests.cpp"]
+include-directories = [
+    "src/",
+    "dependencies/submodules/UESDK/src",
+    "dependencies/submodules/glm",
+]
+compile-features = ["cxx_std_23"]
+link-libraries = ["nlohmann_json"]
+cmake-after = """
+add_test(NAME compatibility-policy-tests COMMAND compatibility-policy-tests)
+add_test(NAME build-metadata-tests COMMAND powershell -NoProfile -NonInteractive
+    -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/BuildMetadataTests.ps1")
+set_tests_properties(build-metadata-tests PROPERTIES TIMEOUT 120)
+"""
+
+[target.diagnostic-safety-tests]
+condition = "compatibility-policy-tests"
+type = "executable"
+sources = ["tests/DiagnosticSafetyTests.cpp", "tests/CadenceReplayTests.cpp", "tests/LoggingDisabledTests.cpp", "tests/CachedCVarReadTests.cpp", "tests/ConsoleTextTests.cpp", "tests/UE58UIInitializationTests.cpp", "dependencies/submodules/UESDK/tests/DiscoveryValidationTests.cpp", "dependencies/submodules/UESDK/tests/LayoutSafetyTests.cpp"]
+include-directories = ["src/", "dependencies/submodules/UESDK/src"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["nlohmann_json", "spdlog", "uesdk", "Version", "imgui"]
+cmake-after = """
+add_test(NAME diagnostic-safety-tests COMMAND diagnostic-safety-tests)
+"""
+
+[target.hifi-hook-memory-tests]
+condition = "compatibility-policy-tests"
+type = "executable"
+sources = ["tests/HiFiRushHookMemoryTests.cpp", "src/utility/HiFiRushHookMemory.cpp"]
+include-directories = ["src/"]
+compile-features = ["cxx_std_23"]
+link-libraries = ["safetyhook", "spdlog", "kananlib"]
+cmake-after = """
+add_test(NAME hifi-hook-memory-tests COMMAND hifi-hook-memory-tests)
+set_tests_properties(hifi-hook-memory-tests PROPERTIES TIMEOUT 60)
+"""
 
 [target.vr-plugin-nullifier]
 type = "shared"

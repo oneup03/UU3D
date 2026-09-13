@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include <sdk/CVar.hpp>
 
 #include "../../Mod.hpp"
+#include "CVarDiagnostics.hpp"
 
 // For UE cvars.
 class CVarManager final : public ModComponent {
@@ -39,6 +41,9 @@ public:
 
     ChangeSnapshot get_change_snapshot() const;
     uint64_t get_change_counter() const;
+    void request_diagnostic_snapshot() { m_diagnostic_snapshot_requested.store(true, std::memory_order_release); }
+    nlohmann::json get_diagnostic_snapshot() const;
+    uint64_t diagnostic_snapshot_revision() const { return m_diagnostic_snapshot_revision.load(std::memory_order_acquire); }
     static void record_global_change(std::wstring_view name, std::wstring_view value, std::string_view source);
     static void record_global_command(std::string_view command, std::string_view source);
 
@@ -86,6 +91,10 @@ public:
         virtual void freeze() = 0;
         virtual void update() = 0;
         virtual void draw_ui() = 0;
+        virtual std::optional<double> read_diagnostic_value() = 0;
+        uevr::cvar_diagnostics::WriteObservation get_write_observation() const;
+        void poll_write_observation(int64_t now_ms);
+        void draw_write_observation() const;
 
         void unfreeze() {
             m_frozen = false;
@@ -118,6 +127,8 @@ public:
         }
 
     protected:
+        uint64_t begin_ui_write(double requested);
+        void finish_ui_write(uint64_t request_id, bool callable);
         void load_internal(const std::string& filename, bool set_defaults);
         void load_from_config_internal(const utility::Config& cfg, bool set_defaults);
         void save_internal(const std::string& filename);
@@ -146,6 +157,8 @@ public:
 
         bool m_frozen{false};
         bool m_ever_frozen{false};
+        mutable std::mutex m_write_observation_mutex{};
+        uevr::cvar_diagnostics::WriteObservation m_write_observation{};
     };
 
     class CVarStandard : public CVar {
@@ -166,10 +179,13 @@ public:
         void freeze() override;
         void update() override;
         void draw_ui() override;
+        std::optional<double> read_diagnostic_value() override;
 
     protected:
         std::wstring m_frozen_value{};
         sdk::IConsoleVariable** m_cvar{nullptr};
+        sdk::IConsoleVariable* m_interface_cvar{nullptr};
+        bool m_interface_fallback_attempted{false};
         bool m_setter_unavailable{false};
     };
 
@@ -190,13 +206,24 @@ public:
         void freeze() override;
         void update() override;
         void draw_ui() override;
+        std::optional<double> read_diagnostic_value() override;
 
     protected:
         std::optional<sdk::ConsoleVariableDataWrapper> m_cvar_data;
+        sdk::IConsoleVariable* m_interface_cvar{nullptr};
+        bool m_interface_fallback_attempted{false};
+        bool m_setter_unavailable{false};
     };
 
 private:
     void refresh_frozen_cvar_state();
+    void process_diagnostics();
+
+    static inline std::atomic_bool s_pending_ui_readbacks{false};
+    std::atomic_bool m_diagnostic_snapshot_requested{false};
+    std::atomic<uint64_t> m_diagnostic_snapshot_revision{0};
+    mutable std::mutex m_diagnostic_snapshot_mutex{};
+    nlohmann::json m_diagnostic_snapshot = {{"sampled", false}};
 
     std::vector<std::shared_ptr<CVar>> m_displayed_cvars{};
     std::vector<std::shared_ptr<CVar>> m_all_cvars{}; // ones the user can manually add to cvars.txt'
@@ -229,6 +256,8 @@ private:
     bool m_cvar_ui_open_this_frame{false};
     bool m_ue51_fsr3_runtime_cvars_done{false};
     int m_ue51_fsr3_runtime_cvar_attempts{0};
+    bool m_stalker2_deepdvc_runtime_cvars_done{false};
+    int m_stalker2_deepdvc_runtime_cvar_attempts{0};
     bool m_aphelion_framegen_runtime_cvars_done{false};
     int m_aphelion_framegen_runtime_cvar_attempts{0};
     bool m_windrose_shadow_runtime_cvars_done{false};
@@ -251,6 +280,8 @@ private:
         std::make_unique<CVarStandard>(L"Renderer", L"r.TemporalAA.Algorithm", CVar::Type::INT, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.TemporalAA.Upsampling", CVar::Type::INT, 0, 1),
         std::make_unique<CVarStandard>(L"Renderer", L"r.PostProcessing.PropagateAlpha", CVar::Type::INT, 0, 2),
+        // Registered in Core; preserve the engine/game default until configured.
+        std::make_unique<CVarStandard>(L"Core", L"r.MaxAnisotropy", CVar::Type::INT, 1, 16),
         std::make_unique<CVarStandard>(L"Renderer", L"r.Upscale.Quality", CVar::Type::INT, 0, 5),
         std::make_unique<CVarStandard>(L"Renderer", L"r.LightCulling.Quality", CVar::Type::INT, 0, 2),
         std::make_unique<CVarStandard>(L"Renderer", L"r.SubsurfaceScattering", CVar::Type::INT, 0, 2),

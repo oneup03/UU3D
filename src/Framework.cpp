@@ -422,6 +422,8 @@ Framework::Framework(HMODULE framework_module)
     }
 
     spdlog::info("Commit hash: {}", UEVR_COMMIT_HASH);
+    spdlog::info("UESDK commit: {} (tracked changes: UEVR={}, UESDK={})",
+        UEVR_UESDK_COMMIT_HASH, UEVR_TRACKED_DIRTY, UEVR_UESDK_TRACKED_DIRTY);
     spdlog::info("Tag: {}", UEVR_TAG);
     spdlog::info("Commits past tag: {}", UEVR_COMMITS_PAST_TAG);
     spdlog::info("Branch: {}", UEVR_BRANCH);

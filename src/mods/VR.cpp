@@ -42,6 +42,7 @@
 #include <sdk/Utility.hpp>
 
 #include <tracy/Tracy.hpp>
+#include "utility/SupportDiagnostics.hpp"
 
 #include "Framework.hpp"
 #include "frameworkConfig.hpp"
@@ -536,10 +537,47 @@ bool is_stalker2_executable_cached() {
     return is_stalker2;
 }
 
+bool is_stalker2_legacy_ue51_runtime_cached() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(utility::get_executable()).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::is_stalker2_legacy_ue51_runtime(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS);
+    }();
+
+    return result;
+}
+
+bool stalker2_native_fix_requires_same_pass_cached() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(utility::get_executable()).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::stalker2_native_fix_requires_same_pass(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS);
+    }();
+
+    return result;
+}
+
 bool is_dune_awakening_executable_cached() {
     static const bool is_dune = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
-        return exe_path && uevr::games::is_dune_awakening_executable_path(*exe_path);
+        return uevr::games::dune_experimental_rendering_enabled &&
+               exe_path && uevr::games::is_dune_awakening_executable_path(*exe_path);
     }();
 
     return is_dune;
@@ -603,7 +641,7 @@ bool should_defer_game_specific_very_late_openxr_wait(const VRRuntime* runtime, 
     }
 
     const auto game_needs_deferred_wait =
-        is_stalker2_executable_cached() ||
+        is_stalker2_legacy_ue51_runtime_cached() ||
         is_dune_awakening_executable_cached();
 
     if (!game_needs_deferred_wait) {
@@ -1584,6 +1622,15 @@ bool is_mixtape_executable() {
     return is_mixtape;
 }
 
+bool is_the_sinking_city_2_executable() {
+    static const bool is_the_sinking_city_2 = []() {
+        const auto module_path = utility::get_module_pathw(utility::get_executable());
+        return module_path.has_value() && uevr::games::is_the_sinking_city_2_executable_path(*module_path);
+    }();
+
+    return is_the_sinking_city_2;
+}
+
 bool is_halo_campaign_evolved_executable() {
     static const bool is_halo = []() {
         const auto module_path = utility::get_module_pathw(utility::get_executable());
@@ -2416,6 +2463,202 @@ MixtapeAuto2DDecision evaluate_mixtape_auto_2d(sdk::UGameEngine* engine) {
     return {};
 }
 
+struct TheSinkingCity2BinkUiDecision {
+    bool active{false};
+    std::string widget{};
+    std::string player{};
+    std::string url{};
+    std::optional<bool> initialized{};
+    std::optional<bool> playing{};
+    std::optional<bool> paused{};
+};
+
+TheSinkingCity2BinkUiDecision evaluate_the_sinking_city_2_bink_ui(sdk::UGameEngine* engine) try {
+    (void)engine;
+
+    static const std::wstring widget_class_name =
+        L"WidgetBlueprintGeneratedClass /Game/Blueprints/UI/Widgets/Cinematics/BinkVideoWidget.BinkVideoWidget_C";
+    static const std::wstring player_class_name = L"Class /Script/BinkMediaPlayer.BinkMediaPlayer";
+    static constexpr std::wstring_view expected_player_name =
+        L"/NarrationFeatures/VideoStarterBinkPlayer.VideoStarterBinkPlayer";
+
+    sdk::UObject* visible_widget{};
+    for (auto* widget : get_live_objects_by_class_name(widget_class_name)) {
+        const auto in_viewport = call_object_bool_function(widget, L"IsInViewport");
+        const auto visible = call_object_bool_function(widget, L"IsVisible");
+        const bool is_visible = visible.has_value() ? *visible : in_viewport.value_or(false);
+
+        if (is_visible) {
+            visible_widget = widget;
+            break;
+        }
+    }
+
+    if (visible_widget == nullptr) {
+        return {};
+    }
+
+    for (auto* player : get_live_objects_by_class_name(player_class_name)) {
+        const auto player_name = player->get_full_name();
+        if (player_name.find(expected_player_name) == std::wstring::npos) {
+            continue;
+        }
+
+        TheSinkingCity2BinkUiDecision decision{};
+        decision.widget = get_log_object_name(visible_widget);
+        decision.player = utility::narrow(player_name);
+        decision.initialized = call_object_bool_function(player, L"IsInitialized");
+        decision.playing = call_object_bool_function(player, L"IsPlaying");
+        decision.paused = call_object_bool_function(player, L"IsPaused");
+
+        const auto url = read_mixtape_bink_url(player);
+        if (url.has_value()) {
+            decision.url = utility::narrow(*url);
+        }
+
+        // Visibility and initialization intentionally keep the layer active
+        // while Bink is paused; IsPlaying alone drops out on pause screens.
+        decision.active = decision.initialized.value_or(false) &&
+                          url.has_value() && contains_case_insensitive(*url, L".bk2");
+        return decision;
+    }
+
+    return {};
+} catch (...) {
+    SPDLOG_WARNING_EVERY_N_SEC(
+        5,
+        "[TheSinkingCity2][BinkUI] Failed closed while validating the movie widget/player");
+    return {};
+}
+
+safetyhook::InlineHook g_the_sinking_city_2_bink_per_frame_info_hook{};
+std::once_flag g_the_sinking_city_2_bink_per_frame_info_hook_once{};
+std::atomic_bool g_the_sinking_city_2_bink_per_frame_info_hook_ready{false};
+
+// UE5.8.2 Bink's overlay path passes this 32-byte packet immediately before
+// drawing to the viewport target. Redirecting this one packet keeps Bink's
+// decode, timing, pause, and aspect-ratio behavior intact while moving the
+// actual draw into UEVR's dedicated UI texture.
+struct TheSinkingCity2BinkPerFrameInfo {
+    void* rhi_command_list{};
+    void* render_target{};
+    int32_t target_kind{};
+    int32_t width{};
+    int32_t height{};
+    int32_t hdr_output{};
+};
+
+static_assert(sizeof(TheSinkingCity2BinkPerFrameInfo) == 0x20);
+static_assert(offsetof(TheSinkingCity2BinkPerFrameInfo, render_target) == 0x8);
+static_assert(offsetof(TheSinkingCity2BinkPerFrameInfo, width) == 0x14);
+
+void the_sinking_city_2_bink_set_per_frame_info(const TheSinkingCity2BinkPerFrameInfo* frame_info) {
+    if (frame_info == nullptr || frame_info->rhi_command_list == nullptr ||
+        frame_info->render_target == nullptr || frame_info->target_kind != 4 ||
+        frame_info->width <= 0 || frame_info->height <= 0)
+    {
+        g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(frame_info);
+        return;
+    }
+
+    auto& vr = VR::get();
+    if (vr == nullptr || !vr->is_the_sinking_city_2_bink_ui_active()) {
+        g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(frame_info);
+        return;
+    }
+
+    auto& fake_stereo_hook = vr->get_fake_stereo_hook();
+    auto* const render_target_manager =
+        fake_stereo_hook != nullptr ? fake_stereo_hook->get_render_target_manager() : nullptr;
+    auto* const dedicated_ui_target =
+        render_target_manager != nullptr ? render_target_manager->get_dedicated_ui_target() : nullptr;
+    const auto dedicated_ui_width =
+        render_target_manager != nullptr ? render_target_manager->get_dedicated_ui_width() : 0;
+    const auto dedicated_ui_height =
+        render_target_manager != nullptr ? render_target_manager->get_dedicated_ui_height() : 0;
+
+    if (dedicated_ui_target == nullptr || dedicated_ui_width == 0 || dedicated_ui_height == 0 ||
+        dedicated_ui_width > 16384 || dedicated_ui_height > 16384 ||
+        frame_info->render_target == dedicated_ui_target)
+    {
+        g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(frame_info);
+        return;
+    }
+
+    auto redirected = *frame_info;
+    redirected.render_target = dedicated_ui_target;
+    redirected.width = static_cast<int32_t>(dedicated_ui_width);
+    redirected.height = static_cast<int32_t>(dedicated_ui_height);
+    redirected.hdr_output = 0;
+
+    SPDLOG_INFO_ONCE(
+        "[TheSinkingCity2][BinkUI] Redirecting the native Bink overlay from the viewport target {:x} "
+        "({}x{}) to the dedicated UI target {:x} ({}x{})",
+        reinterpret_cast<uintptr_t>(frame_info->render_target),
+        frame_info->width,
+        frame_info->height,
+        reinterpret_cast<uintptr_t>(dedicated_ui_target),
+        dedicated_ui_width,
+        dedicated_ui_height);
+    g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(&redirected);
+}
+
+bool ensure_the_sinking_city_2_bink_target_hook() {
+    std::call_once(g_the_sinking_city_2_bink_per_frame_info_hook_once, []() {
+        const auto module = utility::get_executable();
+        const auto module_size = utility::get_module_size(module).value_or(0);
+        const auto module_base = reinterpret_cast<uintptr_t>(module);
+        const auto module_end = module_base + module_size;
+
+        if (module == nullptr || module_size == 0 || module_end < module_base) {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Executable image was unavailable; leaving Bink rendering untouched");
+            return;
+        }
+
+        // BinkPluginSetPerFrameInfo in the shipped UE5.8.0 executable. The
+        // complete two-MOVUPS body is unique and an update fails open if it
+        // changes rather than falling back to an RVA.
+        static constexpr std::string_view pattern =
+            "0F 10 01 0F 11 05 ? ? ? ? 0F 10 49 10 0F 11 0D ? ? ? ? C3";
+        const auto target = utility::scan(module_base, module_size, std::string{pattern});
+
+        if (!target.has_value()) {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Native Bink target signature was not found; leaving Bink rendering untouched");
+            return;
+        }
+
+        const auto next = *target + 1;
+        if (next >= module_end ||
+            utility::scan(next, module_end - next, std::string{pattern}).has_value())
+        {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Native Bink target signature was ambiguous; leaving Bink rendering untouched");
+            return;
+        }
+
+        auto hook = safetyhook::create_inline(
+            reinterpret_cast<void*>(*target),
+            &the_sinking_city_2_bink_set_per_frame_info,
+            safetyhook::InlineHook::StartDisabled);
+        if (!hook) {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Failed to create the native Bink target hook; leaving Bink rendering untouched");
+            return;
+        }
+
+        g_the_sinking_city_2_bink_per_frame_info_hook = std::move(hook);
+        const auto enabled = g_the_sinking_city_2_bink_per_frame_info_hook.enable();
+        if (!enabled.has_value()) {
+            (void)g_the_sinking_city_2_bink_per_frame_info_hook.disable();
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Failed to enable the native Bink target hook; leaving Bink rendering untouched");
+            return;
+        }
+
+        g_the_sinking_city_2_bink_per_frame_info_hook_ready.store(true, std::memory_order_release);
+        SPDLOG_INFO("[TheSinkingCity2][BinkUI] Native Bink dedicated-UI redirect armed at {:x}", *target);
+    });
+
+    return g_the_sinking_city_2_bink_per_frame_info_hook_ready.load(std::memory_order_acquire);
+}
+
 safetyhook::InlineHook g_halo_electra_present_video_frame_hook{};
 safetyhook::InlineHook g_halo_electra_video_flush_hook{};
 safetyhook::InlineHook g_halo_electra_open_hook{};
@@ -2705,14 +2948,15 @@ bool VR::should_ignore_native_stereo_fix_for_avowed_sync() const {
 }
 
 bool VR::should_force_native_stereo_fix_same_pass() const {
-    if (!m_native_stereo_fix->value() || is_using_afr() || !is_stalker2_executable_cached()) {
+    if (!m_native_stereo_fix->value() || is_using_afr() || !stalker2_native_fix_requires_same_pass_cached()) {
         return false;
     }
 
-    // Stalker2's UE5.1 render-target handoff is only stable with the native
-    // stereo fix using the original same-pass path. Letting this flip live can
-    // invalidate active render state and crash during cutscene/gameplay RT work.
-    SPDLOG_INFO_ONCE("[Stalker2][NativeStereoFix] Forcing Same Stereo Pass while Native Stereo Fix is enabled");
+    // Both validated Stalker2 layouts tear down renderer-owned allocations if
+    // Native Fix preserves a synthetic SECONDARY renderer transaction. Keep
+    // the original same-pass handoff for Native Fix only; Native and Synced
+    // rendering remain unchanged.
+    SPDLOG_INFO_ONCE("[Stalker2][NativeStereoFix] Forcing Same Stereo Pass for the validated runtime");
     return true;
 }
 
@@ -4652,6 +4896,65 @@ void VR::record_ui_layer_pose_sample(
     }
 }
 
+nlohmann::json VR::get_support_diagnostics() {
+    auto cvars = m_cvar_manager->get_diagnostic_snapshot();
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    cvars["snapshot_age_ms"] = cvars.contains("sample_steady_ms")
+        ? nlohmann::json(std::max<int64_t>(0, now_ms - cvars["sample_steady_ms"].get<int64_t>())) : nlohmann::json(nullptr);
+    std::optional<double> cap;
+    if (cvars.contains("values") && cvars["values"].contains("t.MaxFPS") && cvars["values"]["t.MaxFPS"].is_number()) {
+        cap = cvars["values"]["t.MaxFPS"].get<double>();
+    }
+
+    int64_t display_period{};
+    nlohmann::json xr{{"sampled", false}};
+    {
+        // Export must neither race runtime replacement nor wait for render callbacks.
+        std::unique_lock lifetime{m_openvr_mtx, std::try_to_lock};
+        if (!lifetime.owns_lock()) {
+            xr["unavailable_reason"] = "Runtime busy; refresh later";
+        } else if (m_runtime == nullptr || !m_runtime->is_openxr() || m_openxr == nullptr) {
+            xr["unavailable_reason"] = "OpenXR is not the active runtime";
+        } else {
+            const auto& runtime = m_openxr;
+            std::unique_lock events{runtime->event_mtx, std::try_to_lock};
+            std::unique_lock assignment{runtime->sync_assignment_mtx, std::try_to_lock};
+            if (events.owns_lock() && assignment.owns_lock()) {
+                display_period = runtime->frame_state.predictedDisplayPeriod;
+                xr = {{"sampled", true}, {"internal_frame", runtime->internal_frame_count},
+                    {"internal_render_frame", runtime->internal_render_frame_count},
+                    {"pose_age_ms", runtime->get_pose_update_age_ms()},
+                    {"session_state", static_cast<int>(runtime->session_state)}};
+            } else {
+                xr["unavailable_reason"] = "XR state busy; refresh later";
+            }
+        }
+    }
+    const auto ui = get_ui_layer_pose_telemetry_snapshot();
+    nlohmann::json result{
+        {"read_only", true}, {"cvars", std::move(cvars)}, {"openxr", std::move(xr)},
+        {"pacing", utility::support::pacing(display_period, cap)},
+        {"ui_pose_telemetry", {{"sample_count", ui.sample_count},
+            {"last_pose_age_ms", ui.last_pose_age_ms}, {"last_image_age_frames", ui.last_ui_image_age_frames},
+            {"note", "Ages belong to the last telemetry sample, not necessarily this export; zero samples means unavailable."}}},
+        {"native_fix_same_pass", is_native_stereo_fix_same_pass_enabled()},
+        {"native_fix_preserve_secondary_pass", is_native_stereo_fix_preserve_secondary_pass_enabled()},
+    };
+    if (m_fake_stereo_hook != nullptr) {
+        if (const auto rtm = m_fake_stereo_hook->get_render_target_manager(); rtm != nullptr) {
+            const auto capture = rtm->get_scene_capture_target_snapshot();
+            result["native_capture"] = {{"published", capture != nullptr}, {"current_generation", rtm->get_scene_capture_generation()}};
+            if (capture) {
+                result["native_capture"]["published_generation"] = capture->generation;
+                result["native_capture"]["width"] = capture->width;
+                result["native_capture"]["height"] = capture->height;
+            }
+        }
+    }
+    return result;
+}
+
 void VR::record_hitch_snapshot_sample(std::chrono::steady_clock::time_point now) {
     auto& sample = m_hitch_snapshot_samples[m_hitch_snapshot_cursor];
     sample = {};
@@ -4923,7 +5226,7 @@ void VR::dump_hitch_snapshot(std::chrono::steady_clock::duration tick_gap, const
 
 void VR::note_stalker2_transition_stress(const char* reason) {
     if (!m_is_d3d12 || m_openxr == nullptr || get_runtime() == nullptr ||
-        !get_runtime()->is_openxr() || !is_stalker2_executable_cached() ||
+        !get_runtime()->is_openxr() || !is_stalker2_legacy_ue51_runtime_cached() ||
         !m_openxr->got_first_valid_poses)
     {
         return;
@@ -4962,7 +5265,7 @@ void VR::note_stalker2_transition_stress(const char* reason) {
 
 bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
     if (!m_is_d3d12 || m_openxr == nullptr || get_runtime() == nullptr ||
-        !get_runtime()->is_openxr() || !is_stalker2_executable_cached() ||
+        !get_runtime()->is_openxr() || !is_stalker2_legacy_ue51_runtime_cached() ||
         !m_openxr->can_run_frame_loop() || !m_openxr->got_first_valid_poses)
     {
         return false;
@@ -5176,6 +5479,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     update_shf_auto_2d_mode(engine);
     update_dispatch_auto_2d_mode(engine);
     update_mixtape_auto_2d_mode(engine);
+    update_the_sinking_city_2_bink_ui_state(engine);
     update_halo_electra_cinematic_state(engine);
     update_windrose_meta_ui_auto_2d_mode();
 
@@ -6240,6 +6544,42 @@ void VR::update_mixtape_auto_2d_mode(sdk::UGameEngine* engine) {
     if (m_mixtape_auto_2d_active.exchange(false, std::memory_order_relaxed)) {
         m_2d_screen_mode->value() = m_mixtape_auto_2d_previous_mode;
         spdlog::info("[Mixtape][Auto2D] active=false restored={}", m_mixtape_auto_2d_previous_mode);
+    }
+}
+
+void VR::update_the_sinking_city_2_bink_ui_state(sdk::UGameEngine* engine) {
+    if (!is_the_sinking_city_2_executable()) {
+        return;
+    }
+
+    (void)ensure_the_sinking_city_2_bink_target_hook();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_the_sinking_city_2_bink_ui_last_sample.time_since_epoch().count() != 0 &&
+        now - m_the_sinking_city_2_bink_ui_last_sample < std::chrono::milliseconds(250))
+    {
+        return;
+    }
+
+    m_the_sinking_city_2_bink_ui_last_sample = now;
+    const auto decision = evaluate_the_sinking_city_2_bink_ui(engine);
+    const bool was_active = m_the_sinking_city_2_bink_ui_active.exchange(decision.active, std::memory_order_acq_rel);
+
+    if (was_active == decision.active) {
+        return;
+    }
+
+    if (decision.active) {
+        spdlog::info(
+            "[TheSinkingCity2][BinkUI] active=true widget={} player={} url={} initialized={} playing={} paused={}",
+            decision.widget.empty() ? "unresolved" : decision.widget,
+            decision.player.empty() ? "unresolved" : decision.player,
+            decision.url.empty() ? "unresolved" : decision.url,
+            decision.initialized.has_value() ? (*decision.initialized ? "true" : "false") : "unresolved",
+            decision.playing.has_value() ? (*decision.playing ? "true" : "false") : "unresolved",
+            decision.paused.has_value() ? (*decision.paused ? "true" : "false") : "unresolved");
+    } else {
+        spdlog::info("[TheSinkingCity2][BinkUI] active=false; native overlay routing is idle");
     }
 }
 
@@ -9235,7 +9575,11 @@ void VR::on_post_present() {
 
     const auto is_same_frame = m_render_frame_count > 0 && m_render_frame_count == m_frame_count;
 
-    m_render_frame_count = m_frame_count;
+    const auto completed_present_frame = m_frame_count;
+    m_render_frame_count = completed_present_frame;
+    if (m_fake_stereo_hook != nullptr) {
+        m_fake_stereo_hook->observe_native_frame_present(completed_present_frame);
+    }
 
     auto runtime = get_runtime();
 

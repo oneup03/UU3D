@@ -63,6 +63,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # carry the embedded-RenderDoc crash fix. Apply it to the builder's own checkout
 # before UESDK is added/compiled. Idempotent; warns (never fails) on drift.
 include(cmake/ApplyUESDKPatch.cmake)
+option(UEVR_BUILD_COMPATIBILITY_TESTS "Build the offline compatibility policy tests" OFF)
+if(UEVR_BUILD_COMPATIBILITY_TESTS)
+    enable_testing()
+endif()
 
 add_subdirectory(dependencies/submodules/UESDK)
 
@@ -512,6 +516,162 @@ target_link_libraries(sdk-test PUBLIC
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target compatibility-policy-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET compatibility-policy-tests)
+	set(compatibility-policy-tests_SOURCES "")
+
+	list(APPEND compatibility-policy-tests_SOURCES
+		"tests/CompatibilityPolicyTests.cpp"
+	)
+
+	list(APPEND compatibility-policy-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${compatibility-policy-tests_SOURCES})
+	add_executable(compatibility-policy-tests)
+
+	if(compatibility-policy-tests_SOURCES)
+		target_sources(compatibility-policy-tests PRIVATE ${compatibility-policy-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT compatibility-policy-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${compatibility-policy-tests_SOURCES})
+
+	target_compile_features(compatibility-policy-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(compatibility-policy-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+		"dependencies/submodules/glm"
+	)
+
+	target_link_libraries(compatibility-policy-tests PRIVATE
+		nlohmann_json
+	)
+
+	add_test(NAME compatibility-policy-tests COMMAND compatibility-policy-tests)
+	add_test(NAME build-metadata-tests COMMAND powershell -NoProfile -NonInteractive
+	    -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/BuildMetadataTests.ps1")
+	set_tests_properties(build-metadata-tests PROPERTIES TIMEOUT 120)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target diagnostic-safety-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET diagnostic-safety-tests)
+	set(diagnostic-safety-tests_SOURCES "")
+
+	list(APPEND diagnostic-safety-tests_SOURCES
+		"tests/DiagnosticSafetyTests.cpp"
+		"tests/CadenceReplayTests.cpp"
+		"tests/LoggingDisabledTests.cpp"
+		"tests/CachedCVarReadTests.cpp"
+		"tests/ConsoleTextTests.cpp"
+		"tests/UE58UIInitializationTests.cpp"
+		"dependencies/submodules/UESDK/tests/DiscoveryValidationTests.cpp"
+		"dependencies/submodules/UESDK/tests/LayoutSafetyTests.cpp"
+	)
+
+	list(APPEND diagnostic-safety-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${diagnostic-safety-tests_SOURCES})
+	add_executable(diagnostic-safety-tests)
+
+	if(diagnostic-safety-tests_SOURCES)
+		target_sources(diagnostic-safety-tests PRIVATE ${diagnostic-safety-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT diagnostic-safety-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${diagnostic-safety-tests_SOURCES})
+
+	target_compile_features(diagnostic-safety-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(diagnostic-safety-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+	)
+
+	target_link_libraries(diagnostic-safety-tests PRIVATE
+		nlohmann_json
+		spdlog
+		uesdk
+		Version
+		imgui
+	)
+
+	add_test(NAME diagnostic-safety-tests COMMAND diagnostic-safety-tests)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target hifi-hook-memory-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET hifi-hook-memory-tests)
+	set(hifi-hook-memory-tests_SOURCES "")
+
+	list(APPEND hifi-hook-memory-tests_SOURCES
+		"tests/HiFiRushHookMemoryTests.cpp"
+		"src/utility/HiFiRushHookMemory.cpp"
+	)
+
+	list(APPEND hifi-hook-memory-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${hifi-hook-memory-tests_SOURCES})
+	add_executable(hifi-hook-memory-tests)
+
+	if(hifi-hook-memory-tests_SOURCES)
+		target_sources(hifi-hook-memory-tests PRIVATE ${hifi-hook-memory-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT hifi-hook-memory-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${hifi-hook-memory-tests_SOURCES})
+
+	target_compile_features(hifi-hook-memory-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(hifi-hook-memory-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(hifi-hook-memory-tests PRIVATE
+		safetyhook
+		spdlog
+		kananlib
+	)
+
+	add_test(NAME hifi-hook-memory-tests COMMAND hifi-hook-memory-tests)
+	set_tests_properties(hifi-hook-memory-tests PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
 # Target vr-plugin-nullifier
 set(CMKR_TARGET vr-plugin-nullifier)
 set(vr-plugin-nullifier_SOURCES "")
@@ -834,6 +994,8 @@ list(APPEND uevr_SOURCES
 	"src/uevr-imgui/imgui_impl_dx11.cpp"
 	"src/uevr-imgui/imgui_impl_dx12.cpp"
 	"src/uevr-imgui/imgui_impl_win32.cpp"
+	"src/utility/BuildIdentity.cpp"
+	"src/utility/HiFiRushHookMemory.cpp"
 	"src/utility/ImGui.cpp"
 	"src/DumperMode.hpp"
 	"src/ExceptionHandler.hpp"
@@ -864,15 +1026,26 @@ list(APPEND uevr_SOURCES
 	"src/mods/pluginloader/FUObjectArrayFunctions.hpp"
 	"src/mods/pluginloader/UScriptStructFunctions.hpp"
 	"src/mods/uobjecthook/SDKDumper.hpp"
+	"src/mods/vr/BodycamTextureLayout.hpp"
+	"src/mods/vr/Borderlands4Slate.hpp"
+	"src/mods/vr/CVarDiagnostics.hpp"
 	"src/mods/vr/CVarManager.hpp"
+	"src/mods/vr/CompatibilityPolicy.hpp"
 	"src/mods/vr/D3D11Component.hpp"
 	"src/mods/vr/D3D12Component.hpp"
 	"src/mods/vr/FFakeStereoRenderingHook.hpp"
 	"src/mods/vr/GameDepthCapture.hpp"
+	"src/mods/vr/HiFiRushRendererEntry.hpp"
 	"src/mods/vr/IXRTrackingSystemHook.hpp"
+	"src/mods/vr/NativeFrameDiagnostics.hpp"
+	"src/mods/vr/NativeFrameDiagnosticsJson.hpp"
 	"src/mods/vr/OverlayComponent.hpp"
 	"src/mods/vr/RenderTargetPoolHook.hpp"
+	"src/mods/vr/SWZeroCompanyBinary.hpp"
+	"src/mods/vr/StellarBladeRendererEntry.hpp"
 	"src/mods/vr/UE57SlateSymbols.hpp"
+	"src/mods/vr/UE58OwnedUITexture.hpp"
+	"src/mods/vr/UE58UIInitialization.hpp"
 	"src/mods/vr/UpscaleHelper.hpp"
 	"src/mods/vr/d3d12/ComPtr.hpp"
 	"src/mods/vr/d3d12/CommandContext.hpp"
@@ -903,8 +1076,12 @@ list(APPEND uevr_SOURCES
 	"src/render/ShaderOverrideRegistry.hpp"
 	"src/uevr-imgui/font_robotomedium.hpp"
 	"src/uevr-imgui/uevr_imconfig.hpp"
+	"src/utility/BuildIdentity.hpp"
+	"src/utility/HiFiRushHookMemory.hpp"
 	"src/utility/ImGui.hpp"
 	"src/utility/Logging.hpp"
+	"src/utility/ProtectedHookTrampoline.hpp"
+	"src/utility/SupportDiagnostics.hpp"
 	"src/mods/vr/flat3d/Flat3DDisplayUtils.h"
 	"src/uevr-imgui/imgui_impl_dx11.h"
 	"src/uevr-imgui/imgui_impl_dx12.h"

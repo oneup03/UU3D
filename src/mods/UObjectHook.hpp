@@ -85,6 +85,9 @@ public:
         bool require_array_member = true,
         bool run_creation_jobs = true);
 
+    bool exists_or_track_plugin_object(sdk::UObjectBase* object);
+    void track_plugin_created_component(sdk::UActorComponent* component);
+
 protected:
     std::string_view get_name() const override { return "UObjectHook"; };
     bool is_advanced_mod() const override { return true; }
@@ -156,22 +159,16 @@ public:
         // In-memory state
         sdk::AActor* adjustment_visualizer{nullptr};
         bool adjusting{false};
+
+        // Stalker 2 can miss UObject destruction notifications in lazy mode.
+        // Preserve the FUObjectArray identity so a recycled pointer is never
+        // treated as the component that was originally attached.
+        int32_t component_internal_index{-1};
+        int32_t component_serial_number{-1};
+        bool component_identity_valid{false};
     };
 
-    std::shared_ptr<MotionControllerState> get_or_add_motion_controller_state(sdk::USceneComponent* component) {
-        {
-            std::shared_lock _{m_mutex};
-            if (auto it = m_motion_controller_attached_components.find(component); it != m_motion_controller_attached_components.end()) {
-                return it->second;
-            }
-        }
-
-        std::unique_lock _{m_mutex};
-        auto result = std::make_shared<MotionControllerState>();
-        return m_motion_controller_attached_components[component] = result;
-
-        return result;
-    }
+    std::shared_ptr<MotionControllerState> get_or_add_motion_controller_state(sdk::USceneComponent* component);
 
     std::optional<std::shared_ptr<MotionControllerState>> get_motion_controller_state(sdk::USceneComponent* component) {
         std::shared_lock _{m_mutex};
@@ -345,6 +342,7 @@ private:
         std::atomic<uint64_t> persistent_path_skips{};
         std::atomic<uint64_t> persistent_budget_skips{};
         std::atomic<uint64_t> class_browser_suppressed{};
+        std::atomic<uint64_t> stale_attachment_prunes{};
     } m_stalker2_lazy_stats{};
 
     std::unordered_map<sdk::UObjectBase*, DestroyedObjectTombstone> m_destroyed_object_tombstones{};
