@@ -4115,7 +4115,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 };
                 const auto right_bounds = vr::VRTextureBounds_t{runtime->view_bounds[1][0], runtime->view_bounds[1][2],
                                                                 runtime->view_bounds[1][1], runtime->view_bounds[1][3]};
+                record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 1);
                 auto e = vr::VRCompositor()->Submit(vr::Eye_Right, &right_eye, &right_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+                record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 1);
                 runtime->frame_synced = false;
 
                 if (e != vr::VRCompositorError_None) {

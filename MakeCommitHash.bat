@@ -22,7 +22,13 @@ SET UEVR_TAG=
 FOR /F "tokens=*" %%t IN ('git describe --tags --always --abbrev^=0') DO (SET UEVR_TAG=%%t)
 IF "%UEVR_TAG%"=="" (SET UEVR_TAG=no_tag)
 
-FOR /F "tokens=*" %%c IN ('git describe --tags --always --long') DO (SET UEVR_TAG_LONG=%%c)
+REM Preserve the base-tag API value, or a short commit hash when no tag exists.
+SET UEVR_TAG_LONG=
+FOR /F "tokens=*" %%t IN ('git describe --tags --abbrev^=0 2^>nul') DO (SET UEVR_TAG_LONG=%%t)
+IF "%UEVR_TAG_LONG%"=="" (
+FOR /F "tokens=*" %%g IN ('git rev-parse --short HEAD 2^>nul') DO (SET UEVR_TAG_LONG=%%g)
+)
+IF "%UEVR_TAG_LONG%"=="" (SET UEVR_TAG_LONG=no_tag)
 
 REM Count commits since the tag directly; the old dash-split broke on tags that
 REM themselves contain dashes (e.g. nightly-00008-<sha>), which yielded a

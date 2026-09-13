@@ -309,7 +309,10 @@ int test_native_frame_adapters() {
                 ++pos; ++submits;
             }
         }
-        expect(copies == (std::string(backend) == "D3D11" ? 2 : 3) && submits == (std::string(backend) == "D3D11" ? 4 : 5),
+        // D3D12 carries one submit site upstream does not: the AFW (Alternate
+        // FrameWarp) OpenVR right-eye submit, which pairs with the warped
+        // second eye rather than a second engine render.
+        expect(copies == (std::string(backend) == "D3D11" ? 2 : 3) && submits == (std::string(backend) == "D3D11" ? 4 : 6),
             "expected backend copy/submit coverage (update fixture for new paths)");
         if (std::string(backend) == "D3D11") {
             const auto copy = code.find("bool D3D11Component::OpenXR::copy(");
