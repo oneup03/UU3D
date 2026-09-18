@@ -194,6 +194,12 @@ private:
     bool m_have_depth_srv{false};
     float m_hud_depth_uscale{1.0f};
     int32_t m_hud_mode_effective{0};
+    // Which eye the bound scene-depth buffer belongs to, in the COMPOSITOR's
+    // per-eye convention (+1 = left). Shared by every consumer that samples it
+    // (aim readback, geometry cursor, HUD tile-depth pre-pass) so they cannot
+    // disagree. NOT the same as the drawing eye's dir - the overlay pass runs
+    // once per eye against this single buffer.
+    float m_depth_sampled_dir{1.0f};
 
     // HUD world/static classification: tiny R8 mask ping-pong + a copy of
     // last frame's UI texture (see g_flat3d_hudclass_hlsl).
@@ -227,6 +233,10 @@ private:
     static constexpr uint32_t kStripeRows = 2;
     ComPtr<ID3D12Resource> m_depth_readback[kRing]{};
     bool m_depth_copied[kRing]{};
+    // Stereo state each slot's stripes were captured under - the readback is
+    // ~kRing frames old, so the live convergence is the wrong one to correct
+    // the sample position with.
+    Flat3DDepthAim m_depth_aim[kRing]{};
     DXGI_FORMAT m_depth_format{DXGI_FORMAT_UNKNOWN};
     uint32_t m_depth_roi_w{0};
     uint32_t m_depth_row_pitch{0};

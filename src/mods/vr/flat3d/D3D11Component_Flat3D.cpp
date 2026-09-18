@@ -270,7 +270,7 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
             float center_uu = -1.0f;
             float nearest_uu = -1.0f;
             m_flat3d_compositor.sample_depth(context.Get(), scene_depth.Get(),
-                                             vr->get_flat3d_runtime()->game_nearz.load(),
+                                             vr->get_flat3d_runtime()->game_nearz.load(), params,
                                              &center_uu, &nearest_uu);
 
             auto* flat3d = vr->get_flat3d_runtime();

@@ -48,9 +48,15 @@ public:
         m_frames = 0;
         m_z_hist_n = 0;
         m_z_hist_i = 0;
+        m_approach_frames = 0;
     }
 
 private:
+    // Median of the n most recently pushed raw samples (newest first, walking
+    // m_z_hist backwards from the write cursor). Used by the camera-cut snap,
+    // which must not wait for the full-length median to cross a step.
+    float median_of_recent(int n) const;
+
     float m_z_ema_uu{-1.0f}; // asymmetric EMA of the median-filtered nearest depth
     float m_inv_conv{-1.0f}; // smoothed output in 1/convergence space (< 0 = uninitialized)
     unsigned m_frames{0};
@@ -62,6 +68,11 @@ private:
     float m_z_hist[kZHist]{};
     int m_z_hist_n{0};
     int m_z_hist_i{0};
+
+    // Consecutive frames the RAW sample has sat past the camera-cut approach
+    // ratio. A near statistic sensitive enough to be useful legitimately halves
+    // when an object enters one sample patch, so one frame is not a cut.
+    int m_approach_frames{0};
 };
 
 } // namespace vrmod::flat3d

@@ -622,6 +622,13 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
                 }
             }
         }
+
+        // Which eye the bound buffer is, for the shader-side lateral
+        // correction. Refreshed EVERY frame, not just when the SRV is
+        // recreated: under AFR the engine alternates eyes while handing back
+        // the same pooled depth texture, so a value latched at creation time
+        // would be right on half the frames and inverted on the other half.
+        m_depth_sampled_dir = sampled_eye_dir(params, m_hud_depth_uscale < 1.0f);
     }
 
     // HUD anchor constants (b1) — refreshed every frame (empty when off).
@@ -1000,6 +1007,15 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
             dc.aspect_xy = m_eye_w > 0 ? (float)m_eye_h / (float)m_eye_w : 0.5625f;
             dc.ui_crop_x = params.ui_crop_x;
             dc.ui_crop_y = params.ui_crop_y;
+            // Lateral eye-offset correction for the PER-EYE depth buffer. This
+            // pre-pass runs ONCE (not per eye), so the only direction in play is
+            // the sampled buffer's - fold it straight into the coefficient.
+            const float aim_uv_scale = m_eye_w > 0
+                ? m_depth_sampled_dir / (float)m_eye_w / std::max(params.scene_scale, 1e-3f)
+                : 0.0f;
+            dc.hud_aim_k_uv = params.hud_k_px * aim_uv_scale;
+            dc.hud_aim_bias_uv = params.scene_shift_px * aim_uv_scale;
+            dc.hud_inv_conv_uu = params.hud_inv_conv_uu;
 
             context->IASetInputLayout(nullptr);
             context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1365,7 +1381,8 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
             oc.dot_radius_px = (layer == 4) ? params.cursor_size_px : params.crosshair_size_px;
             oc.eye_width_px = (float)m_eye_w;
             oc.eye_height_px = (float)m_eye_h;
-            // Low 4 bits = mode; bits 4..7 = x-dilation tiles, bits 8..11 = y.
+            // Low 4 bits = mode; bits 4..7 = x-dilation tiles, bits 8..11 = y,
+            // bit 12 = the SAMPLED eye (set = right).
             // The dilation is authored as a fraction of screen WIDTH; convert to
             // MASK TILES per axis (grid 64x36) AND fold in the central UI crop so
             // the neighbourhood keeps a fixed on-screen shape: x needs *crop_x
@@ -1375,7 +1392,17 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
                 (int32_t)std::lround(params.hud_icon_radius * 64.0f * params.ui_crop_x), 1, 8);
             const int32_t tiles_y = std::clamp(
                 (int32_t)std::lround(params.hud_icon_radius * 36.0f * params.ui_crop_y), 1, 15);
-            oc.hud_mode = base_mode | (tiles_x << 4) | (tiles_y << 8);
+            // Which eye the bound scene_depth belongs to. Packed rather than
+            // given its own float because the block is full and 28 dwords is a
+            // 16-byte multiple this cbuffer's ByteWidth depends on. This is NOT
+            // `dir`: that is the eye being DRAWN, and the overlay pass runs once
+            // per eye against this one buffer.
+            // Bit 12 = sampled eye, bit 13 = the eye being DRAWN (which is what
+            // hud_k_px/hud_bias_px are signed for). AimShiftUV needs both to
+            // re-sign those constants onto the buffer it is actually reading.
+            const int32_t aim_bit = (m_depth_sampled_dir < 0.0f ? (1 << 12) : 0)
+                                  | (dir < 0.0f ? (1 << 13) : 0);
+            oc.hud_mode = base_mode | (tiles_x << 4) | (tiles_y << 8) | aim_bit;
             // Vertical stem reach (depth-adaptive only): signed extra dilation
             // tiles (>0 down, <0 up), capped so the loop stays bounded.
             oc.hud_stem_reach = (layer == 0 && hud_mode == 1)
@@ -1430,12 +1457,15 @@ void Flat3DCompositorD3D11::draw_overlays(ID3D11DeviceContext* context, ID3D11Sh
     context->PSSetShaderResources(0, 5, null_srvs);
 }
 
-// Non-blocking SceneDepthZ readback: copies a few thin ROI stripes of the
-// LEFT-eye half into a staging ring, maps the oldest entry with DO_NOT_WAIT,
-// and derives the aim-point depth (median around center) and the nearest
-// significant depth (~2nd percentile, rejects specks). Values in UE units.
+// Non-blocking SceneDepthZ readback: copies a few thin ROI stripes of one eye's
+// half into a staging ring, maps the oldest entry with DO_NOT_WAIT, and derives
+// the aim-point depth (nearest around the eye-corrected aim column) and the
+// nearest significant depth (~2nd percentile, rejects specks). Values in UE
+// units. params supplies the per-capture stereo snapshot the aim correction
+// needs - see Flat3DDepthAim.
 void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Texture2D* scene_depth,
-                                         float nearz_uu, float* out_center_uu, float* out_nearest_uu) {
+                                         float nearz_uu, const Flat3DFrameParams& params,
+                                         float* out_center_uu, float* out_nearest_uu) {
     if (out_center_uu != nullptr) *out_center_uu = m_center_ema_uu;
     if (out_nearest_uu != nullptr) *out_nearest_uu = -1.0f;
 
@@ -1512,6 +1542,19 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     const auto write_slot = m_depth_frame % kDepthRing;
     auto* dst = m_depth_staging[write_slot].Get();
 
+    // Record the stereo state THIS capture is taken under, so the readback (a
+    // few frames later, possibly at a different convergence) corrects the
+    // sample column with the right numbers. hud_k_px is in OUTPUT eye pixels;
+    // rescale it to depth-buffer texels.
+    const float aim_px_scale = m_eye_w > 0
+        ? (float)eye_w / (float)m_eye_w / std::max(params.scene_scale, 1e-3f)
+        : 0.0f;
+    m_depth_aim[write_slot].k_px = params.hud_k_px * aim_px_scale;
+    m_depth_aim[write_slot].bias_px = params.scene_shift_px * aim_px_scale;
+    m_depth_aim[write_slot].inv_conv_uu = params.hud_inv_conv_uu;
+    m_depth_aim[write_slot].eye_w = (float)eye_w;
+    m_depth_aim[write_slot].dir = sampled_eye_dir(params, sd_desc.Width >= m_eye_w * 2);
+
     for (uint32_t s = 0; s < kDepthStripes; ++s) {
         const float frac = ((float)s + 0.5f) / (float)kDepthStripes; // evenly spread stripe centers
         uint32_t y = roi_y0 + (uint32_t)((roi_y1 - roi_y0 - kStripeRows) * frac);
@@ -1572,14 +1615,33 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
 
     const uint32_t center_stripe = kDepthStripes / 2; // frac 0.5 stripe
     const uint32_t center_x = roi_w / 2;
-    // Aim-window half-width. Wide enough to span the stereo parallax band: we
-    // read the LEFT-eye half, but a near object under the FUSED reticle sits at
-    // eye-center only at the convergence depth — nearer geometry has crossed
-    // disparity and shifts sideways in the left eye, so a center-only sample
-    // reads the background behind it (the reticle only "pops" onto it when the
-    // player aims off-center by the parallax). Sampling out to ~6% of the ROI
-    // and taking the nearest catches the object wherever its disparity puts it.
-    const uint32_t kAimHalfW = std::max<uint32_t>(12u, roi_w / 16);
+
+    // Aim column, corrected for the lateral bias of reading a PER-EYE depth
+    // buffer. A near object under the FUSED reticle does NOT sit at eye-center
+    // in this buffer: only content at the convergence depth does, and anything
+    // nearer or further is displaced by its own disparity. Sampling the center
+    // column therefore reads past the target, worst at distance, and
+    // ASYMMETRICALLY - which is why the target used to be picked up earlier
+    // from one side than the other.
+    //
+    // The previous code compensated by widening this window to ~6% of the ROI
+    // and taking the nearest thing in it. That caught the target but could not
+    // tell it apart from any other near surface in the band, since it threw
+    // away the one thing that is known exactly: the DIRECTION and size of the
+    // displacement. Correct the position instead, then the window can be narrow.
+    //
+    // The correction needs the depth it is measuring, so it uses the previous
+    // frame's value; it settles in a frame or two and the result is EMA-smoothed
+    // anyway. Before the first valid sample offset_px() returns 0 and the window
+    // is simply centered.
+    const auto& aim = m_depth_aim[read_slot];
+    const float aim_x = std::clamp((float)center_x + aim.offset_px(m_center_ema_uu),
+                                   0.0f, (float)(roi_w - 1));
+
+    // Narrow, now that the window is aimed at the right column: wide enough to
+    // absorb a frame of EMA lag and to hit a thin target, not wide enough to
+    // latch onto a near object the reticle is not on.
+    const uint32_t kAimHalfW = std::max<uint32_t>(6u, (uint32_t)(aim.eye_w * 0.015f));
     // Central sub-region (mid ~40% of the ROI both axes): the aim target sits
     // here even though it is rarely the frame's global nearest object.
     const uint32_t cregion_x0 = (uint32_t)(roi_w * 0.30f);
@@ -1620,14 +1682,13 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     }
 
     // Dense aim-point sweep: full-resolution (every texel) scan of the reticle's
-    // rows over the parallax-band window (see kAimHalfW). Sampling every texel
-    // guarantees a thin/small target is hit, and the wide span covers the
-    // crossed-disparity offset of a near object in the left-eye half so the
-    // reticle stops reading the background behind it. Kept scene depth only
+    // rows around the eye-corrected aim column (see aim_x / kAimHalfW). Sampling
+    // every texel guarantees a thin/small target is hit. Kept scene depth only
     // (far-sentinel / near-plane "glued" texels excluded), same as the ROI loop.
     {
-        const uint32_t ax0 = center_x > kAimHalfW ? center_x - kAimHalfW : 0u;
-        const uint32_t ax1 = std::min(center_x + kAimHalfW, roi_w - 1);
+        const uint32_t aim_xi = (uint32_t)std::lround(aim_x);
+        const uint32_t ax0 = aim_xi > kAimHalfW ? aim_xi - kAimHalfW : 0u;
+        const uint32_t ax1 = std::min(aim_xi + kAimHalfW, roi_w - 1);
         for (uint32_t r = 0; r < kStripeRows; ++r) {
             const uint32_t row = center_stripe * kStripeRows + r;
             const uint8_t* row_data = (const uint8_t*)mapped.pData + row * mapped.RowPitch;
@@ -1669,15 +1730,18 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
             p98 = at(0.98f);
         }
 
-        spdlog::info("[Flat3D][depth-sample] nearz={:.3f}uu center(ema={:.1f})uu samples={} far={} "
+        spdlog::info("[Flat3D][depth-sample] nearz={:.3f}uu center(ema={:.1f})uu "
+                     "aim(x={:.1f} center={} dx={:+.1f} eye={} halfw={}) samples={} far={} "
                      "glued(z<{:.3f}uu)={} kept={} d=[{:.6f}..{:.6f}] z(p2/p50/p98)={:.1f}/{:.1f}/{:.1f}uu",
-                     nearz_uu, m_center_ema_uu, total, far_rejected, z_glue_uu, glued, z_samples.size(),
+                     nearz_uu, m_center_ema_uu,
+                     aim_x, center_x, aim_x - (float)center_x, aim.dir > 0.0f ? 'L' : 'R', kAimHalfW,
+                     total, far_rejected, z_glue_uu, glued, z_samples.size(),
                      d_min, d_max, p2, p50, p98);
     }
 
-    // Aim/crosshair depth: the NEAREST surface in the center window; the whole
-    // reticle region then renders at that single depth. A tiny near percentile
-    // (~5th) instead of the raw minimum rejects a lone near speck but still
+    // Aim/crosshair depth: the NEAREST surface in the eye-corrected aim window;
+    // the whole reticle region then renders at that single depth. A tiny near
+    // percentile instead of the raw minimum rejects a lone near speck but still
     // pins the crosshair to the closest thing under the aim point.
     if (!center_samples.empty()) {
         // 3rd-nearest of the dense aim window: rejects a lone 1-2px speck / edge
@@ -2137,6 +2201,7 @@ void Flat3DCompositorD3D11::reset() {
     m_hud_depth_srv.Reset();
     m_hud_depth_src = nullptr;
     m_hud_depth_uscale = 1.0f;
+    m_depth_sampled_dir = 1.0f;
     m_anchor_cb.Reset();
     m_hud_mode_effective = 0;
 

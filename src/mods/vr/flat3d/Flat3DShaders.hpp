@@ -14,6 +14,7 @@
 // (bilinearly) sampled at output resolution — i.e. upscale-then-pattern, so
 // the line pattern stays display-pixel-exact regardless of render resolution.
 
+#include <algorithm>
 #include <cstdint>
 
 namespace vrmod::flat3d {
@@ -267,6 +268,79 @@ struct Flat3DFrameParams {
     bool want_depth{false};
 };
 
+// Snapshot of the stereo state a depth capture was taken UNDER, so the lateral
+// eye-offset correction that reads it back uses the right numbers.
+//
+// The scene-depth buffer is a PER-EYE buffer: there is no centre view, and
+// everything in it is displaced horizontally by the disparity for its own
+// depth. A screen position expressed in undisplaced (fused) terms therefore
+// reads a column of the scene offset to one side - worst at distance, and
+// ASYMMETRIC, so an object is detected earlier when approached from one
+// direction than from the other. Correcting it means sampling at
+//     x + dir * separation * (conv/z - 1) * eye_w/2
+// which is exactly the shift the compositor gives an overlay that should land
+// at depth z, so it is expressed here in the same (k_px, inv_conv_uu) terms the
+// HUD path already uses rather than as a second derivation of the same formula.
+//
+// It is a SNAPSHOT because the readback is a few frames behind the GPU: the
+// live convergence is not the one the stripes were captured under.
+struct Flat3DDepthAim {
+    float k_px{0.0f};        // px per (1/z_uu - 1/conv_uu), in DEPTH-BUFFER texels
+    // Whole-frame bias, same texels. Zero in the normal projection mode; under
+    // the symmetric-projection compat path the shear is dropped but the eye
+    // TRANSLATION remains, so the buffer keeps a per-eye offset that converges
+    // at infinity instead of at the screen plane, and this term describes it.
+    float bias_px{0.0f};
+    float inv_conv_uu{0.0f};
+    float eye_w{0.0f};       // per-eye width of the depth target, in texels
+    // +1 = the captured buffer is the LEFT eye's, -1 = the RIGHT eye's, in the
+    // COMPOSITOR's per-eye convention (eye 0 = +1), which is the one that
+    // answers "which way is this eye's copy of the content displaced". Note it
+    // is the opposite sign from the projection shear's convention - see the
+    // dir used when recording overlays.
+    float dir{1.0f};
+
+    // Lateral offset, in depth-buffer texels, from an undisplaced screen
+    // position to the column this eye's buffer actually holds depth-z content
+    // at. Add it to the sample position. Zero when the snapshot is unset or the
+    // depth estimate is invalid, which is the correct no-op.
+    float offset_px(float z_uu) const {
+        if (z_uu <= 0.0f || eye_w <= 0.0f) {
+            return 0.0f;
+        }
+
+        // POSITIVE when the sample is NEARER than the screen plane.
+        const float raw = 1.0f / z_uu - inv_conv_uu;
+
+        // Asymmetric limits, matching the overlay clamp in the shaders: BEHIND
+        // the screen plane the constraint is physical (uncrossed disparity past
+        // IPD cannot be fused), but IN FRONT the eyes converge inward and there
+        // is no divergence to protect against, so reusing the tight cap there
+        // would just stop near content tracking depth. This is a backstop
+        // against a bad depth sample flinging the sample column across the
+        // frame, not a limit normal geometry runs into.
+        //
+        // Branch on raw, never on the sign of the result: dir is folded into
+        // that, so its sign encodes WHICH EYE, not near-vs-far.
+        const float lim = (raw > 0.0f ? 0.15f : 0.05f) * eye_w;
+        return std::clamp(dir * (k_px * raw - bias_px), -lim, lim);
+    }
+};
+
+// Which eye a bound scene-depth buffer belongs to, in the COMPOSITOR's per-eye
+// convention (+1 = left). Double-wide depth: we read the LEFT half, so eye 0.
+// Single-width under AFR/AFW: the engine renders ONE view per frame and
+// afr_left_eye names it (AFW rides AFR, so it carries the fresh eye there too).
+// Anything else defaults to left.
+//
+// params.eye_swap must NOT enter this - it is an output-LAYOUT swap applied in
+// the repack shader and says nothing about which eye the engine drew.
+inline float sampled_eye_dir(const Flat3DFrameParams& params, bool depth_is_double_wide) {
+    const bool one_view = params.afr_frame || params.warp_frame;
+    const bool left = depth_is_double_wide || !one_view || params.afr_left_eye;
+    return left ? 1.0f : -1.0f;
+}
+
 // Matches the cbuffer in the repack shader below. 12 dwords (3x float4):
 // nine meaningful values, then the tail padding an HLSL cbuffer rounds up to.
 // The D3D11 path uses sizeof() directly as the buffer ByteWidth, which D3D11
@@ -393,7 +467,13 @@ struct HudDepthConstants {
     // the side. 1 = no crop (UI already at eye aspect).
     float ui_crop_x{1.0f};
     float ui_crop_y{1.0f};
-    float pad_[3]{};               // keep 16-byte aligned (3 rows of 4 dwords)
+    // Lateral eye-offset correction for the PER-EYE depth buffer (see
+    // resolve_invz). hud_aim_k_uv is in eye-U units per (1/z_uu - 1/conv_uu),
+    // with the SAMPLED eye's direction already folded into its sign. Both take
+    // former padding slots, so the struct stays 12 dwords / 48 bytes.
+    float hud_aim_k_uv{0.0f};
+    float hud_aim_bias_uv{0.0f};
+    float hud_inv_conv_uu{0.0f};   // fills the last padding slot: 12 dwords / 48 bytes
 };
 static_assert(sizeof(HudDepthConstants) == 12 * sizeof(uint32_t), "hud depth constant size");
 
@@ -823,6 +903,19 @@ int HudMode() { return hud_mode & 15; }
 int HudTiles()  { return max((hud_mode >> 4) & 15, 1); }
 int HudTilesY() { return max((hud_mode >> 8) & 15, 1); }
 
+// Bit 12: which eye the bound scene_depth belongs to (set = RIGHT). This is NOT
+// the eye being drawn. The overlay pass runs once per eye, and hud_k_px already
+// carries the DRAWING eye's direction - but the depth buffer is a single eye's
+// buffer whichever eye we are drawing, so using hud_k_px's sign to correct a
+// depth SAMPLE POSITION would push the right-eye draw the wrong way. Take the
+// magnitude from abs(hud_k_px) and the direction from here.
+float AimDir() { return ((hud_mode >> 12) & 1) != 0 ? -1.0 : 1.0; }
+// Bit 13: which eye is being DRAWN (set = right) - the one hud_k_px/hud_bias_px
+// are signed for. Carried separately so AimShiftUV can re-sign them from the
+// drawing eye to the sampled one; the two agree on half the frames under AFR
+// and disagree on the other half, which is exactly the bug this avoids.
+float DrawDir() { return ((hud_mode >> 13) & 1) != 0 ? -1.0 : 1.0; }
+
 // Safety limits on the HUD depth shift, in eye-U units (per eye, so the
 // on-screen disparity is twice these).
 //
@@ -849,6 +942,36 @@ static const float kHudShiftLimitNear   = 0.15;
 float ClampHudShiftUV(float s_px, float raw, float extra) {
     float lim = ((raw > 0.0) ? kHudShiftLimitNear : kHudShiftLimitBehind) + extra;
     return clamp(s_px / max(eye_width_px, 1.0), -lim, lim);
+}
+
+// Lateral correction (eye-U units) from an undisplaced screen position to the
+// column THIS EYE's depth buffer actually holds depth-z content at. The scene
+// depth we sample is a PER-EYE buffer: only content at the convergence depth
+// sits where the fused image puts it, everything else is displaced by its own
+// disparity, so an uncorrected sample reads past the target - worst at
+// distance, and asymmetrically.
+//
+// invz is an ESTIMATE of the depth being measured (the shift depends on it), so
+// callers take one uncorrected tap first and correct with that. Same asymmetric
+// limits as ClampHudShiftUV, branched on raw for the same reason: AimDir() is
+// folded into the result, so its sign encodes which eye, not near-vs-far.
+float AimShiftUV(float invz) {
+    float raw = invz - hud_inv_conv_uu;
+    // (hud_k_px * raw - hud_bias_px) is EXACTLY the depth buffer's lateral
+    // displacement in BOTH projection modes, and the bias term is not optional.
+    // Normally scene_shift_px is 0 and it reduces to k*raw. Under the
+    // symmetric-projection compat path the shear is dropped but the eye
+    // TRANSLATION remains, so the buffer still has a per-eye offset - a
+    // different one, converging at infinity instead of at the screen plane.
+    // Both terms are pre-divided by scene_scale and the frustum is widened by
+    // exactly that same (1 + separation), so the factor cancels and this stays
+    // exact rather than approximate.
+    //
+    // Re-signed from the DRAWING eye (which both constants carry) to the
+    // SAMPLED eye: the overlay pass runs once per eye against one buffer.
+    float s_uv = AimDir() * DrawDir() * (hud_k_px * raw - hud_bias_px) / max(eye_width_px, 1.0);
+    float lim = (raw > 0.0) ? kHudShiftLimitNear : kHudShiftLimitBehind;
+    return clamp(s_uv, -lim, lim);
 }
 
 // Per-pixel HUD shift (eye-U units) for the depth modes. For depth-adaptive
@@ -1024,8 +1147,20 @@ float4 ps_main(VSOut input) : SV_Target {
         // reusing the HUD depth formula. region_center is the mono tip position;
         // sky / no surface -> screen plane. Clamped so a very near hit still fuses.
         if (cursor_depth != 0) {
-            float dev = scene_depth.SampleLevel(samp, float2(region_center.x * hud_depth_uscale, region_center.y), 0).r;
+            // TWO-TAP: the depth buffer is a PER-EYE buffer, so the tip's
+            // undisplaced position does not point at the same content the fused
+            // image shows there. Tap 1 is uncorrected and exists only to
+            // estimate the depth the correction needs; tap 2 reads the column
+            // this eye's buffer actually holds it at. One iteration suffices -
+            // the residual is second order in the depth error.
+            float u0 = region_center.x;
+            float dev0 = scene_depth.SampleLevel(samp, float2(u0 * hud_depth_uscale, region_center.y), 0).r;
+            float invz0 = (dev0 > 1e-7) ? (dev0 / max(hud_nearz_uu, 1e-6)) : hud_inv_conv_uu;
+
+            float u1 = saturate(u0 + AimShiftUV(invz0));
+            float dev = scene_depth.SampleLevel(samp, float2(u1 * hud_depth_uscale, region_center.y), 0).r;
             float invz = (dev > 1e-7) ? (dev / max(hud_nearz_uu, 1e-6)) : hud_inv_conv_uu;
+
             float raw = invz - hud_inv_conv_uu;
             float s_px = hud_k_px * raw - hud_bias_px;
             d.x -= ClampHudShiftUV(s_px, raw, 0.01); // cursor keeps its extra headroom
@@ -1414,7 +1549,13 @@ cbuffer DepthParams : register(b0) {
     float  aspect_xy;
     float  ui_crop_x;   // un-crop UI-tile uv -> scene/eye uv (central crop inverse)
     float  ui_crop_y;
-    float3 pad_;
+    // Lateral eye-offset correction for sampling the PER-EYE depth buffer (see
+    // resolve_invz). k is in eye-U units per (1/z_uu - 1/conv_uu), with the
+    // SAMPLED eye's direction already folded into its sign - this pre-pass runs
+    // once, not per eye, so there is no drawing-eye sign to confuse it with.
+    float  hud_aim_k_uv;
+    float  hud_aim_bias_uv;
+    float  hud_inv_conv_uu;
 };
 
 Texture2D hud_mask      : register(t0); // classification mask (world = high)
@@ -1443,6 +1584,33 @@ float resolve_invz(float2 uv) {
 
     // Inverse of the overlay's central UI crop: eye = 0.5 + (ui - 0.5)/crop.
     float2 sc = saturate(0.5 + (uv - 0.5) / float2(ui_crop_x, ui_crop_y));
+
+    // Lateral eye offset. scene_depth is a PER-EYE buffer: only content at the
+    // convergence depth sits where the fused image puts it, so an uncorrected
+    // sample reads a column displaced to one side - worst at distance, and
+    // asymmetric, which shows up as a marker latching to an object sooner from
+    // one approach direction than the other.
+    //
+    // TWO-TAP, because the shift depends on the depth being measured: tap 0
+    // only estimates it. A sky / no-surface tap 0 leaves the correction at
+    // zero, which is self-consistent (nothing to correct toward) and lets the
+    // ring search below run uncorrected, exactly as it did before.
+    float dev0 = scene_depth.SampleLevel(samp, float2(sc.x * hud_depth_uscale, sc.y), 0).r;
+    if (dev0 > 1e-9) {
+        float raw0 = dev0 / max(hud_nearz_uu, 1e-6) - hud_inv_conv_uu;
+        // k*raw - bias. The bias is zero in the normal projection mode; under
+        // the symmetric-projection compat path the shear is dropped but the eye
+        // TRANSLATION remains, so the buffer still carries a per-eye offset and
+        // this term is what describes it. Both coefficients already have the
+        // sampled eye's direction folded in - this pre-pass runs once, not per
+        // eye, so there is no drawing-eye sign to reconcile.
+        //
+        // Asymmetric backstop, matching the overlay clamp: pop-out is not
+        // divergence, so the near side gets more room. Branch on raw0, never on
+        // the shift's sign - that sign encodes which eye, not near-vs-far.
+        float lim = (raw0 > 0.0) ? 0.15 : 0.05;
+        sc.x = saturate(sc.x + clamp(hud_aim_k_uv * raw0 - hud_aim_bias_uv, -lim, lim));
+    }
 
     float dev = scene_depth.SampleLevel(samp, float2(sc.x * hud_depth_uscale, sc.y), 0).r;
     if (dev > 1e-9) {
