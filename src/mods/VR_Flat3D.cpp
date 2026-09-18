@@ -2844,8 +2844,10 @@ void VR::on_draw_sidebar_flat3d() {
                               "Raise it if close objects drag the whole scene too deep.");
         }
         m_flat3d_autoconv_logging->draw("Log Samples");
-        text_disabled_wrapped("Separation auto-scales with the pull-in so the background "
-                              "stays exactly where you calibrated it.");
+        text_disabled_wrapped("Only the screen plane moves. Background depth is set by Separation "
+                              "alone and does not change with convergence, so the pull-in costs you "
+                              "nothing at the back of the scene. Your manual Convergence is the "
+                              "ceiling - auto only ever pulls closer.");
 
         if (flat3d != nullptr) {
             const auto nearest = flat3d->nearest_depth_uu.load();

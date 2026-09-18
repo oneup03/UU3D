@@ -66,7 +66,8 @@ public:
     // stalling (staging ring; results are ~ring-depth frames old). Outputs
     // are in UE units, < 0 when no valid sample. EMA-smoothed internally.
     void sample_depth(ID3D11DeviceContext* context, ID3D11Texture2D* scene_depth,
-                      float nearz_uu, float* out_center_uu, float* out_nearest_uu);
+                      float nearz_uu, const Flat3DFrameParams& params,
+                      float* out_center_uu, float* out_nearest_uu);
 
     void reset();
 
@@ -169,6 +170,12 @@ private:
     ComPtr<ID3D11ShaderResourceView> m_hud_depth_srv{};
     ID3D11Texture2D* m_hud_depth_src{nullptr}; // not owned; identity key only
     float m_hud_depth_uscale{1.0f};
+    // Which eye the bound scene-depth buffer belongs to, in the COMPOSITOR's
+    // per-eye convention (+1 = left). Shared by every consumer that samples it
+    // (aim readback, geometry cursor, HUD tile-depth pre-pass) so they cannot
+    // disagree. NOT the same as the drawing eye's dir - the overlay pass runs
+    // once per eye against this single buffer.
+    float m_depth_sampled_dir{1.0f};
     ComPtr<ID3D11Buffer> m_anchor_cb{};
     int32_t m_hud_mode_effective{0};
 
@@ -219,6 +226,10 @@ private:
     static constexpr uint32_t kDepthStripes = 9;
     static constexpr uint32_t kStripeRows = 2;
     ComPtr<ID3D11Texture2D> m_depth_staging[kDepthRing]{};
+    // Stereo state each slot's stripes were captured under - the readback is a
+    // few frames old, so the live convergence is the wrong one to correct the
+    // sample position with.
+    Flat3DDepthAim m_depth_aim[kDepthRing]{};
     DXGI_FORMAT m_depth_format{DXGI_FORMAT_UNKNOWN};
     uint32_t m_depth_roi_w{0};
     uint64_t m_depth_frame{0};
