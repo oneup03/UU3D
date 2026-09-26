@@ -166,6 +166,13 @@ void Framework::hook_monitor() {
                 m_last_chance_time = now;
 
                 spdlog::info("Last chance encountered for hooking");
+
+                // 5s without a present is either a rehook-worthy swapchain
+                // change or a genuinely hung game, and the log cannot tell them
+                // apart on its own. Dump where every thread actually is - the
+                // dumper caps itself at a few reports, so a game that simply
+                // stopped presenting does not fill the log.
+                framework::dump_all_thread_stacks("no present for 5 seconds");
             }
 
             if (!m_has_last_chance && now - m_last_chance_time > std::chrono::seconds(1)) {
