@@ -1,23 +1,17 @@
 diff --git a/src/sdk/StereoStuff.cpp b/src/sdk/StereoStuff.cpp
-index 8353d83..9b3d6c8 100644
+index 5de7b97..9bebb81 100644
 --- a/src/sdk/StereoStuff.cpp
 +++ b/src/sdk/StereoStuff.cpp
-@@ -109,10 +109,16 @@ void* FRHITexture::get_native_resource() const {
-             SPDLOG_INFO(" vtable: {:x} (rel {:x})", (uintptr_t)potential_vtable, (uintptr_t)potential_vtable - (uintptr_t)*module_within);
- 
-             auto is_vtable_d3d = [](std::string_view module_path_lower) {
--                return module_path_lower.ends_with("d3d11.dll") || 
--                module_path_lower.ends_with("d3d12.dll") || 
-+                return module_path_lower.ends_with("d3d11.dll") ||
-+                module_path_lower.ends_with("d3d12.dll") ||
-                 module_path_lower.ends_with("d3d12core.dll") ||
-                 module_path_lower.ends_with("dxgi.dll") ||
-+                // When RenderDoc is embedded it wraps every D3D12 object, so the
-+                // native resource behind an RHI texture is a RenderDoc wrapper
-+                // whose vtable lives in renderdoc.dll. Accept it so stereo setup
-+                // doesn't reject the (correct) wrapped resource and scan on into
-+                // bad vtable slots — which crashes under embedded capture.
-+                module_path_lower.ends_with("renderdoc.dll") ||
-                 module_path_lower.ends_with("d3d12sdklayers.dll") ||
-                 module_path_lower.ends_with("d3d11_1sdklayers.dll") ||
-                 module_path_lower.ends_with("d3d11_2sdklayers.dll") ||
+@@ -67,6 +67,12 @@ void* FRHITexture::get_native_resource() const {
+             module_path_lower.ends_with("d3d12.dll") || 
+             module_path_lower.ends_with("d3d12core.dll") ||
+             module_path_lower.ends_with("dxgi.dll") ||
++            // When RenderDoc is embedded it wraps every D3D12 object, so the
++            // native resource behind an RHI texture is a RenderDoc wrapper
++            // whose vtable lives in renderdoc.dll. Accept it so stereo setup
++            // doesn't reject the (correct) wrapped resource and scan on into
++            // bad vtable slots - which crashes under embedded capture.
++            module_path_lower.ends_with("renderdoc.dll") ||
+             module_path_lower.ends_with("d3d12sdklayers.dll") ||
+             module_path_lower.ends_with("d3d11_1sdklayers.dll") ||
+             module_path_lower.ends_with("d3d11_2sdklayers.dll") ||
