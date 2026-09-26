@@ -224,42 +224,58 @@ jobs:
           Copy-Item -Force ${{github.workspace}}/notes/LICENSE ${{github.workspace}}/UU3D/LICENSE-UEVR.txt
         shell: powershell
 
-      # As of PureDark AFW v1.0-beta.6 the joeyhodge and nightly packages ship a
-      # BYTE-IDENTICAL PDAFWPlugin.dll (only their own UEVRBackend.dll differs),
-      # so one download serves both backends. The hash check is here so that if
-      # PureDark ever diverges them this fails loudly instead of silently
-      # shipping the wrong plugin - AFW degrades to plain AFR without erroring,
-      # which would be very easy to miss.
-      - name: Bundle PDAFWPlugin from PureDark AFW release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # PDAFWPlugin.dll ships from the repository for now: dependencies/PDAFWPlugin.dll
+      # is copied into both backends. The previous behaviour - pulling the latest
+      # PureDark AFW release and bundling its plugin - is kept below, commented out
+      # verbatim, so it can be restored as-is when we go back to tracking releases.
+      - name: Bundle PDAFWPlugin from the repository
         run: |
-          $afwDir = "${{github.workspace}}/afw-plugin"
-          New-Item -ItemType Directory -Force -Path $afwDir | Out-Null
-          gh release download --repo PureDark/UEVR --pattern "UEVR-*_AFW_*.zip" --dir $afwDir
-          $zips = Get-ChildItem $afwDir -Filter *.zip
-          if ($zips.Count -lt 1) { throw "No '*_AFW_*' zip assets found in the latest PureDark/UEVR release" }
-
-          $hashes = @{}
-          foreach ($zip in $zips) {
-            $dest = Join-Path $afwDir $zip.BaseName
-            Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
-            $dll = Get-ChildItem $dest -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1
-            if (-not $dll) { throw "PDAFWPlugin.dll not found inside $($zip.Name)" }
-            $hashes[$zip.Name] = (Get-FileHash -Algorithm SHA256 $dll.FullName).Hash
-            Write-Host "$($zip.Name): $($hashes[$zip.Name])"
-          }
-
-          $distinct = $hashes.Values | Sort-Object -Unique
-          if ($distinct.Count -gt 1) {
-            throw "PDAFWPlugin.dll now DIFFERS between PureDark's AFW packages. The workflow assumed they were identical - pick the right one per backend before releasing."
-          }
-
-          $src = (Get-ChildItem $afwDir -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1).FullName
+          $src = "${{github.workspace}}/dependencies/PDAFWPlugin.dll"
+          if (-not (Test-Path $src)) { throw "dependencies/PDAFWPlugin.dll is missing from the checkout" }
+          Write-Host "PDAFWPlugin.dll SHA256: $((Get-FileHash -Algorithm SHA256 $src).Hash)"
           Copy-Item -Force $src ${{github.workspace}}/UU3D/
           Copy-Item -Force $src ${{github.workspace}}/UU3D/modern/
-          Write-Host "Bundled PDAFWPlugin.dll into both backends"
+          Write-Host "Bundled PDAFWPlugin.dll into both backends (from dependencies/)"
         shell: powershell
+
+      # --- previous behaviour, kept for restoration -------------------------------
+      # # As of PureDark AFW v1.0-beta.6 the joeyhodge and nightly packages ship a
+      # # BYTE-IDENTICAL PDAFWPlugin.dll (only their own UEVRBackend.dll differs),
+      # # so one download serves both backends. The hash check is here so that if
+      # # PureDark ever diverges them this fails loudly instead of silently
+      # # shipping the wrong plugin - AFW degrades to plain AFR without erroring,
+      # # which would be very easy to miss.
+      # - name: Bundle PDAFWPlugin from PureDark AFW release
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     $afwDir = "${{github.workspace}}/afw-plugin"
+      #     New-Item -ItemType Directory -Force -Path $afwDir | Out-Null
+      #     gh release download --repo PureDark/UEVR --pattern "UEVR-*_AFW_*.zip" --dir $afwDir
+      #     $zips = Get-ChildItem $afwDir -Filter *.zip
+      #     if ($zips.Count -lt 1) { throw "No '*_AFW_*' zip assets found in the latest PureDark/UEVR release" }
+      #
+      #     $hashes = @{}
+      #     foreach ($zip in $zips) {
+      #       $dest = Join-Path $afwDir $zip.BaseName
+      #       Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
+      #       $dll = Get-ChildItem $dest -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1
+      #       if (-not $dll) { throw "PDAFWPlugin.dll not found inside $($zip.Name)" }
+      #       $hashes[$zip.Name] = (Get-FileHash -Algorithm SHA256 $dll.FullName).Hash
+      #       Write-Host "$($zip.Name): $($hashes[$zip.Name])"
+      #     }
+      #
+      #     $distinct = $hashes.Values | Sort-Object -Unique
+      #     if ($distinct.Count -gt 1) {
+      #       throw "PDAFWPlugin.dll now DIFFERS between PureDark's AFW packages. The workflow assumed they were identical - pick the right one per backend before releasing."
+      #     }
+      #
+      #     $src = (Get-ChildItem $afwDir -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1).FullName
+      #     Copy-Item -Force $src ${{github.workspace}}/UU3D/
+      #     Copy-Item -Force $src ${{github.workspace}}/UU3D/modern/
+      #     Write-Host "Bundled PDAFWPlugin.dll into both backends"
+      #   shell: powershell
+      # ---------------------------------------------------------------------------
 
       - name: Show final layout
         run: Get-ChildItem ${{github.workspace}}/UU3D -Recurse -File | ForEach-Object { $_.FullName.Replace("${{github.workspace}}/UU3D", "") }

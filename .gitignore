@@ -47,3 +47,6 @@ build_*.log
 
 # fxc-generated shader debug PDBs (the .inc bytecode headers are still tracked)
 src/mods/vr/shaders/Compiled/*.pdb
+
+# Shipped AFW plugin (bundled by the release workflow; see dev-release.yml)
+!dependencies/PDAFWPlugin.dll
