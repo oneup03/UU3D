@@ -118,6 +118,7 @@ FetchContent_Declare(kananlib
 )
 FetchContent_MakeAvailable(kananlib)
 
+if(NOT UEVR_HAVE_VENDORED_SAFETYHOOK)
 set(SAFETYHOOK_FETCH_ZYDIS ON)
 
 message(STATUS "Fetching safetyhook (b62c7356f3e364209a2ae14489550156d7b58b8b)...")
@@ -128,6 +129,8 @@ FetchContent_Declare(safetyhook
 		b62c7356f3e364209a2ae14489550156d7b58b8b
 )
 FetchContent_MakeAvailable(safetyhook)
+
+endif()
 
 message(STATUS "Fetching sdkgenny (f58077f8da8a271490c17558e93b75843b3afd19)...")
 FetchContent_Declare(sdkgenny

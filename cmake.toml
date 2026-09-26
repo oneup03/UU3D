@@ -96,11 +96,19 @@ tag = "70db095765ab2066dd88dfb7bbcc42259ed167c5"
 git = "https://github.com/cursey/kananlib"
 tag = "49fdf2d3b1db350e370beacb607d5721bc2911ad"
 
+# Skipped when dependencies/vendor/safetyhook is present (see the
+# UEVR_HAVE_VENDORED_SAFETYHOOK block above): the vendored copy is this same
+# revision plus the UEVR allocator/trap patches (UEVR_PATCHES.md), and both
+# together would define the safetyhook target twice.
 [fetch-content.safetyhook]
 git = "https://github.com/praydog/safetyhook"
 tag = "b62c7356f3e364209a2ae14489550156d7b58b8b"
 cmake-before="""
+if(NOT UEVR_HAVE_VENDORED_SAFETYHOOK)
 set(SAFETYHOOK_FETCH_ZYDIS ON)
+"""
+cmake-after="""
+endif()
 """
 
 [fetch-content.sdkgenny]
