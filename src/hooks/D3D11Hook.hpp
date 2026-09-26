@@ -90,6 +90,14 @@ public:
     // target must match it — not the (forced-native) backbuffer.
     uint32_t get_engine_believed_width() const { return m_engine_believed_w.load(); }
     uint32_t get_engine_believed_height() const { return m_engine_believed_h.load(); }
+    // The belief is normally captured from the game's own ResizeBuffers, but a
+    // viewport change that lands ON the pinned native size never reaches
+    // ResizeBuffers (nothing to resize), so the stereo hook refreshes it from the
+    // engine's render-target-size request while the native hold is armed.
+    void set_engine_believed(uint32_t w, uint32_t h) {
+        m_engine_believed_w = w;
+        m_engine_believed_h = h;
+    }
 
     // Suppress render-resolution capture for a time window: engine-initiated
     // resizes WE requested (native nudge / borderless kick) can arrive more

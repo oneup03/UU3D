@@ -9,6 +9,8 @@
 #include <optional>
 #include <thread>
 
+#include <intrin.h> // _ReturnAddress (window-hold diagnostics)
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -17,7 +19,14 @@
 #include <imgui.h>
 #include <safetyhook.hpp>
 #include <spdlog/spdlog.h>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <vector>
+
 #include <utility/Module.hpp>
+#include <utility/PointerHook.hpp>
+#include <utility/Scan.hpp>
 #include <utility/ScopeGuard.hpp>
 #include <utility/String.hpp>
 
@@ -243,6 +252,297 @@ bool flat3d_install_clientrect_spoof() {
     return installed;
 }
 
+// --- Window hold (Native Output) --------------------------------------------
+// The borderless re-assert below is a POLL: it notices a shrunken window and
+// pushes it back every 3s. That is enough for a game that only sizes its window
+// once, but some titles re-apply their own resolution to the window every time
+// it changes (Hellblade 2 reshapes back to the in-game 1920x1080 about 40ms
+// after each of our kicks), which turns the poll into a permanent tug-of-war -
+// window churn, swapchain churn and a compositor rebuild every round, forever.
+//
+// Out-shouting the engine cannot win that; taking the lever away can. While
+// native output holds the window, every SetWindowPos / MoveWindow the GAME
+// makes against THAT window is rewritten to our rect instead of being obeyed.
+// Our own kicks run under a thread-local bypass so they still pass through,
+// and nothing else is touched: z-order, activation, show/hide and every other
+// window all behave normally.
+std::atomic<bool> g_flat3d_window_hold_active{false};
+std::atomic<HWND> g_flat3d_window_hold_hwnd{nullptr};
+std::atomic<int32_t> g_flat3d_window_hold_x{0};
+std::atomic<int32_t> g_flat3d_window_hold_y{0};
+std::atomic<int32_t> g_flat3d_window_hold_w{0};
+std::atomic<int32_t> g_flat3d_window_hold_h{0};
+thread_local bool g_flat3d_window_hold_bypass = false;
+SafetyHookInline g_setwindowpos_hook{};
+SafetyHookInline g_movewindow_hook{};
+SafetyHookInline g_setwindowlongptrw_hook{};
+SafetyHookInline g_setwindowlongptra_hook{};
+SafetyHookInline g_setwindowlongw_hook{};
+SafetyHookInline g_setwindowlonga_hook{};
+SafetyHookInline g_showwindow_hook{};
+
+// Scoped pass-through for our OWN window calls.
+struct Flat3DWindowHoldBypass {
+    Flat3DWindowHoldBypass() { g_flat3d_window_hold_bypass = true; }
+    ~Flat3DWindowHoldBypass() { g_flat3d_window_hold_bypass = false; }
+};
+
+bool flat3d_window_hold_applies(HWND wnd) {
+    return !g_flat3d_window_hold_bypass &&
+           g_flat3d_window_hold_active.load(std::memory_order_relaxed) &&
+           wnd != nullptr && wnd == g_flat3d_window_hold_hwnd.load(std::memory_order_relaxed) &&
+           g_flat3d_window_hold_w.load(std::memory_order_relaxed) > 0 &&
+           g_flat3d_window_hold_h.load(std::memory_order_relaxed) > 0;
+}
+
+// Throttled: a fighting engine can hit this every frame.
+void flat3d_log_window_hold(const char* api, int w, int h, UINT flags, void* caller) {
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+
+    spdlog::info("[Flat3D] Native output: window hold dropped a game {} to {}x{} (held at {}x{}, flags {:x}, "
+                 "caller {:x})",
+                 api, w, h, g_flat3d_window_hold_w.load(), g_flat3d_window_hold_h.load(), (uint32_t)flags,
+                 (uintptr_t)caller);
+}
+
+// SUBTRACT ONLY. The hold's job is to stop the game MOVING the window, not to
+// initiate window work of its own: dropping the offending move/size leaves
+// every other effect of the call (z-order, activation, frame change, the
+// WM_WINDOWPOS* traffic it was always going to generate) exactly as the caller
+// intended. An earlier version rewrote the rect instead and cleared
+// SWP_NOMOVE/SWP_NOSIZE, which turned even a z-order-only call into a real
+// geometry change - a cross-thread WM_SIZE, an engine viewport resize and a
+// ResizeBuffers (which takes the hook monitor mutex) on a thread that never
+// asked for one. Correcting a wrong rect is the 3s poll's job, under our own
+// bypass, from the window's own thread.
+BOOL WINAPI flat3d_held_set_window_pos(HWND wnd, HWND insert_after, int x, int y, int cx, int cy, UINT flags) {
+    if (flat3d_window_hold_applies(wnd)) {
+        const int hx = g_flat3d_window_hold_x.load(std::memory_order_relaxed);
+        const int hy = g_flat3d_window_hold_y.load(std::memory_order_relaxed);
+        const int hw = g_flat3d_window_hold_w.load(std::memory_order_relaxed);
+        const int hh = g_flat3d_window_hold_h.load(std::memory_order_relaxed);
+
+        if ((flags & SWP_NOSIZE) == 0 && (cx != hw || cy != hh)) {
+            flat3d_log_window_hold("SetWindowPos", cx, cy, flags, _ReturnAddress());
+            flags |= SWP_NOSIZE;
+        }
+
+        if ((flags & SWP_NOMOVE) == 0 && (x != hx || y != hy)) {
+            flags |= SWP_NOMOVE;
+        }
+    }
+
+    return g_setwindowpos_hook.unsafe_call<BOOL>(wnd, insert_after, x, y, cx, cy, flags);
+}
+
+// MoveWindow is a geometry call by construction - there is no flag to drop - so
+// the held rect is substituted instead. That is still subtractive: the caller
+// was already going to send this traffic, and identical values make it a no-op.
+BOOL WINAPI flat3d_held_move_window(HWND wnd, int x, int y, int w, int h, BOOL repaint) {
+    if (flat3d_window_hold_applies(wnd)) {
+        const int hw = g_flat3d_window_hold_w.load(std::memory_order_relaxed);
+        const int hh = g_flat3d_window_hold_h.load(std::memory_order_relaxed);
+
+        if (w != hw || h != hh) {
+            flat3d_log_window_hold("MoveWindow", w, h, 0, _ReturnAddress());
+        }
+
+        x = g_flat3d_window_hold_x.load(std::memory_order_relaxed);
+        y = g_flat3d_window_hold_y.load(std::memory_order_relaxed);
+        w = hw;
+        h = hh;
+    }
+
+    return g_movewindow_hook.unsafe_call<BOOL>(wnd, x, y, w, h, repaint);
+}
+
+// The frame styles are part of the hold. UE's SetWindowMode(Windowed) puts
+// WS_CAPTION|WS_THICKFRAME back through SetWindowLongPtr, and on a window whose
+// OUTER rect is held that shrinks the CLIENT by the frame (3840x2160 ->
+// 3818x2104) - a WM_SIZE the engine follows and that some games treat as
+// "re-apply my stored resolution" (Hellblade 2), cascading into a windowed
+// 1080p re-apply right after the user asked for something else. Subtractive
+// again: only the frame bits are masked (and WS_POPUP kept), everything else
+// the game sets in the style word passes through. Our own kick strips the
+// same bits under the bypass.
+LONG_PTR flat3d_held_style_value(int index, LONG_PTR value) {
+    if (index == GWL_STYLE) {
+        constexpr LONG_PTR kStrip = WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+        return (value & ~kStrip) | WS_POPUP;
+    }
+
+    if (index == GWL_EXSTYLE) {
+        constexpr LONG_PTR kStrip = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE;
+        return value & ~kStrip;
+    }
+
+    return value;
+}
+
+void flat3d_log_style_hold(const char* api, int index, LONG_PTR wanted, LONG_PTR held) {
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+
+    spdlog::info("[Flat3D] Native output: window hold kept the frame off ({} {} {:x} -> {:x}, caller {:x})",
+                 api, index == GWL_STYLE ? "GWL_STYLE" : "GWL_EXSTYLE", (uint64_t)wanted, (uint64_t)held,
+                 (uintptr_t)_ReturnAddress());
+}
+
+LONG_PTR WINAPI flat3d_held_set_window_long_ptr_w(HWND wnd, int index, LONG_PTR value) {
+    if ((index == GWL_STYLE || index == GWL_EXSTYLE) && flat3d_window_hold_applies(wnd)) {
+        if (const auto held = flat3d_held_style_value(index, value); held != value) {
+            flat3d_log_style_hold("SetWindowLongPtrW", index, value, held);
+            value = held;
+        }
+    }
+
+    return g_setwindowlongptrw_hook.unsafe_call<LONG_PTR>(wnd, index, value);
+}
+
+LONG_PTR WINAPI flat3d_held_set_window_long_ptr_a(HWND wnd, int index, LONG_PTR value) {
+    if ((index == GWL_STYLE || index == GWL_EXSTYLE) && flat3d_window_hold_applies(wnd)) {
+        if (const auto held = flat3d_held_style_value(index, value); held != value) {
+            flat3d_log_style_hold("SetWindowLongPtrA", index, value, held);
+            value = held;
+        }
+    }
+
+    return g_setwindowlongptra_hook.unsafe_call<LONG_PTR>(wnd, index, value);
+}
+
+LONG WINAPI flat3d_held_set_window_long_w(HWND wnd, int index, LONG value) {
+    if ((index == GWL_STYLE || index == GWL_EXSTYLE) && flat3d_window_hold_applies(wnd)) {
+        if (const auto held = (LONG)flat3d_held_style_value(index, (LONG_PTR)(ULONG)value); held != value) {
+            flat3d_log_style_hold("SetWindowLongW", index, value, held);
+            value = held;
+        }
+    }
+
+    return g_setwindowlongw_hook.unsafe_call<LONG>(wnd, index, value);
+}
+
+LONG WINAPI flat3d_held_set_window_long_a(HWND wnd, int index, LONG value) {
+    if ((index == GWL_STYLE || index == GWL_EXSTYLE) && flat3d_window_hold_applies(wnd)) {
+        if (const auto held = (LONG)flat3d_held_style_value(index, (LONG_PTR)(ULONG)value); held != value) {
+            flat3d_log_style_hold("SetWindowLongA", index, value, held);
+            value = held;
+        }
+    }
+
+    return g_setwindowlonga_hook.unsafe_call<LONG>(wnd, index, value);
+}
+
+// A maximized popup covers the WORK area, not the monitor - the taskbar
+// strip comes off the client, which is the same WM_SIZE cascade as the frame.
+// Show, minimize and restore pass through untouched.
+BOOL WINAPI flat3d_held_show_window(HWND wnd, int cmd) {
+    if ((cmd == SW_MAXIMIZE || cmd == SW_SHOWMAXIMIZED) && flat3d_window_hold_applies(wnd)) {
+        static std::chrono::steady_clock::time_point last{};
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now - last >= std::chrono::seconds(5)) {
+            last = now;
+            spdlog::info("[Flat3D] Native output: window hold turned a game ShowWindow({}) into SW_SHOW (caller {:x})",
+                         cmd, (uintptr_t)_ReturnAddress());
+        }
+
+        cmd = SW_SHOW;
+    }
+
+    return g_showwindow_hook.unsafe_call<BOOL>(wnd, cmd);
+}
+
+bool flat3d_install_window_hold() {
+    static bool attempted = false;
+    static bool installed = false;
+
+    if (attempted) {
+        return installed;
+    }
+    attempted = true;
+
+    if (auto* user32 = GetModuleHandleW(L"user32.dll")) {
+        if (auto p = GetProcAddress(user32, "SetWindowPos")) {
+            g_setwindowpos_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_set_window_pos);
+        }
+        // MoveWindow is its own export (it does not route through the hooked
+        // SetWindowPos), so it needs its own hook.
+        if (auto p = GetProcAddress(user32, "MoveWindow")) {
+            g_movewindow_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_move_window);
+        }
+        // Frame styles and maximize are part of the geometry (see the style
+        // hold above). All four SetWindowLong exports exist on x64.
+        if (auto p = GetProcAddress(user32, "SetWindowLongPtrW")) {
+            g_setwindowlongptrw_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_set_window_long_ptr_w);
+        }
+        if (auto p = GetProcAddress(user32, "SetWindowLongPtrA")) {
+            g_setwindowlongptra_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_set_window_long_ptr_a);
+        }
+        if (auto p = GetProcAddress(user32, "SetWindowLongW")) {
+            g_setwindowlongw_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_set_window_long_w);
+        }
+        if (auto p = GetProcAddress(user32, "SetWindowLongA")) {
+            g_setwindowlonga_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_set_window_long_a);
+        }
+        if (auto p = GetProcAddress(user32, "ShowWindow")) {
+            g_showwindow_hook = safetyhook::create_inline((void*)p, (void*)&flat3d_held_show_window);
+        }
+    }
+
+    installed = (bool)g_setwindowpos_hook;
+    spdlog::info("[Flat3D] Window hold hooks: SetWindowPos={} MoveWindow={} SetWindowLongPtrW={} SetWindowLongPtrA={} "
+                 "SetWindowLongW={} SetWindowLongA={} ShowWindow={}",
+                 (bool)g_setwindowpos_hook, (bool)g_movewindow_hook, (bool)g_setwindowlongptrw_hook,
+                 (bool)g_setwindowlongptra_hook, (bool)g_setwindowlongw_hook, (bool)g_setwindowlonga_hook,
+                 (bool)g_showwindow_hook);
+    return installed;
+}
+
+// Arm/refresh the hold at the rect native output wants. Installs the hooks on
+// first use; a disabled hold leaves them inert (the gate is the atomic).
+void flat3d_window_hold_arm(HWND wnd, int x, int y, int w, int h, bool enabled) {
+    if (!enabled) {
+        g_flat3d_window_hold_active.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (wnd == nullptr || w <= 0 || h <= 0) {
+        return;
+    }
+
+    if (!flat3d_install_window_hold()) {
+        return;
+    }
+
+    g_flat3d_window_hold_x.store(x, std::memory_order_relaxed);
+    g_flat3d_window_hold_y.store(y, std::memory_order_relaxed);
+    g_flat3d_window_hold_w.store(w, std::memory_order_relaxed);
+    g_flat3d_window_hold_h.store(h, std::memory_order_relaxed);
+    g_flat3d_window_hold_hwnd.store(wnd, std::memory_order_relaxed);
+
+    if (!g_flat3d_window_hold_active.exchange(true, std::memory_order_acq_rel)) {
+        spdlog::info("[Flat3D] Native output: window hold engaged ({}x{} at ({},{}) - game resizes of this "
+                     "window are rewritten to it)", w, h, x, y);
+    }
+}
+
+void flat3d_window_hold_release() {
+    if (g_flat3d_window_hold_active.exchange(false, std::memory_order_acq_rel)) {
+        spdlog::info("[Flat3D] Native output: window hold released");
+    }
+}
+
 // Current + native (max) resolution of the monitor hosting hwnd. Native is
 // cached per display device (EnumDisplaySettings walk).
 struct Flat3DDisplayInfo {
@@ -321,7 +621,466 @@ std::optional<Flat3DDisplayInfo> query_display_info(HWND hwnd) {
 // full_apply runs ApplySettings (scalability + save) instead of the narrower
 // ApplyResolutionSettings, for subclasses that only hook the former.
 // Game thread only.
-bool apply_gameusersettings_resolution(uint32_t w, uint32_t h, bool full_apply, uint8_t window_mode = 1) {
+// --- Saved-video-settings guard (Native Output) ------------------------------
+// Native output asks the engine for its native size + WindowedFullscreen through
+// GameUserSettings (the lever that sticks on games that undo r.SetRes). The
+// stored RESOLUTION is put back right after the apply, but a game that re-syncs
+// its settings object from the live window state (Hellblade 2 does, then saves
+// at exit) writes OUR native borderless to disk anyway - and boots there next
+// time, rendering the scene at native. So the save itself is intercepted:
+// UGameUserSettings::SaveSettings is virtual, and the live object's vtable slot
+// (found from the UFunction's exec thunk) catches Blueprint and C++ callers
+// alike. While the object holds exactly what we imposed, the save writes the
+// user's own resolution + mode instead, then the live values go back. Anything
+// ELSE the game holds at save time (windowed, another resolution, exclusive
+// fullscreen) is an unambiguous in-game choice: it passes through and becomes
+// the remembered preference. The one ambiguous choice - borderless at native,
+// identical to what we impose - is treated as ours; the Keep Game's Saved
+// Video Settings toggle exists for users who want that saved.
+// Set by the sentinel below when our DLL's static destruction begins: the
+// game's LAST settings save (Hellblade 2: ~65s into its own shutdown) lands
+// after that point, when spdlog is gone, so the guard must keep working without
+// logging. Plain bool on purpose - it has to outlive every destructor.
+bool g_flat3d_tearing_down = false;
+
+struct Flat3DTeardownSentinel {
+    ~Flat3DTeardownSentinel() { g_flat3d_tearing_down = true; }
+};
+Flat3DTeardownSentinel g_flat3d_teardown_sentinel{};
+
+// TRIVIALLY DESTRUCTIBLE by design (atomics, raw pointers, no unique_ptr): the
+// process tears our DLL's statics down at exit long before the game performs
+// its final save, and a destructor here would restore the vtable slot and hand
+// that save back to the game with our imposed values still in it. The
+// PointerHook is leaked on purpose - the patch must stay until the process
+// dies, and UEVR never unloads mid-game anyway.
+struct Flat3DSettingsGuard {
+    std::atomic<bool> enabled{true};        // mirrors the toggle
+    std::atomic<bool> armed{false};         // a user resolution/mode is known
+    // When we last imposed (steady_clock ms) and whether that impose changed
+    // the game's mode. A GameUserSettings impose does (Windowed -> ours), so
+    // the mode alone marks a save as ours for as long as it takes (the exit
+    // re-sync included). A plain r.SetRes changes only the resolution, and a
+    // later user pick of native under the same mode is indistinguishable by
+    // value - so that ownership expires 30s after the impose.
+    std::atomic<int64_t> last_impose_ms{0};
+    std::atomic<bool> imposed_changes_mode{false};
+    std::atomic<int32_t> user_w{0};
+    std::atomic<int32_t> user_h{0};
+    std::atomic<uint8_t> user_mode{2};
+    std::atomic<int32_t> imposed_w{0};
+    std::atomic<int32_t> imposed_h{0};
+    std::atomic<uint8_t> imposed_mode{1};
+
+    // Game thread only from here on (installed from it, called on it).
+    sdk::UObject* object{nullptr};
+    PointerHook* hook{nullptr};                       // leaked, see above
+    void (*original)(sdk::UObject*){nullptr};        // cached: the hook body never touches PointerHook
+    bool install_attempted{false};
+    sdk::UFunction* get_res{nullptr};
+    sdk::UFunction* set_res{nullptr};
+    sdk::UFunction* get_mode{nullptr};
+    sdk::UFunction* set_mode{nullptr};
+    sdk::UFunction* confirm{nullptr};
+    sdk::UFunction* get_confirmed_res{nullptr};
+    sdk::UFunction* get_confirmed_mode{nullptr};
+};
+
+static_assert(std::is_trivially_destructible_v<Flat3DSettingsGuard>,
+              "the settings guard must survive static destruction (see the note above)");
+
+Flat3DSettingsGuard g_settings_guard{};
+thread_local bool g_settings_guard_inside = false;
+
+struct Flat3DIntPoint {
+    int32_t x{0};
+    int32_t y{0};
+};
+
+Flat3DIntPoint flat3d_gus_get_res(sdk::UObject* o, sdk::UFunction* fn) {
+    Flat3DIntPoint p{};
+    if (fn != nullptr) {
+        o->process_event(fn, &p);
+    }
+    return p;
+}
+
+uint8_t flat3d_gus_get_mode(sdk::UObject* o, sdk::UFunction* fn) {
+    struct { uint8_t v{0}; } p{};
+    if (fn != nullptr) {
+        o->process_event(fn, &p);
+    }
+    return p.v;
+}
+
+void flat3d_gus_set_res(sdk::UObject* o, sdk::UFunction* fn, Flat3DIntPoint p) {
+    if (fn != nullptr) {
+        o->process_event(fn, &p);
+    }
+}
+
+void flat3d_gus_set_mode(sdk::UObject* o, sdk::UFunction* fn, uint8_t m) {
+    struct { uint8_t v; } p{m};
+    if (fn != nullptr) {
+        o->process_event(fn, &p);
+    }
+}
+
+void flat3d_gus_call(sdk::UObject* o, sdk::UFunction* fn) {
+    uint8_t dummy[16]{};
+    if (fn != nullptr) {
+        o->process_event(fn, dummy);
+    }
+}
+
+const char* flat3d_window_mode_name(uint8_t m) {
+    return m == 0 ? "Fullscreen" : m == 1 ? "WindowedFullscreen" : m == 2 ? "Windowed" : "?";
+}
+
+// A UHT exec thunk for a BlueprintCallable virtual is P_FINISH followed by
+// P_THIS->Fn(): load the vtable from `this` (rcx, possibly copied to another
+// register first), then call/jump through [vtable + slot*8]. Walking the thunk
+// for that dispatch yields the slot without knowing the class layout.
+std::optional<uint32_t> flat3d_vtable_slot_from_exec_thunk(sdk::UFunction* fn) {
+    if (fn == nullptr) {
+        return std::nullopt;
+    }
+
+    auto ip = (uint8_t*)fn->get_native_function();
+
+    if (ip == nullptr) {
+        return std::nullopt;
+    }
+
+    bool this_regs[ND_MAX_GPR_REGS]{};
+    this_regs[NDR_RCX] = true;
+    int vtable_reg = -1;
+
+    const auto forget = [&](int reg) {
+        if (reg >= 0 && reg < ND_MAX_GPR_REGS) {
+            this_regs[reg] = false;
+            if (vtable_reg == reg) {
+                vtable_reg = -1;
+            }
+        }
+    };
+
+    for (int i = 0; i < 96; ++i) {
+        const auto ix = utility::decode_one(ip, 32);
+
+        if (!ix) {
+            return std::nullopt;
+        }
+
+        if (ix->Instruction == ND_INS_RETN || ix->Instruction == ND_INS_INT3) {
+            break;
+        }
+
+        const auto& op0 = ix->Operands[0];
+        const auto& op1 = ix->Operands[1];
+
+        if (ix->Instruction == ND_INS_MOV && ix->OperandsCount >= 2 && op0.Type == ND_OP_REG &&
+            op0.Info.Register.Type == ND_REG_GPR)
+        {
+            const int dst = (int)op0.Info.Register.Reg;
+
+            if (op1.Type == ND_OP_REG && op1.Info.Register.Type == ND_REG_GPR) {
+                const int src = (int)op1.Info.Register.Reg;
+                if (this_regs[src]) {
+                    this_regs[dst] = true;
+                } else if (vtable_reg == src) {
+                    vtable_reg = dst;
+                } else {
+                    forget(dst);
+                }
+            } else if (op1.Type == ND_OP_MEM && op1.Info.Memory.HasBase && !op1.Info.Memory.HasIndex &&
+                       this_regs[op1.Info.Memory.Base] && (!op1.Info.Memory.HasDisp || op1.Info.Memory.Disp == 0))
+            {
+                forget(dst);
+                vtable_reg = dst; // mov reg, [this]
+            } else if (vtable_reg >= 0 && op1.Type == ND_OP_MEM && op1.Info.Memory.HasBase &&
+                       (int)op1.Info.Memory.Base == vtable_reg && op1.Info.Memory.HasDisp)
+            {
+                // mov reg, [vtable + slot*8] (tail-call form)
+                const auto disp = (int64_t)op1.Info.Memory.Disp;
+                return (disp >= 0 && disp % 8 == 0) ? std::optional<uint32_t>((uint32_t)(disp / 8)) : std::nullopt;
+            } else {
+                forget(dst);
+            }
+        } else if ((ix->Instruction == ND_INS_CALLNI || ix->Instruction == ND_INS_JMPNI) && vtable_reg >= 0 &&
+                   op0.Type == ND_OP_MEM && op0.Info.Memory.HasBase && (int)op0.Info.Memory.Base == vtable_reg)
+        {
+            const auto disp = op0.Info.Memory.HasDisp ? (int64_t)op0.Info.Memory.Disp : 0;
+            return (disp >= 0 && disp % 8 == 0) ? std::optional<uint32_t>((uint32_t)(disp / 8)) : std::nullopt;
+        } else if (ix->Instruction == ND_INS_CALLNR || ix->Instruction == ND_INS_CALLNI) {
+            // An unrelated call clobbers the volatile registers.
+            for (int r : {NDR_RAX, NDR_RCX, NDR_RDX, NDR_R8, NDR_R9, NDR_R10, NDR_R11}) {
+                forget(r);
+            }
+        }
+
+        ip += ix->Length;
+    }
+
+    return std::nullopt;
+}
+
+void flat3d_guarded_save_settings(sdk::UObject* self) {
+    auto& g = g_settings_guard;
+    const auto original = g.original;
+
+    if (original == nullptr) {
+        return;
+    }
+
+    if (g_settings_guard_inside || self != g.object || !g.enabled.load(std::memory_order_relaxed) ||
+        !g.armed.load(std::memory_order_relaxed))
+    {
+        original(self);
+        return;
+    }
+
+    struct Leave {
+        ~Leave() { g_settings_guard_inside = false; }
+    } leave{};
+    g_settings_guard_inside = true;
+
+    const bool can_log = !g_flat3d_tearing_down;
+
+    const auto cur = flat3d_gus_get_res(self, g.get_res);
+    const auto cur_mode = flat3d_gus_get_mode(self, g.get_mode);
+    const auto imposed_w = g.imposed_w.load();
+    const auto imposed_h = g.imposed_h.load();
+
+    // The MODE is the tell. We always put the stored resolution back after an
+    // apply (so the object usually holds the user's resolution under OUR mode),
+    // and a game that re-syncs from the live window holds our native under our
+    // mode. Any other mode is an in-game choice: it passes through and becomes
+    // the remembered preference.
+    if (cur_mode != g.imposed_mode.load()) {
+        if (cur.x > 0 && cur.y > 0) {
+            g.user_w = cur.x;
+            g.user_h = cur.y;
+            g.user_mode = cur_mode;
+        }
+
+        if (can_log) {
+            spdlog::info("[Flat3D] Settings guard: save passes through ({}x{} {} is the game's own choice)",
+                         cur.x, cur.y, flat3d_window_mode_name(cur_mode));
+        }
+
+        original(self);
+        return;
+    }
+
+    // A resolution-only impose (r.SetRes: mode untouched) cannot be told apart
+    // from the user later picking native under that same mode, except by time.
+    if (!g.imposed_changes_mode.load(std::memory_order_relaxed)) {
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        if (now_ms - g.last_impose_ms.load(std::memory_order_relaxed) > 30000) {
+            if (cur.x > 0 && cur.y > 0) {
+                g.user_w = cur.x;
+                g.user_h = cur.y;
+                g.user_mode = cur_mode;
+            }
+
+            if (can_log) {
+                spdlog::info("[Flat3D] Settings guard: save passes through ({}x{} {}; our last resolution-only impose "
+                             "was long enough ago that this is the user's)",
+                             cur.x, cur.y, flat3d_window_mode_name(cur_mode));
+            }
+
+            original(self);
+            return;
+        }
+    }
+
+    // Under our mode, a resolution that is not our native is the user's (put
+    // back by us, or picked in-game since): keep it and remember it. Our
+    // native itself is replaced by the remembered one.
+    const bool res_is_ours = cur.x == imposed_w && cur.y == imposed_h;
+
+    if (!res_is_ours && cur.x > 0 && cur.y > 0) {
+        g.user_w = cur.x;
+        g.user_h = cur.y;
+    }
+
+    const Flat3DIntPoint write{g.user_w.load(), g.user_h.load()};
+    const auto write_mode = g.user_mode.load();
+    const bool changes = write.x != cur.x || write.y != cur.y || write_mode != cur_mode;
+
+    if (!changes || write.x <= 0 || write.y <= 0) {
+        original(self);
+        return;
+    }
+
+    const auto conf = flat3d_gus_get_res(self, g.get_confirmed_res);
+    const auto conf_mode = flat3d_gus_get_mode(self, g.get_confirmed_mode);
+
+    if (can_log) {
+        spdlog::info("[Flat3D] Settings guard: the game is saving OUR {}x{} {} - writing the user's {}x{} {} instead",
+                     cur.x, cur.y, flat3d_window_mode_name(cur_mode), write.x, write.y,
+                     flat3d_window_mode_name(write_mode));
+    }
+
+    flat3d_gus_set_res(self, g.set_res, write);
+    flat3d_gus_set_mode(self, g.set_mode, write_mode);
+    flat3d_gus_call(self, g.confirm); // LastConfirmed* too, so a load-time revert lands on the same values
+
+    original(self);
+
+    // Put the running game's view back exactly: the confirmed pair first
+    // (only reachable through confirm), then the current pair.
+    if (g.get_confirmed_res != nullptr && conf.x > 0 && conf.y > 0) {
+        flat3d_gus_set_res(self, g.set_res, conf);
+        flat3d_gus_set_mode(self, g.set_mode, conf_mode);
+        flat3d_gus_call(self, g.confirm);
+    }
+
+    flat3d_gus_set_res(self, g.set_res, cur);
+    flat3d_gus_set_mode(self, g.set_mode, cur_mode);
+}
+
+// Records what the game's settings object holds right before we impose
+// (w x h at `mode`): that is the user's own choice, the values a later save of
+// our imposed state is rewritten to. Rules: the first capture takes whatever is
+// there; after that a different mode is a fresh in-game choice (take both), the
+// same mode only refreshes the resolution when it is not our native.
+void flat3d_settings_guard_arm(sdk::UObject* settings, sdk::UClass* settings_class, uint32_t w, uint32_t h,
+                               uint8_t imposed_mode);
+
+void flat3d_settings_guard_install(sdk::UObject* settings, sdk::UClass* settings_class) {
+    auto& g = g_settings_guard;
+
+    if (g.install_attempted) {
+        return;
+    }
+    g.install_attempted = true;
+
+    const auto save_fn = settings_class->find_function(L"SaveSettings");
+    const auto slot = flat3d_vtable_slot_from_exec_thunk(save_fn);
+
+    if (!slot || *slot >= 2048) {
+        spdlog::warn("[Flat3D] Settings guard: could not locate UGameUserSettings::SaveSettings in the vtable "
+                     "(function {:x}, slot {}) - the game's saves are left alone",
+                     (uintptr_t)save_fn, slot ? (int)*slot : -1);
+        return;
+    }
+
+    auto** vtable = *(void***)settings;
+    const auto target = vtable[*slot];
+    const auto module = target != nullptr ? utility::get_module_within((uintptr_t)target) : std::nullopt;
+
+    if (!module) {
+        spdlog::warn("[Flat3D] Settings guard: vtable slot {} does not point into a module ({:x}) - saves left alone",
+                     *slot, (uintptr_t)target);
+        return;
+    }
+
+    g.get_res = settings_class->find_function(L"GetScreenResolution");
+    g.set_res = settings_class->find_function(L"SetScreenResolution");
+    g.get_mode = settings_class->find_function(L"GetFullscreenMode");
+    g.set_mode = settings_class->find_function(L"SetFullscreenMode");
+    g.confirm = settings_class->find_function(L"ConfirmVideoMode");
+    g.get_confirmed_res = settings_class->find_function(L"GetLastConfirmedScreenResolution");
+    g.get_confirmed_mode = settings_class->find_function(L"GetLastConfirmedFullscreenMode");
+
+    if (g.get_res == nullptr || g.set_res == nullptr || g.get_mode == nullptr || g.set_mode == nullptr) {
+        spdlog::warn("[Flat3D] Settings guard: GameUserSettings lacks the resolution/mode accessors - saves left alone");
+        return;
+    }
+
+    g.object = settings;
+    g.hook = new PointerHook(&vtable[*slot], (void*)&flat3d_guarded_save_settings); // leaked on purpose
+    g.original = g.hook->get_original<void (*)(sdk::UObject*)>();
+
+    spdlog::info("[Flat3D] Settings guard: hooked UGameUserSettings::SaveSettings (vtable slot {}, {:x} = module + {:x}); "
+                 "saves of our imposed native borderless will carry the user's own values",
+                 *slot, (uintptr_t)target, (uintptr_t)target - (uintptr_t)*module);
+}
+
+void flat3d_settings_guard_arm(sdk::UObject* settings, sdk::UClass* settings_class, uint32_t w, uint32_t h,
+                               uint8_t imposed_mode) {
+    auto& g = g_settings_guard;
+
+    const auto cur = flat3d_gus_get_res(settings, settings_class->find_function(L"GetScreenResolution"));
+    const auto cur_mode = flat3d_gus_get_mode(settings, settings_class->find_function(L"GetFullscreenMode"));
+
+    g.imposed_w = (int32_t)w;
+    g.imposed_h = (int32_t)h;
+    g.imposed_mode = imposed_mode;
+    g.imposed_changes_mode = cur_mode != imposed_mode;
+    g.last_impose_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    if (cur.x > 0 && cur.y > 0) {
+        const bool res_is_native = cur.x == (int32_t)w && cur.y == (int32_t)h;
+        bool changed = false;
+
+        if (!g.armed.load()) {
+            g.user_w = cur.x;
+            g.user_h = cur.y;
+            g.user_mode = cur_mode;
+            g.armed = true;
+            changed = true;
+        } else if (cur_mode != imposed_mode) {
+            changed = g.user_w.load() != cur.x || g.user_h.load() != cur.y || g.user_mode.load() != cur_mode;
+            g.user_w = cur.x;
+            g.user_h = cur.y;
+            g.user_mode = cur_mode;
+        } else if (!res_is_native) {
+            changed = g.user_w.load() != cur.x || g.user_h.load() != cur.y;
+            g.user_w = cur.x;
+            g.user_h = cur.y;
+        }
+
+        if (changed) {
+            spdlog::info("[Flat3D] Settings guard: remembering the user's {}x{} {} (imposing {}x{} {})",
+                         g.user_w.load(), g.user_h.load(), flat3d_window_mode_name(g.user_mode.load()),
+                         w, h, flat3d_window_mode_name(imposed_mode));
+        }
+    }
+
+    flat3d_settings_guard_install(settings, settings_class);
+}
+
+// Resolves the live GameUserSettings object (the game's own subclass) and its
+// class; false when the engine is not far enough along yet.
+bool flat3d_find_gameusersettings(sdk::UObject*& settings_out, sdk::UClass*& class_out) {
+    const auto c = sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.GameUserSettings");
+    if (c == nullptr) {
+        return false;
+    }
+
+    const auto dfo = c->get_class_default_object();
+    if (dfo == nullptr) {
+        return false;
+    }
+
+    const auto get_fn = c->find_function(L"GetGameUserSettings");
+    if (get_fn == nullptr) {
+        return false;
+    }
+
+    struct {
+        sdk::UObject* return_value{nullptr};
+    } get_params{};
+
+    dfo->process_event(get_fn, &get_params);
+
+    if (get_params.return_value == nullptr || get_params.return_value->get_class() == nullptr) {
+        return false;
+    }
+
+    settings_out = get_params.return_value;
+    class_out = get_params.return_value->get_class();
+    return true;
+}
+
+bool apply_gameusersettings_resolution(uint32_t w, uint32_t h, bool full_apply, uint8_t window_mode = 1,
+                                       bool guard_saves = true) {
     const auto c = sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.GameUserSettings");
     if (c == nullptr) {
         return false;
@@ -361,6 +1120,8 @@ bool apply_gameusersettings_resolution(uint32_t w, uint32_t h, bool full_apply, 
     const auto apply_fn = settings_class->find_function(full_apply ? L"ApplySettings" : L"ApplyResolutionSettings");
 
     if (set_res_fn == nullptr || apply_fn == nullptr) {
+        spdlog::warn("[Flat3D] GameUserSettings: {} lacks SetScreenResolution/{} - cannot apply through it",
+                     utility::narrow(settings_class->get_full_name()), full_apply ? "ApplySettings" : "ApplyResolutionSettings");
         return false;
     }
 
@@ -374,6 +1135,19 @@ bool apply_gameusersettings_resolution(uint32_t w, uint32_t h, bool full_apply, 
     struct { int32_t x; int32_t y; } orig{0, 0};
     if (get_res_fn != nullptr) {
         settings->process_event(get_res_fn, &orig);
+    }
+
+    const auto orig_mode = flat3d_gus_get_mode(settings, settings_class->find_function(L"GetFullscreenMode"));
+
+    spdlog::info("[Flat3D] GameUserSettings: applying {}x{} {} via {} (game holds {}x{} {})",
+                 w, h, flat3d_window_mode_name(window_mode), full_apply ? "ApplySettings" : "ApplyResolutionSettings",
+                 orig.x, orig.y, flat3d_window_mode_name(orig_mode));
+
+    // Saved-settings guard: what the object holds NOW is the user's own choice,
+    // the values a later save of our imposed state is rewritten to. (Katanga
+    // passes guard_saves=false: it wants the game genuinely windowed.)
+    if (guard_saves) {
+        flat3d_settings_guard_arm(settings, settings_class, w, h, window_mode);
     }
 
     struct {
@@ -394,14 +1168,29 @@ bool apply_gameusersettings_resolution(uint32_t w, uint32_t h, bool full_apply, 
     } apply_params{false};
     settings->process_event(apply_fn, &apply_params);
 
-    // Put the stored resolution back to the user's value WITHOUT re-applying:
-    // the swapchain is already native and the render resolution is preserved, so
-    // this only fixes the game's own setting/UI and any later SaveSettings() —
-    // leaving native there would make the game boot at native next launch and
-    // render there (no upscale, full GPU cost).
+    // Put the stored resolution AND mode back to the user's values WITHOUT
+    // re-applying: the engine already took the request (RequestResolutionChange
+    // is deferred to its tick and reads GSystemResolution, not this object), so
+    // this only decides what the game believes about itself from here on. That
+    // matters: a game keeps windowed semantics only while it believes it is
+    // windowed - Hellblade 2 applies its resolution picker through the engine
+    // in Windowed, and in borderless neither applies it nor writes it to this
+    // object (desktop resolution, picker inert). With the user's mode back, a
+    // menu resolution change reaches us as a ResizeBuffers and the nudge
+    // re-imposes in one round; the window itself never moves (size, styles and
+    // maximize are all held), so the game's windowed re-apply reflex has
+    // nothing to react to. Katanga keeps the game genuinely windowed and skips
+    // the mode restore.
     if (get_res_fn != nullptr && orig.x > 0 && orig.y > 0) {
         settings->process_event(set_res_fn, &orig);
     }
+
+    if (guard_saves && set_mode_fn != nullptr && orig_mode != window_mode) {
+        flat3d_gus_set_mode(settings, set_mode_fn, orig_mode);
+    }
+
+    spdlog::info("[Flat3D] GameUserSettings: applied; the game's stored setting is back to {}x{} {}",
+                 orig.x, orig.y, flat3d_window_mode_name(guard_saves ? orig_mode : window_mode));
 
     return true;
 }
@@ -1392,6 +2181,7 @@ void VR::sample_flat3d_camera_and_publish_anchors() {
 void VR::update_flat3d_ensure_windowed() {
     // Let the game own its swapchain/window size again — the Katanga shared
     // texture is sized from the render resolution, not the window.
+    flat3d_window_hold_release();
     if (auto& h12 = g_framework->get_d3d12_hook(); h12 != nullptr) {
         h12->set_forced_resize(0, 0);
     }
@@ -1440,7 +2230,7 @@ void VR::update_flat3d_ensure_windowed() {
         // resolution (apply_gameusersettings_resolution restores the stored
         // value after applying).
         if (w != 0 && h != 0) {
-            apply_gameusersettings_resolution(w, h, /*full_apply=*/false, /*window_mode=*/2);
+            apply_gameusersettings_resolution(w, h, /*full_apply=*/false, /*window_mode=*/2, /*guard_saves=*/false);
         }
 
         if (!win32_fallback) {
@@ -1452,6 +2242,7 @@ void VR::update_flat3d_ensure_windowed() {
         const auto st = GetWindowLongPtrW(wnd, GWL_STYLE);
         const auto want = (st & ~static_cast<LONG_PTR>(WS_POPUP)) | WS_OVERLAPPEDWINDOW;
         if (want != st) {
+            Flat3DWindowHoldBypass bypass{}; // ours, never held
             SetWindowLongPtrW(wnd, GWL_STYLE, want);
             SetWindowPos(wnd, nullptr, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
@@ -1459,13 +2250,66 @@ void VR::update_flat3d_ensure_windowed() {
     });
 }
 
-// Called once per game-thread frame (from VR::on_frame) while flat3d is the
+// Called once per PRESENTED frame (VR::on_frame, which Framework runs from the
+// Present hook - the render thread, not the game thread; anything that touches
+// engine objects from here goes through GameThreadWorker) while flat3d is the
 // active runtime. Derives the EFFECTIVE separation/convergence from the
 // calibrated triple (depth, convergence, reference FoV) + live game FoV.
+void VR::flat3d_release_window_hold() {
+    flat3d_window_hold_release();
+}
+
+void VR::flat3d_note_engine_viewport_size(uint32_t w, uint32_t h) {
+    if (w < 64 || h < 64) {
+        return;
+    }
+
+    const auto refresh = [&](auto& hook) {
+        // Only while the native hold pins the swapchain: outside it, the
+        // belief stays what ResizeBuffers captured (zero in the VR runtimes).
+        if (hook == nullptr || hook->get_forced_resize_width() == 0) {
+            return;
+        }
+
+        if (hook->get_engine_believed_width() == w && hook->get_engine_believed_height() == h) {
+            return;
+        }
+
+        spdlog::info("[Flat3D] Native output: engine viewport is now {}x{} (was believed {}x{}) - refreshed from "
+                     "the render-target-size request, no ResizeBuffers followed",
+                     w, h, hook->get_engine_believed_width(), hook->get_engine_believed_height());
+        hook->set_engine_believed(w, h);
+
+        // The game's OWN viewport changes also set the render resolution here,
+        // under the same rule as the ResizeBuffers capture (our nudges and kicks
+        // suppress it, the game's changes don't). A change that lands ON the
+        // pinned native - the user picking borderless / desktop resolution -
+        // never reaches ResizeBuffers, so without this the per-eye size would
+        // stay at the previous sub-native request no matter what they chose.
+        // Never larger than native: a viewport bigger than the display is an
+        // engine DPI echo, not a render request.
+        const bool game_change = !hook->is_render_res_capture_suppressed() &&
+                                 w <= hook->get_forced_resize_width() && h <= hook->get_forced_resize_height();
+
+        if (game_change && (hook->get_game_requested_width() != w || hook->get_game_requested_height() != h)) {
+            spdlog::info("[Flat3D] Native output: the game requested {}x{} on its own (viewport change outside our "
+                         "nudges) - the 3D render resolution follows",
+                         w, h);
+            hook->set_game_requested(w, h);
+        }
+    };
+
+    refresh(g_framework->get_d3d12_hook());
+    refresh(g_framework->get_d3d11_hook());
+}
+
 void VR::update_flat3d_params() {
     auto flat3d = get_flat3d_runtime();
 
     if (flat3d == nullptr || !flat3d->loaded) {
+        // Nothing re-arms the hold while flat3d is not driving the frame, so
+        // never leave the game's window pinned behind us.
+        flat3d_window_hold_release();
         return;
     }
 
@@ -1686,16 +2530,58 @@ void VR::update_flat3d_params() {
             const auto bb_w = (uint32_t)rt.x;
             const auto bb_h = (uint32_t)rt.y;
 
+            // The BACKBUFFER cannot answer "has the engine accepted native?" —
+            // the resize rewrite pins it at native the first time the game
+            // touches it, so a swapchain-only compare goes quiet immediately
+            // and we stop asking while the ENGINE still believes its own
+            // sub-native resolution. It keeps re-applying that belief to its
+            // window (Hellblade 2, every kick) and draws its UI at that size
+            // into our native backbuffer. So nudge on the engine's belief when
+            // we have one, and fall back to the backbuffer before the first
+            // resize has told us what the engine thinks.
+            uint32_t eng_w = 0;
+            uint32_t eng_h = 0;
+
+            if (auto& h12 = g_framework->get_d3d12_hook(); h12 != nullptr && h12->get_engine_believed_width() != 0) {
+                eng_w = h12->get_engine_believed_width();
+                eng_h = h12->get_engine_believed_height();
+            } else if (auto& h11 = g_framework->get_d3d11_hook(); h11 != nullptr) {
+                eng_w = h11->get_engine_believed_width();
+                eng_h = h11->get_engine_believed_height();
+            }
+
+            const auto cur_w = eng_w != 0 ? eng_w : bb_w;
+            const auto cur_h = eng_w != 0 ? eng_h : bb_h;
+
             static std::chrono::steady_clock::time_point last_nudge{};
             static int nudge_attempts = 0;
 
-            if (!half_stretch && bb_w != 0 && (bb_w != swap_w || bb_h != swap_h)) {
+            // Debounce: never impose while the engine is still mid-change. A
+            // game applying a menu pick can resize two or three times within
+            // ~100ms (Hellblade 2: its pick, its windowed re-apply, UE's
+            // windowed clamp), each a swapchain reset with UI textures, scene
+            // capture, DLSS features and our compositor all rebuilt; stacking
+            // our own reset onto that storm is where the GPU-crash reports
+            // cluster. Wait for the engine's size to hold still first - the
+            // pick then settles, and ONE impose follows.
+            static uint32_t last_engine_w = 0;
+            static uint32_t last_engine_h = 0;
+            static std::chrono::steady_clock::time_point last_engine_size_change{};
+
+            if (cur_w != last_engine_w || cur_h != last_engine_h) {
+                last_engine_w = cur_w;
+                last_engine_h = cur_h;
+                last_engine_size_change = std::chrono::steady_clock::now();
+            }
+
+            if (!half_stretch && cur_w != 0 && (cur_w != swap_w || cur_h != swap_h)) {
                 const auto now = std::chrono::steady_clock::now();
+                const bool engine_settled = now - last_engine_size_change > std::chrono::seconds(3);
 
                 // r.SetRes resizes within a frame or two on the games we target,
                 // so retry fast; nudge_attempts resets the moment native is
                 // reached, so this never spams once it takes.
-                if (now - last_nudge > std::chrono::seconds(4)) {
+                if (engine_settled && now - last_nudge > std::chrono::seconds(4)) {
                     last_nudge = now;
 
                     if (nudge_attempts < 6) {
@@ -1704,7 +2590,11 @@ void VR::update_flat3d_params() {
                         const auto seed = [&](auto& hook) {
                             if (hook != nullptr) {
                                 if (hook->get_game_requested_width() == 0) {
-                                    hook->set_game_requested(bb_w, bb_h);
+                                    // The engine's own belief IS the in-game
+                                    // resolution, so it is what the 3D render
+                                    // resolution should be (the backbuffer is
+                                    // already ours).
+                                    hook->set_game_requested(cur_w, cur_h);
                                 }
                                 // Window, not one-shot: some games (Gotham
                                 // Knights) re-apply OUR resolution multiple
@@ -1715,30 +2605,51 @@ void VR::update_flat3d_params() {
                         seed(g_framework->get_d3d12_hook());
                         seed(g_framework->get_d3d11_hook());
 
-                        // r.SetRes is the standard UE path and is intercepted by
-                        // our ResizeBuffers hook, so it forces the swapchain
-                        // native without persisting a resolution change — give it
-                        // the bulk of the attempts. Only fall back to
-                        // GameUserSettings.ApplyResolutionSettings (still no save,
-                        // and it restores the stored resolution afterward) for
-                        // games that ignore r.SetRes. We deliberately never call
-                        // ApplySettings: its SaveSettings() would write native
-                        // into the game's own config, so the game would boot at
-                        // native next launch and render there (no upscale).
-                        const int method = nudge_attempts <= 4 ? 0 : 1;
+                        spdlog::info("[Flat3D] Native output: engine is at {}x{} (backbuffer {}x{}), native is "
+                                     "{}x{} — asking the engine to resize (attempt {})",
+                                     cur_w, cur_h, bb_w, bb_h, swap_w, swap_h, nudge_attempts);
 
-                        spdlog::info("[Flat3D] Native output: swapchain {}x{} doesn't match native {}x{} — "
-                                     "asking the engine to resize ({}, attempt {})",
-                                     bb_w, bb_h, swap_w, swap_h,
-                                     method == 0 ? "r.SetRes" : "GameUserSettings.ApplyResolutionSettings",
-                                     nudge_attempts);
+                        // Two levers, neither of which persists anything: r.SetRes
+                        // (mode untouched; keeps an exclusive-fullscreen game
+                        // exclusive) and GameUserSettings.ApplyResolutionSettings
+                        // at WindowedFullscreen (the stored setting is put back
+                        // right after). Which goes first is decided on the game
+                        // thread from the game's own window mode: a WINDOWED game
+                        // gets the settings path first, because such games
+                        // re-apply their stored windowed resolution on every
+                        // change and undo a plain r.SetRes within a frame
+                        // (Hellblade 2: four in a row, each a full swapchain and
+                        // compositor rebuild), while the settings path took on
+                        // the first try. Anything else gets r.SetRes first. Each
+                        // falls back to the other after enough attempts. We
+                        // deliberately never call ApplySettings: its
+                        // SaveSettings() would persist native.
+                        GameThreadWorker::get().enqueue([swap_w, swap_h, attempt = nudge_attempts]() {
+                            sdk::UObject* settings = nullptr;
+                            sdk::UClass* settings_class = nullptr;
+                            const bool have_settings = flat3d_find_gameusersettings(settings, settings_class);
+                            const uint8_t mode = have_settings
+                                ? flat3d_gus_get_mode(settings, settings_class->find_function(L"GetFullscreenMode"))
+                                : (uint8_t)0xff;
+                            const bool windowed = mode == 2;
+                            const bool settings_first = windowed ? attempt <= 3 : attempt > 4;
 
-                        GameThreadWorker::get().enqueue([swap_w, swap_h, method]() {
-                            if (method != 0 && apply_gameusersettings_resolution(swap_w, swap_h, /*full_apply=*/false)) {
+                            spdlog::info("[Flat3D] Native output: game window mode is {} - trying {} first",
+                                         have_settings ? flat3d_window_mode_name(mode) : "unknown",
+                                         settings_first ? "GameUserSettings.ApplyResolutionSettings" : "r.SetRes");
+
+                            if (settings_first && apply_gameusersettings_resolution(swap_w, swap_h, /*full_apply=*/false)) {
                                 return;
                             }
 
                             if (auto* engine = sdk::UEngine::get(); engine != nullptr) {
+                                // r.SetRes leaves the window mode alone, but a game that
+                                // re-syncs its settings from the live window still saves
+                                // our native at exit - arm the guard with the mode it has.
+                                if (have_settings) {
+                                    flat3d_settings_guard_arm(settings, settings_class, swap_w, swap_h, mode);
+                                }
+
                                 const std::wstring cmd =
                                     L"r.SetRes " + std::to_wstring(swap_w) + L"x" + std::to_wstring(swap_h);
                                 engine->exec(cmd.c_str());
@@ -1746,8 +2657,9 @@ void VR::update_flat3d_params() {
                         });
                     } else if (nudge_attempts == 6) {
                         ++nudge_attempts;
-                        spdlog::warn("[Flat3D] Native output: engine ignored the resize requests; output "
-                                     "stays {}x{} until the game changes resolution", bb_w, bb_h);
+                        spdlog::warn("[Flat3D] Native output: engine ignored the resize requests and stays at "
+                                     "{}x{}; the window hold keeps the output at native ({}x{}) but the engine's "
+                                     "own UI may size itself from its belief", cur_w, cur_h, swap_w, swap_h);
                     }
                 }
             } else if (nudge_attempts != 0) {
@@ -1854,6 +2766,12 @@ void VR::update_flat3d_params() {
             const auto wnd = g_framework->get_window();
             RECT client{};
 
+            // Arm (and keep current) the window hold, so a game that re-applies
+            // its own window rect between our 3s polls cannot shrink it back.
+            flat3d_window_hold_arm(wnd, target_x, target_y, (int)win_w, (int)win_h,
+                                   m_flat3d_window_hold->value());
+            g_settings_guard.enabled.store(m_flat3d_keep_saved_video_settings->value(), std::memory_order_relaxed);
+
             // Use the REAL client rect (bypass the half-width spoof) so our own
             // window management still sees the true full-panel size.
             if (wnd != nullptr && flat3d_real_client_rect(wnd, &client)) {
@@ -1899,6 +2817,7 @@ void VR::update_flat3d_params() {
                         // WM_STYLECHANGING to the owner and can deadlock
                         // against the render thread we're called from.
                         GameThreadWorker::get().enqueue([wnd, target_x, target_y, win_w, win_h]() {
+                            Flat3DWindowHoldBypass bypass{}; // ours, never held
                             constexpr LONG_PTR kStripStyles =
                                 WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
                             const auto style = GetWindowLongPtrW(wnd, GWL_STYLE);
@@ -2703,6 +3622,25 @@ void VR::on_draw_sidebar_flat3d() {
         ImGui::SetTooltip("HDR output (PQ/scRGB swapchains) washes out the 3D modes and\n"
                           "disables ghost reduction - this switches the game back to SDR.\n"
                           "Turn off to experiment with HDR passthrough.");
+    }
+
+    m_flat3d_window_hold->draw("Hold Window Size");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Keeps the game window pinned borderless at the display's native rect:\n"
+                          "the game's own window resize/move calls are rewritten to it instead\n"
+                          "of obeyed. Fixes games that fight the forced fullscreen by re-applying\n"
+                          "their in-game resolution to the window every few frames (Hellblade 2).\n"
+                          "Turn off if a game needs to own its window (windowed play, odd alt-tab).");
+    }
+
+    m_flat3d_keep_saved_video_settings->draw("Keep Game's Saved Video Settings");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Native output switches the game to borderless at native through its own\n"
+                          "settings. Some games then save THAT (Hellblade 2 saves on exit) and boot\n"
+                          "borderless at native next time - full-resolution rendering cost. With this on,\n"
+                          "a save of our imposed state writes your own resolution and window mode instead.\n"
+                          "Any other choice you make in-game is saved as-is. Turn off to let the game save\n"
+                          "whatever it holds (a deliberate borderless-at-native choice looks like ours).");
     }
 
     text_disabled_wrapped("Output is held at the display's native resolution; the in-game "
