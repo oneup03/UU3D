@@ -113,7 +113,7 @@ jobs:
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
         with:
           ref: ${{ matrix.sha }}
-          token: ${{ secrets.UESDK_PULLER }}
+          token: ${{ secrets.UESDK_PULLER || github.token }}
           submodules: recursive
           persist-credentials: false
           fetch-depth: 0

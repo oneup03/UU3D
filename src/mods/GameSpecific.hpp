@@ -38,6 +38,16 @@ inline bool is_dune_awakening_executable_path(std::wstring_view path) {
            lowered.find(L"duneawakening") != std::wstring::npos;
 }
 
+inline bool is_dune_ue521_frame_handoff_runtime(
+    std::wstring_view path, uint32_t version_ms, uint32_t version_ls) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"dunesandbox-win64-shipping.exe" &&
+        version_ms == 0x00050002 && version_ls == 0x00010000;
+}
+
 inline bool is_mechwarrior_clans_executable_path(std::wstring_view path) {
     const auto lowered = lowercase_path(path);
     return lowered.find(L"mechwarrior-win64-shipping") != std::wstring::npos ||
