@@ -1,8 +1,12 @@
 #include <windows.h>
 #include <DbgHelp.h>
 #include <ShlObj.h>
+#include <TlHelp32.h>
+#include <chrono>
 #include <filesystem>
+#include <format>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <SafetyHook.hpp>
 #include <spdlog/spdlog.h>
@@ -325,5 +329,174 @@ void framework::setup_exception_handler() {
         if (const auto fn = GetProcAddress(user32, "MessageBoxW"); fn != nullptr) {
             g_messagebox_w_hook = safetyhook::create_inline((void*)fn, (void*)&messagebox_w_hooked);
         }
+    }
+}
+
+// --- Hang diagnostics --------------------------------------------------------
+// A hang leaves nothing in the log: the last line is wherever each thread got
+// to, which is not the same as where it is STUCK. This walks every other thread
+// in the process and reports its current RIP plus the module-resident values
+// still sitting on its stack - enough to name the function that is not
+// returning, and (by comparing two dumps a while apart) to tell a blocked
+// thread from a spinning one.
+//
+// Everything is copied out while the thread is suspended and only formatted
+// after it is resumed: spdlog allocates, and allocating while another thread
+// holds the CRT heap lock in suspension is its own deadlock. ReadProcessMemory
+// against our own process reads the stack without IsBadReadPtr's first-chance
+// AV storm.
+void framework::dump_all_thread_stacks(const char* reason) {
+    constexpr int max_dumps = 3;
+    constexpr auto min_interval = std::chrono::seconds(20);
+    constexpr size_t stack_bytes = 0x600;
+    constexpr size_t max_frames = 14;
+
+    static std::mutex mtx{};
+    static int dumps = 0;
+    static std::chrono::steady_clock::time_point last{};
+
+    std::scoped_lock _{mtx};
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if (dumps >= max_dumps || (dumps > 0 && now - last < min_interval)) {
+        return;
+    }
+    last = now;
+    ++dumps;
+
+    const auto self = GetCurrentThreadId();
+    const auto pid = GetCurrentProcessId();
+
+    spdlog::error("[HangDump #{}] {} (dumping threads of pid {}, this is thread {})", dumps, reason, pid, self);
+
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        spdlog::error("[HangDump #{}] Could not snapshot threads ({})", dumps, GetLastError());
+        return;
+    }
+
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+
+    for (auto ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) {
+            continue;
+        }
+
+        const auto thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                       FALSE, entry.th32ThreadID);
+
+        if (thread == nullptr) {
+            continue;
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+
+        uint8_t stack[stack_bytes]{};
+        SIZE_T stack_read = 0;
+        bool have_ctx = false;
+        // SuspendThread returns the PREVIOUS suspend count: anything above zero
+        // means somebody else already had this thread frozen, which is the
+        // difference between "stuck in a loop" and "not running at all".
+        DWORD prev_suspend_count = 0;
+
+        if (const auto count = SuspendThread(thread); count != (DWORD)-1) {
+            prev_suspend_count = count;
+            have_ctx = GetThreadContext(thread, &ctx) != FALSE;
+
+            if (have_ctx) {
+                ReadProcessMemory(GetCurrentProcess(), (void*)ctx.Rsp, stack, sizeof(stack), &stack_read);
+            }
+
+            ResumeThread(thread);
+        }
+
+        CloseHandle(thread);
+
+        if (!have_ctx) {
+            continue;
+        }
+
+        const auto describe = [](uintptr_t addr) {
+            if (const auto module_within = utility::get_module_within(addr)) {
+                const auto path = utility::get_module_path(*module_within);
+                auto name = path.value_or("Unknown");
+
+                if (const auto slash = name.find_last_of("\/"); slash != std::string::npos) {
+                    name = name.substr(slash + 1);
+                }
+
+                return std::format("{} + {:x}", name, addr - (uintptr_t)*module_within);
+            }
+
+            return std::string{"<no module>"};
+        };
+
+        spdlog::error("[HangDump #{}] thread {} RIP {:x} ({}) RSP {:x} suspended_by_others={}", dumps,
+                      entry.th32ThreadID, (uintptr_t)ctx.Rip, describe(ctx.Rip), (uintptr_t)ctx.Rsp,
+                      prev_suspend_count);
+
+        // Registers name the arguments of whatever call is stuck (a memcpy's
+        // rcx/rdx/r8, say), and the region info says whether the addresses they
+        // point at are even committed and writable.
+        spdlog::error("[HangDump #{}]   RAX {:x} RBX {:x} RCX {:x} RDX {:x} RSI {:x} RDI {:x} RBP {:x} R8 {:x} R9 {:x}",
+                      dumps, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.R8, ctx.R9);
+
+        const auto describe_region = [&](const char* label, uintptr_t addr) {
+            if (addr < 0x10000) {
+                return;
+            }
+
+            MEMORY_BASIC_INFORMATION mbi{};
+
+            if (VirtualQuery((void*)addr, &mbi, sizeof(mbi)) == 0) {
+                spdlog::error("[HangDump #{}]   {} {:x}: unmapped", dumps, label, addr);
+                return;
+            }
+
+            spdlog::error("[HangDump #{}]   {} {:x}: base {:x} size {:x} state {:x} protect {:x} type {:x}", dumps,
+                          label, addr, (uintptr_t)mbi.BaseAddress, (uintptr_t)mbi.RegionSize, mbi.State, mbi.Protect,
+                          mbi.Type);
+        };
+
+        describe_region("rcx", ctx.Rcx);
+        describe_region("rdx", ctx.Rdx);
+        describe_region("rsi", ctx.Rsi);
+        describe_region("rdi", ctx.Rdi);
+
+        // Frames only for threads that are actually somewhere interesting. A
+        // thread parked in an ntdll wait is the normal state of most of a
+        // game's thread pool, and dumping fourteen frames for each of eighty of
+        // them buries the one thread that matters.
+        const auto rip_module = utility::get_module_within(ctx.Rip);
+        const auto rip_path = rip_module ? utility::get_module_path(*rip_module).value_or("") : std::string{};
+        const bool parked = rip_path.find("ntdll.dll") != std::string::npos && prev_suspend_count == 0;
+
+        if (parked) {
+            continue;
+        }
+
+        size_t logged = 0;
+
+        for (size_t off = 0; off + sizeof(uintptr_t) <= stack_read && logged < max_frames; off += sizeof(uintptr_t)) {
+            uintptr_t value{};
+            memcpy(&value, stack + off, sizeof(value));
+
+            if (value < 0x10000 || utility::get_module_within(value) == std::nullopt) {
+                continue;
+            }
+
+            spdlog::error("[HangDump #{}]   [rsp+{:x}] {:x} ({})", dumps, off, value, describe(value));
+            ++logged;
+        }
+    }
+
+    CloseHandle(snapshot);
+
+    if (const auto logger = spdlog::default_logger()) {
+        logger->flush();
     }
 }
