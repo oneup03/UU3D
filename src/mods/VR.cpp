@@ -2982,6 +2982,11 @@ void VR::on_frame() {
 
     if (is_using_flat3d()) {
         update_flat3d_params();
+    } else {
+        // Flat3D's native-output window hold is re-armed per frame from
+        // update_flat3d_params; releasing it here keeps a runtime switch from
+        // leaving the game's window pinned.
+        flat3d_release_window_hold();
     }
 
     if (!get_runtime()->ready()) {

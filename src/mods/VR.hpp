@@ -407,6 +407,18 @@ public:
         return m_runtime != nullptr && m_runtime->is_flat3d();
     }
 
+    // Drops the Flat3D native-output window hold (see VR_Flat3D.cpp). Static so
+    // the non-flat3d frame path can release it without a runtime.
+    static void flat3d_release_window_hold();
+
+    // Called by the stereo hook with the size the engine requests its render
+    // target at (= its viewport size). While native output pins the swapchain,
+    // this is the only reliable signal for a viewport change that lands ON the
+    // pinned size (no ResizeBuffers follows), so it refreshes the D3D hooks'
+    // "engine believed" size, which the UI texture and the native-output nudge
+    // are keyed on. No-op outside native output.
+    static void flat3d_note_engine_viewport_size(uint32_t w, uint32_t h);
+
     // Queues a 3D screenshot of the next composited stereo frame (Ctrl+F12 /
     // the menu-header button drawn by Framework).
     void request_flat3d_screenshot();
@@ -1532,6 +1544,16 @@ private:
     // HDR swapchains (PQ/scRGB) wash out the SDR-defined 3D output modes and
     // color correction — ask the engine to switch HDR output off while on.
     const ModToggle::Ptr m_flat3d_force_sdr{ ModToggle::create(generate_name("Flat3D_ForceSDR"), true) };
+    // Native output holds the game window borderless at the display's native
+    // rect. Some engines re-apply their own window rect between our polls
+    // (Hellblade 2 reshapes back to the in-game resolution ~40ms after every
+    // kick) — with this on, the game's SetWindowPos/MoveWindow calls against
+    // that window are rewritten to the held rect instead of obeyed.
+    const ModToggle::Ptr m_flat3d_window_hold{ ModToggle::create(generate_name("Flat3D_WindowHold"), true) };
+    // Native output imposes native + WindowedFullscreen through GameUserSettings;
+    // games that save that (HB2, at exit) boot borderless at native next time. With
+    // this on, a save of our imposed state writes the user's own resolution/mode.
+    const ModToggle::Ptr m_flat3d_keep_saved_video_settings{ ModToggle::create(generate_name("Flat3D_KeepSavedVideoSettings"), true) };
     // Scales the Flat3D render FoV. The projection is rebuilt each frame from the
     // GAME's live FoV (APlayerCameraManager::GetFOVAngle, so ADS zoom and cine
     // cameras still drive it); this multiplies that, it does not replace it.
@@ -1764,6 +1786,8 @@ public:
             *m_flat3d_eye_swap,
             *m_flat3d_vsync,
             *m_flat3d_force_sdr,
+            *m_flat3d_window_hold,
+            *m_flat3d_keep_saved_video_settings,
             *m_flat3d_fov_multiplier,
             *m_flat3d_fov_axis,
             *m_flat3d_separation,

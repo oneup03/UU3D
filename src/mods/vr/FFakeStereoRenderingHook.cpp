@@ -13708,6 +13708,11 @@ void VRRenderTargetManager_Base::calculate_render_target_size(const sdk::FViewpo
 
     SPDLOG_INFO("RenderTargetSize Before: {}x{}", x, y);
 
+    // The incoming size is the engine's viewport size - Flat3D native output
+    // keys its UI texture size and its resolution nudge on it (see the note on
+    // VR::flat3d_note_engine_viewport_size). No-op outside native output.
+    VR::flat3d_note_engine_viewport_size(x, y);
+
     // See VR::flat3d_single_view_target.
     const auto single_view = VR::get()->flat3d_single_view_target();
 
