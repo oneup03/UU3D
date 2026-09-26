@@ -12,11 +12,16 @@
 
 #include "mods/GameSpecific.hpp"
 #include "mods/vr/BodycamTextureLayout.hpp"
+#include "mods/vr/BreathedgeInventoryPolicy.hpp"
 #include "mods/vr/Borderlands4Slate.hpp"
 #include "mods/vr/UE58OwnedUITexture.hpp"
 #include "mods/vr/CompatibilityPolicy.hpp"
 #include "mods/vr/StellarBladeRendererEntry.hpp"
 #include "mods/vr/HiFiRushRendererEntry.hpp"
+#include "mods/vr/SifuRendererEntry.hpp"
+#include "mods/vr/SifuMeshCommands.hpp"
+#include "mods/vr/KtjLFogResources.hpp"
+#include "mods/vr/KtjLHookContracts.hpp"
 #include "mods/vr/SWZeroCompanyBinary.hpp"
 
 namespace {
@@ -1237,6 +1242,109 @@ void test_mafia_discovery() {
     }
 }
 
+void test_sifu_callable_renderer_entry() {
+    using namespace uevr::sifu;
+    for (const auto path : {L"Sifu-Win64-Shipping.exe", L"C:\\Games\\sifu-WIN64-shipping.EXE",
+                           L"D:/Games/Sifu-Win64-Shipping.exe"}) {
+        for (const uint32_t ms : {0u, 0x00040019u, 0x0004001Au, 0x0004001Bu, 0x00050008u}) {
+            for (const uint32_t ls : {0u, 0x00010000u, 0x00020000u, 0x00020001u, 0x00030000u}) {
+                for (const bool dx11 : {false, true}) {
+                    for (const bool native_fix : {false, true}) {
+                        expect(should_use_native_fix_renderer(path, ms, ls, dx11, native_fix) ==
+                               (ms == 0x0004001A && ls == 0x00020000 && dx11 && native_fix),
+                            "Sifu renderer is restricted to exact UE4.26.2, DX11 and effective Native Fix");
+                    }
+                }
+            }
+        }
+    }
+    for (const auto path : {L"", L"Sifu.exe", L"Sifu-Win64-Shipping.exe.bak", L"OtherSifu-Win64-Shipping.exe",
+                           L"D:/Sifu-Win64-Shipping.exe/Other.exe", L"SHCO.exe", L"TheMedium-Win64-Shipping.exe",
+                           L"Hi-Fi-RUSH.exe", L"SB-Win64-Shipping.exe", L"ObserverSystemRedux.exe",
+                           L"HellbladeGame-Win64-Shipping.exe", L"prospi-Win64-Shipping.exe"}) {
+        expect(!should_use_native_fix_renderer(path, 0x0004001A, 0x00020000, true, true),
+            "other games and filename substrings retain their original renderer resolver");
+    }
+    expect(!is_distinct_renderer_entry(0, 0x2000), "Sifu missing renderer fails closed");
+    expect(!is_distinct_renderer_entry(0x1000, 0), "Sifu missing Draw identity fails closed");
+    expect(!is_distinct_renderer_entry(0x2000, 0x2000), "Sifu cannot hook Draw as the renderer");
+    expect(is_distinct_renderer_entry(0x1000, 0x2000), "Sifu distinct renderer can be validated");
+
+    sdk::detail::FamilyLayout layout{};
+    expect(!matches_family_layout(layout), "Sifu cannot substitute undiscovered family offsets");
+    layout.has_vtable = false;
+    layout.views = 0;
+    layout.render_target = 0x18;
+    layout.scene_interface = 0x20;
+    layout.frame_count = 0xBC;
+    const auto original = layout;
+    expect(matches_family_layout(layout) && layout == original, "Sifu layout corroboration is read-only");
+    for (const auto field : {&sdk::detail::FamilyLayout::views, &sdk::detail::FamilyLayout::render_target,
+                            &sdk::detail::FamilyLayout::scene_interface, &sdk::detail::FamilyLayout::frame_count}) {
+        auto bad = layout;
+        (bad.*field).reset();
+        expect(!matches_family_layout(bad), "incomplete Sifu discovery remains retryable without publishing offsets");
+        bad.*field = *(layout.*field) + 8;
+        expect(!matches_family_layout(bad), "Sifu rejects a different learned family layout");
+    }
+    auto bad_layout = layout;
+    bad_layout.has_vtable.reset();
+    expect(!matches_family_layout(bad_layout), "unproven Sifu family polymorphism fails closed");
+    bad_layout.has_vtable = true;
+    expect(!matches_family_layout(bad_layout), "polymorphic families cannot inherit Sifu's layout");
+    bad_layout = layout;
+    bad_layout.frame_count = 0x5C;
+    expect(!matches_family_layout(bad_layout), "stock UE4 frame offset cannot be reused for Sifu");
+
+    // Independent EXE fixture, matching dev PDB: callable root [0,0x1ac),
+    // CHAININFO callback child [0x1ac,0x1ea); its parent remains the ABI entry.
+    const std::array<uint8_t, 34> prefix{
+        0x40,0x53,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x57,0x48,0x81,0xEC,0xC0,0x00,
+        0x00,0x00,0x49,0x8B,0x48,0x20,0x45,0x33,0xE4,0x49,0x8B,0xF8,0x4C,0x8B,0xEA,0x41,0x8B,0xEC};
+    const std::array<uint8_t, 24> unwind{
+        0x01,0x12,0x09,0x00,0x12,0x01,0x18,0x00,0x0B,0xF0,0x09,0xD0,
+        0x07,0xC0,0x05,0x70,0x04,0x60,0x03,0x50,0x02,0x30,0x00,0x00};
+    const std::array<uint8_t, 76> loop{
+        0x89,0x87,0xBC,0x00,0x00,0x00,0x39,0x9F,0xE8,0x00,0x00,0x00,0x7E,0x3E,0x4C,0x89,
+        0xB4,0x24,0x00,0x01,0x00,0x00,0x4D,0x8B,0xF4,0x66,0x0F,0x1F,0x84,0x00,0x00,0x00,
+        0x00,0x00,0x48,0x8B,0x87,0xE0,0x00,0x00,0x00,0x48,0x8B,0xD7,0x49,0x8B,0x0C,0x06,
+        0x48,0x8B,0x01,0xFF,0x50,0x28,0xFF,0xC3,0x4D,0x8D,0x76,0x10,0x3B,0x9F,0xE8,0x00,
+        0x00,0x00,0x7C,0xDE,0x4C,0x8B,0xB4,0x24,0x00,0x01,0x00,0x00};
+    std::array<uint8_t, 0x1EA> combined{};
+    std::copy(prefix.begin(), prefix.end(), combined.begin());
+    std::copy(loop.begin(), loop.end(), combined.begin() + 0x19E);
+    constexpr size_t callback = 0x1D4;
+    expect(has_callable_renderer_entry(combined, unwind, callback),
+        "Sifu disp32 frame store and short chained callback validate without relaxing stock thresholds");
+    expect(!has_callable_renderer_entry(std::span{combined}.subspan(0x1AC), unwind, callback - 0x1AC),
+        "Sifu callback continuation must never become a callable hook entry");
+    for (size_t i = 0; i < combined.size(); ++i) {
+        expect(!has_callable_renderer_entry(std::span{combined}.first(i), unwind, callback),
+            "truncated Sifu entry or callback loop fails closed");
+        if (i >= prefix.size() && i < 0x19E) { continue; }
+        auto bad = combined;
+        bad[i] ^= 1;
+        expect(!has_callable_renderer_entry(bad, unwind, callback),
+            "changed Sifu ABI, disp32 offsets, callback argument, loop or virtual slot fails closed");
+    }
+    for (size_t i = 0; i < unwind.size(); ++i) {
+        expect(!has_callable_renderer_entry(combined, std::span{unwind}.first(i), callback),
+            "truncated Sifu root unwind fails closed");
+        auto bad = unwind;
+        bad[i] ^= 1;
+        expect(!has_callable_renderer_entry(combined, bad, callback), "changed Sifu root unwind fails closed");
+    }
+    auto child_unwind = unwind;
+    child_unwind[0] = 0x21;
+    expect(!has_callable_renderer_entry(combined, child_unwind, callback), "Sifu CHAININFO cannot be treated as a root");
+    for (const auto offset : {size_t{0}, size_t{53}, callback - 1, callback + 1, combined.size(), SIZE_MAX}) {
+        expect(!has_callable_renderer_entry(combined, unwind, offset), "Sifu unrelated callback or invalid bounds fail closed");
+    }
+    std::vector<uint8_t> oversized(0x4001);
+    std::copy(combined.begin(), combined.end(), oversized.begin());
+    expect(!has_callable_renderer_entry(oversized, unwind, callback), "Sifu validation work stays bounded");
+}
+
 void test_hifi_rush_callable_renderer_entry() {
     using namespace uevr::hifi;
     for (const auto path : {L"C:\\Games\\Hi-Fi-RUSH.exe", L"hi-fi-rush.exe", L"Hi-Fi-RUSH.exe.bak",
@@ -1435,7 +1543,457 @@ void test_sw_zero_company_binary_revisions() {
 
 } // namespace
 
-int main() {
+void test_sifu_native_mesh_commands() {
+    using namespace uevr::sifu;
+    expect(is_supported_runtime(L"D:\\Games\\Sifu-Win64-Shipping.exe", 0x4001A, 0x20000, true),
+        "Sifu DX11 4.26.2 cache guard accepts the validated runtime");
+    for (const auto path : {L"Medium-Win64-Shipping.exe", L"HellbladeGame-Win64-Shipping.exe",
+                           L"Other-Win64-Shipping.exe", L"Sifu-Win64-Shipping.exe.bak"}) {
+        expect(!is_supported_runtime(path, 0x4001A, 0x20000, true),
+            "Sifu cache guard excludes other executables");
+    }
+    expect(!is_supported_runtime(L"Sifu-Win64-Shipping.exe", 0x4001A, 0x20000, false),
+        "Sifu cache guard does not change DX12");
+    expect(!is_supported_runtime(L"Sifu-Win64-Shipping.exe", 0x4001A, 0x10000, true) &&
+           !is_supported_runtime(L"Sifu-Win64-Shipping.exe", 0x4001B, 0x20000, true),
+        "Sifu cache guard does not infer other engine versions");
+
+    const auto validate = [](auto render, auto any, auto call) {
+        return validate_mesh_command_code(mesh_command_timestamp, mesh_command_image_size, render, any, call);
+    };
+    expect(validate(cached_render_thread_code, cached_any_thread_code, cached_relevance_call_code),
+        "Sifu complete getter and relevance caller evidence validates");
+    expect(!validate_mesh_command_code(mesh_command_timestamp + 1, mesh_command_image_size,
+               cached_render_thread_code, cached_any_thread_code, cached_relevance_call_code) &&
+           !validate_mesh_command_code(mesh_command_timestamp, mesh_command_image_size + 1,
+               cached_render_thread_code, cached_any_thread_code, cached_relevance_call_code),
+        "Sifu cache guard rejects unknown binary revisions");
+    const std::array<std::span<const uint8_t>, 3> signatures{
+        cached_render_thread_code, cached_any_thread_code, cached_relevance_call_code};
+    for (size_t index = 0; index < signatures.size(); ++index) {
+        for (size_t length = 0; length < signatures[index].size(); ++length) {
+            auto evidence = signatures;
+            evidence[index] = evidence[index].first(length);
+            expect(!validate(evidence[0], evidence[1], evidence[2]),
+                "Sifu cache guard rejects every truncated signature");
+        }
+        for (size_t offset = 0; offset < signatures[index].size(); ++offset) {
+            auto evidence = signatures;
+            std::vector<uint8_t> changed{evidence[index].begin(), evidence[index].end()};
+            changed[offset] ^= 1;
+            evidence[index] = changed;
+            expect(!validate(evidence[0], evidence[1], evidence[2]),
+                "Sifu cache guard rejects changed getter and caller instructions");
+        }
+    }
+    const auto relative = [](uint32_t rva, std::span<const uint8_t> bytes, size_t disp_offset, size_t length) {
+        int32_t displacement{};
+        std::memcpy(&displacement, bytes.data() + disp_offset, sizeof(displacement));
+        return static_cast<int64_t>(rva) + length + displacement;
+    };
+    expect(relative(cached_relevance_call_rva, cached_relevance_call_code, 1, 5) == cached_render_thread_rva,
+        "Sifu relevance constructor calls the validated render-thread decision");
+    expect(relative(cached_render_thread_rva, cached_render_thread_code, 3, 7) ==
+           relative(cached_any_thread_rva, cached_any_thread_code, 16, 20),
+        "Sifu render-thread and any-thread decisions read the same console variable");
+
+    for (const bool ready : {false, true}) {
+        for (const bool stereo : {false, true}) {
+            for (const bool native : {false, true}) {
+                const bool rebuild = rebuild_native_mesh_commands(ready, stereo, native);
+                expect(rebuild == (ready && stereo && native),
+                    "Sifu uncached commands require complete hooks and active Native stereo");
+                for (const bool original_value : {false, true}) {
+                    int calls = 0;
+                    const bool result = select_cached_mesh_commands(rebuild, [&]() {
+                        ++calls;
+                        return original_value;
+                    });
+                    expect(result == (!rebuild && original_value) && calls == (rebuild ? 0 : 1),
+                        "Sifu Native rebuilds; other modes preserve either original cache decision exactly");
+                }
+            }
+        }
+    }
+}
+
+void test_breathedge_inventory_world_guard() {
+    using namespace uevr::breathedge;
+    using uevr::games::is_breathedge2_inventory_runtime;
+    for (const auto path : {L"Breathedge2-Win64-Shipping.exe", L"D:\\Games\\Breathedge2-Win64-Shipping.exe",
+                           L"D:/Steam/BREATHEDGE2-WIN64-SHIPPING.EXE"}) {
+        expect(is_breathedge2_inventory_runtime(path, 0x00050007, 0x00040000, true),
+            "Breathedge exact executable leaf accepts case and either path separator");
+        expect(!is_breathedge2_inventory_runtime(path, 0x00050007, 0x00040000, false),
+            "Breathedge inventory guard does not assume the DX11 path");
+        for (const auto version : {std::pair{0x00050007u, 0x00030000u}, {0x00050007u, 0x00050000u},
+                                   {0x00050008u, 0x00040000u}, {0x00050007u, 0x00040001u}}) {
+            expect(!is_breathedge2_inventory_runtime(path, version.first, version.second, true),
+                "Breathedge inventory guard rejects other engine patches and revisions");
+        }
+    }
+    for (const auto path : {L"Other-Win64-Shipping.exe", L"Breathedge2-Win64-Shipping.exe.bak",
+                           L"NotBreathedge2-Win64-Shipping.exe", L"D:/Breathedge2-Win64-Shipping.exe/Other.exe"}) {
+        expect(!is_breathedge2_inventory_runtime(path, 0x00050007, 0x00040000, true),
+            "Breathedge inventory guard cannot match substrings or parent directories");
+    }
+    expect(validated_binary(0xd18f68c7, 0x0a5b0000) &&
+        !validated_binary(0xd18f68c6, 0x0a5b0000) && !validated_binary(0xd18f68c7, 0x0a5b1000),
+        "unreflected viewport/world bits require the matching PDB binary fingerprint");
+    // Captured Draw uses the secondary FCommonViewportClient base, while the
+    // engine's reflected GameViewport points to the complete UObject.
+    constexpr uintptr_t main_viewport = 0x23490fb89e0;
+    constexpr uintptr_t draw_dispatch = 0x23490fb8a08;
+    expect(viewport_candidate_from_draw(draw_dispatch) == main_viewport,
+        "live Draw subobject must resolve to the actual viewport UObject before inspecting flags");
+    expect(viewport_candidate_from_draw(draw_dispatch) + viewport_flags_offset == draw_dispatch + 0x44,
+        "viewport flag access matches the game's Draw instructions and PDB");
+    for (const auto wrong : {main_viewport, main_viewport + 0x38, draw_dispatch + 0x28, draw_dispatch - 0x28}) {
+        expect(viewport_candidate_from_draw(wrong) != main_viewport,
+            "primary, FExec and already-adjusted inputs cannot pass the main viewport identity check");
+    }
+    for (uintptr_t bad = 0; bad <= draw_viewport_subobject_offset; ++bad) {
+        expect(viewport_candidate_from_draw(bad) == 0, "null and underflowing Draw arguments fail closed");
+    }
+    expect(viewport_candidate_from_draw(draw_dispatch + 1) == 0,
+        "misaligned Draw arguments cannot become viewport UObject candidates");
+    for (unsigned bits = 0; bits < 16; ++bits) {
+        const bool native = (bits & 1) != 0, sync = (bits & 2) != 0;
+        const bool extreme = (bits & 4) != 0, screen_2d = (bits & 8) != 0;
+        expect(supported_mode(native, sync, extreme, screen_2d) == ((native || sync) && !extreme && !screen_2d),
+            "Native including Native Fix and Synced are supported; 2D, Extreme and other modes are unchanged");
+    }
+
+    const InventoryObservation inventory{true, true, false, false, false, false, 4, 1.0f, 1, 0};
+    expect(should_enable_inventory_world(inventory), "live inventory parent is eligible independently of its selected tab");
+    for (const auto member : {&InventoryObservation::game_initialized, &InventoryObservation::inventory_root}) {
+        auto invalid = inventory;
+        invalid.*member = false;
+        expect(!should_enable_inventory_world(invalid), "missing initialization or inventory root fails closed");
+    }
+    for (const auto member : {&InventoryObservation::pause_root, &InventoryObservation::auto_pause,
+                             &InventoryObservation::cutscene, &InventoryObservation::death_screen}) {
+        auto invalid = inventory;
+        invalid.*member = true;
+        expect(!should_enable_inventory_world(invalid), "pause, auto-pause, cinematics and death screens never enable the guard");
+    }
+    for (unsigned value = 0; value <= 255; ++value) {
+        auto observed = inventory;
+        observed.visibility = static_cast<uint8_t>(value);
+        expect(should_enable_inventory_world(observed) == (value == 0 || value == 3 || value == 4),
+            "hidden, collapsed and unknown visibility values are excluded");
+        observed = inventory;
+        observed.world_flags = static_cast<uint8_t>(value);
+        expect(should_enable_inventory_world(observed) == ((value & 0x21) == 1),
+            "world must have begun play and must not be tearing down");
+    }
+    for (float opacity : {0.0f, -1.0f, 1.1f, std::numeric_limits<float>::infinity(),
+                           std::numeric_limits<float>::quiet_NaN()}) {
+        auto invalid = inventory;
+        invalid.opacity = opacity;
+        expect(!should_enable_inventory_world(invalid), "invisible and invalid inventory opacity fails closed");
+    }
+    for (int32_t length : {-1, 1, 20, std::numeric_limits<int32_t>::max()}) {
+        auto invalid = inventory;
+        invalid.next_url_length = length;
+        expect(!should_enable_inventory_world(invalid), "pending travel or malformed travel state leaves world rendering untouched");
+    }
+
+    InventorySession before{{0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80}, {1, 2, 3, 4, 5, 6, 7, 8}, 0x100};
+    expect(should_restore_inventory_world(before, before, true) && !should_restore_inventory_world(before, before, false),
+        "restoration requires a still-active validated inventory session");
+    for (size_t i = 0; i < before.objects.size(); ++i) {
+        auto changed = before;
+        ++changed.objects[i];
+        expect(!should_restore_inventory_world(before, changed, true), "owner replacement or world travel must not restore a stale bit");
+        changed = before;
+        ++changed.serials[i];
+        expect(!should_restore_inventory_world(before, changed, true), "object address reuse must not restore a stale bit");
+    }
+    auto changed = before;
+    ++changed.native_viewport;
+    expect(!should_restore_inventory_world(before, changed, true), "native viewport replacement invalidates restoration");
+    expect(!should_restore_inventory_world({}, {}, true), "empty sessions never restore flags");
+    for (unsigned original = 0; original <= 255; ++original) {
+        for (unsigned current = 0; current <= 255; ++current) {
+            const auto enabled = enable_world_rendering(static_cast<uint8_t>(original));
+            const auto restored = restore_world_rendering_bit(static_cast<uint8_t>(current), static_cast<uint8_t>(original));
+            expect(enabled == (original & ~2u) && restored == ((current & ~2u) | (original & 2u)),
+                "only bDisableWorldRendering is changed and unrelated engine writes survive restoration");
+        }
+    }
+    for (unsigned opening = 0; opening < 10; ++opening) {
+        auto session = before;
+        session.objects[6] += opening * 0x100;
+        session.serials[6] += opening;
+        uint8_t flags = 0x82;
+        flags = enable_world_rendering(flags);
+        expect(flags == 0x80, "each inventory opening enables the world only for the draw");
+        expect(should_restore_inventory_world(session, session, true), "new inventory roots are accepted without a one-shot latch");
+        flags = restore_world_rendering_bit(flags, 0x82);
+        expect(flags == 0x82, "each draw restores the game's inventory rendering intent");
+        auto closed = inventory;
+        closed.inventory_root = false;
+        expect(!should_enable_inventory_world(closed), "after inventory closes the guard is inactive");
+    }
+}
+
+void test_ktjl_fog_resources() {
+    namespace f = uevr::ktjl::fog;
+    namespace k = sdk::ktjl;
+    constexpr uintptr_t base = 0x140000000, renderer = 0x60000000, views = 0x61000000;
+    constexpr uintptr_t left = 0x62000000, right = 0x62001000, states = 0x63000000;
+    const auto slot = views + f::view_stride + f::fog_reference_offset;
+    struct Fixture {
+        struct Block { uintptr_t address; std::vector<uint8_t> bytes; bool executable{}; };
+        std::vector<Block> blocks;
+        size_t reads{};
+        void add(uintptr_t address, const void* p, size_t n, bool code = false) {
+            const auto first = static_cast<const uint8_t*>(p);
+            blocks.push_back({address, {first, first + n}, code});
+        }
+        void put(uintptr_t address, const void* p, size_t n) {
+            for (auto& b : blocks) {
+                if (address >= b.address && address - b.address <= b.bytes.size() && n <= b.bytes.size() - (address - b.address)) {
+                    std::memcpy(b.bytes.data() + address - b.address, p, n); return;
+                }
+            }
+            expect(false, "KTJL fog fixture writes stay in mapped storage");
+        }
+        sdk::discovery::Memory memory() {
+            return {this,
+                [](void* c, uintptr_t a, void* p, size_t n) {
+                    auto& self = *static_cast<Fixture*>(c); ++self.reads;
+                    for (const auto& b : self.blocks) {
+                        if (a >= b.address && a - b.address <= b.bytes.size() && n <= b.bytes.size() - (a - b.address)) {
+                            std::memcpy(p, b.bytes.data() + a - b.address, n); return true;
+                        }
+                    }
+                    return false;
+                },
+                [](void* c, uintptr_t a, size_t n) {
+                    for (const auto& b : static_cast<Fixture*>(c)->blocks) {
+                        if (b.executable && a >= b.address && a - b.address <= b.bytes.size() && n <= b.bytes.size() - (a - b.address)) { return true; }
+                    }
+                    return false;
+                }};
+        }
+    };
+    const auto resource = [&](uintptr_t texture) {
+        std::array<uint8_t, 0xF0> data{};
+        const auto put = [&](size_t offset, auto value) { std::memcpy(data.data() + offset, &value, sizeof(value)); };
+        put(0, base + f::pool_vtable_rva); put(8, texture); put(0x10, texture); put(0x18, texture + 0x100);
+        put(0x88, int32_t{2}); put(0xE8, base + f::pool_rva);
+        put(0x90 + 0x14, int32_t{80}); put(0x90 + 0x18, int32_t{45}); put(0x90 + 0x1C, int32_t{64});
+        put(0x90 + 0x20, int32_t{1}); put(0x90 + 0x26, uint16_t{1}); put(0x90 + 0x28, uint16_t{1});
+        put(0x90 + 0x2C, uint32_t{10}); put(0x90 + 0x30, uint32_t{8}); put(0x90 + 0x34, uint32_t{0x40010009});
+        return data;
+    };
+    const auto fixture = [&] {
+        Fixture x;
+        std::array<uint8_t, 512> pe{};
+        const auto put = [&](size_t offset, auto value) { std::memcpy(pe.data() + offset, &value, sizeof(value)); };
+        put(0, uint16_t{0x5A4D}); put(0x3C, uint32_t{0x80}); put(0x80, uint32_t{0x4550});
+        put(0x84, uint16_t{0x8664}); put(0x88, k::image_timestamp); put(0x98, uint16_t{0x20B}); put(0xD0, k::image_size);
+        x.add(base, pe.data(), pe.size());
+        const auto code = [&](uintptr_t rva, const auto& bytes) { x.add(base + rva, bytes.data(), bytes.size(), true); };
+        code(0xAFFF76, k::class_name_access); code(0xA1DC2F, k::object_iteration); code(0x58DC4E, k::name_entry_access);
+        for (const auto& e : f::code_evidence) { code(e.rva, e.bytes); }
+        const auto accessor = base + f::get_desc_rva, release = base + 0x55AAE0, destructor = base + 0x57836D0;
+        x.add(base + f::pool_vtable_rva + 0x10, &accessor, 8); x.add(base + f::pool_vtable_rva + 0x38, &release, 8);
+        x.add(base + f::view_vtable_rva, &destructor, 8);
+        const f::Header h{views, 2, 2}; x.add(renderer + f::views_offset, &h, sizeof(h));
+        for (size_t i = 0; i < 2; ++i) {
+            const f::ViewPrefix v{base + f::view_vtable_rva, 0, renderer + 0x10, states + 0x100 * i};
+            const auto vt = base + k::stereo::state_vtable_rva;
+            const f::Rect rect{static_cast<int32_t>(640 * i), 0, static_cast<int32_t>(640 * (i + 1)), 360};
+            const auto ref = i == 0 ? left : uintptr_t{};
+            x.add(views + f::view_stride * i, &v, sizeof(v)); x.add(v.state, &vt, 8);
+            x.add(views + f::view_stride * i + f::rect_offset, &rect, sizeof(rect));
+            x.add(views + f::view_stride * i + f::fog_reference_offset, &ref, 8);
+        }
+        const auto a = resource(0x64000000), b = resource(0x65000000);
+        x.add(left, a.data(), a.size()); x.add(right, b.data(), b.size());
+        return x;
+    };
+    const auto mutate = [](Fixture& x, uintptr_t address, auto value) { x.put(address, &value, sizeof(value)); };
+    expect(f::supports(L"D:\\Games\\SuicideSquad_KTJL.exe", true), "KTJL fog gate accepts exact DX12 executable");
+    for (const auto path : {L"Other.exe", L"SuicideSquad_KTJL.exe.bak", L"D:\\SuicideSquad_KTJL.exe\\Other.exe"}) {
+        expect(!f::supports(path, true), "KTJL fog repair does not select other titles");
+    }
+    expect(!f::supports(L"SuicideSquad_KTJL.exe", false), "KTJL fog repair does not change DX11");
+    auto x = fixture();
+    expect(f::validate_code(x.memory(), base), "KTJL complete fog producer/consumer/allocator/cleanup evidence validates");
+    for (const auto& e : f::code_evidence) {
+        for (size_t i = 0; i < e.bytes.size(); ++i) {
+            x = fixture(); mutate(x, base + e.rva + i, uint8_t(e.bytes[i] ^ 1));
+            expect(!f::validate_code(x.memory(), base), "any changed KTJL fog instruction rejects installation");
+        }
+        x = fixture();
+        for (auto& b : x.blocks) { if (b.address == base + e.rva) { b.bytes.pop_back(); } }
+        expect(!f::validate_code(x.memory(), base), "truncated KTJL fog instructions reject installation");
+    }
+    for (const auto address : {base + 0x88, base + f::pool_vtable_rva + 0x10, base + f::pool_vtable_rva + 0x38, base + f::view_vtable_rva}) {
+        x = fixture(); mutate(x, address, uint32_t{});
+        expect(!f::validate_code(x.memory(), base), "changed KTJL image/accessor/cleanup vtable rejects installation");
+    }
+    x = fixture();
+    auto p = f::prepare(x.memory(), base, renderer, true);
+    expect(p.decision == f::Decision::allocate && p.right_slot == slot && p.left.address == left && x.reads <= 16,
+        "null right fog volume resolves only its owned ref with bounded render-thread reads");
+    const auto before = x.blocks;
+    int calls{};
+    auto allocate = [&](const f::Plan& plan) { ++calls; mutate(x, plan.right_slot, right); return true; };
+    expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::allocated && calls == 1,
+        "right volume allocation succeeds only after its engine-owned postconditions validate");
+    for (size_t i = 0; i < before.size(); ++i) {
+        if (before[i].address != slot) { expect(before[i].bytes == x.blocks[i].bytes, "fog allocation preserves every primary/family/scene byte"); }
+    }
+    expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::existing && calls == 1,
+        "existing distinct right fog volume is never overwritten or reallocated");
+    for (int frame = 0; frame < 20; ++frame) {
+        mutate(x, slot, uintptr_t{});
+        expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::allocated,
+            "new per-frame FViewInfo fog refs are repaired without stale private texture caching");
+    }
+    x = fixture(); calls = 0;
+    expect(f::ensure(x.memory(), base, renderer, false, allocate) == f::Outcome::passthrough && calls == 0 && x.reads == 0,
+        "disabled fog stays an exact no-allocation passthrough");
+    for (int count : {0, 1, 3, 4}) {
+        x = fixture(); mutate(x, renderer + f::views_offset + 8, int32_t{count});
+        expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::passthrough && calls == 0,
+            "mono/AFR/capture/non-pair families never enter the two-view repair");
+    }
+    const std::array<uintptr_t, 17> invalid{
+        views, views + f::view_stride, views + 0x10, views + f::view_stride + 0x10,
+        views + 0x18, states, states + 0x100, views + f::rect_offset + 8,
+        views + f::view_stride + f::rect_offset + 12, views + f::fog_reference_offset,
+        left, left + 8, left + 0x10, left + 0x18, left + 0x88, left + 0xE8, left + 0x90 + 0x2C};
+    for (auto address : invalid) {
+        x = fixture(); mutate(x, address, uint32_t{});
+        expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::rejected && calls == 0,
+            "invalid view/resource/descriptor never authorizes an engine allocator call");
+    }
+    x = fixture(); mutate(x, views + f::view_stride + 0x18, states);
+    expect(f::prepare(x.memory(), base, renderer, true).decision == f::Decision::reject, "aliased eye states are not a validated pair");
+    x = fixture(); mutate(x, slot, left);
+    expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::rejected, "never share the primary fog texture with the secondary eye");
+    x = fixture();
+    expect(f::ensure(x.memory(), base, renderer, true, [](const f::Plan&) { return false; }) == f::Outcome::rejected,
+        "allocator refusal prevents dispatch with a null resource");
+    expect(f::ensure(x.memory(), base, renderer, true, [](const f::Plan&) { return true; }) == f::Outcome::rejected,
+        "allocator return alone cannot authorize dispatch");
+    x = fixture(); mutate(x, right + 8, uintptr_t{0x64000000});
+    expect(f::ensure(x.memory(), base, renderer, true, allocate) == f::Outcome::rejected,
+        "distinct pooled objects cannot alias the same GPU texture");
+    for (const auto offset : {0x14, 0x18, 0x1C, 0x20, 0x26, 0x28, 0x2C, 0x34}) {
+        x = fixture(); mutate(x, left + 0x90 + offset, uint16_t{});
+        expect(f::prepare(x.memory(), base, renderer, true).decision == f::Decision::reject,
+            "invalid volume extent/array/mip/sample/format/flags are rejected");
+    }
+    x = fixture(); p = f::prepare(x.memory(), base, renderer, true); mutate(x, slot, right);
+    mutate(x, renderer + f::views_offset, views + 0x20000);
+    expect(!f::allocation_completed(x.memory(), base, p), "changed renderer generation cannot publish a stale fog ref");
+}
+
+void test_ktjl_hook_contracts() {
+    namespace h = uevr::ktjl::hooks;
+    namespace k = sdk::ktjl;
+    constexpr uintptr_t base = 0x140000000;
+    struct Fixture {
+        struct Block { uintptr_t address; std::vector<uint8_t> bytes; bool code; };
+        std::vector<Block> blocks;
+        void add(uintptr_t a, std::span<const uint8_t> bytes, bool code) {
+            blocks.push_back({a, {bytes.begin(), bytes.end()}, code});
+        }
+        sdk::discovery::Memory memory() {
+            return {this, [](void* c, uintptr_t a, void* p, size_t n) {
+                for (const auto& b : static_cast<Fixture*>(c)->blocks) {
+                    if (a >= b.address && a - b.address <= b.bytes.size() && n <= b.bytes.size() - (a - b.address)) {
+                        std::memcpy(p, b.bytes.data() + a - b.address, n); return true;
+                    }
+                }
+                return false;
+            }, [](void* c, uintptr_t a, size_t n) {
+                for (const auto& b : static_cast<Fixture*>(c)->blocks) {
+                    if (b.code && a >= b.address && a - b.address <= b.bytes.size() && n <= b.bytes.size() - (a - b.address)) {
+                        return true;
+                    }
+                }
+                return false;
+            }};
+        }
+    };
+    Fixture original;
+    std::array<uint8_t, 512> pe{};
+    const auto put = [&](size_t offset, auto value) { std::memcpy(pe.data() + offset, &value, sizeof(value)); };
+    put(0, uint16_t{0x5A4D}); put(0x3C, uint32_t{0x80}); put(0x80, uint32_t{0x4550});
+    put(0x84, uint16_t{0x8664}); put(0x88, k::image_timestamp); put(0x98, uint16_t{0x20B}); put(0xD0, k::image_size);
+    original.add(base, pe, false);
+    original.add(base + 0xAFFF76, k::class_name_access, true);
+    original.add(base + 0xA1DC2F, k::object_iteration, true);
+    original.add(base + 0x58DC4E, k::name_entry_access, true);
+    original.add(base + h::add_object_rva, h::add_object_entry, true);
+    original.add(base + 0x6368D9, h::add_object_store, true);
+    original.add(base + h::texture_create_rva, h::texture_entry, true);
+    original.add(base + h::allocate_return_rva, h::texture_callsite, true);
+    const auto add_ok = [&](Fixture& f) { return h::validates_add_object(f.memory(), base, base + h::add_object_rva); };
+    const auto texture_ok = [&](Fixture& f) { return h::validates_texture(f.memory(), base); };
+    expect(add_ok(original) && texture_ok(original), "KTJL exact allocator and texture call contracts validate");
+    expect(!h::validates_add_object(original.memory(), base, base + h::add_object_rva + 1),
+        "KTJL never assigns the RDX ABI to a different discovered function");
+    for (size_t block = 1; block < original.blocks.size(); ++block) {
+        const auto check = [&](Fixture& f) { return block < 4 ? add_ok(f) || texture_ok(f) :
+            block < 6 ? add_ok(f) : texture_ok(f); };
+        for (size_t i = 0; i < original.blocks[block].bytes.size(); ++i) {
+            auto changed = original; changed.blocks[block].bytes[i] ^= 1;
+            expect(!check(changed), "KTJL changed ABI instructions reject hook installation");
+        }
+        auto changed = original; changed.blocks[block].bytes.pop_back();
+        expect(!check(changed), "KTJL truncated code rejects hook installation");
+        changed = original; changed.blocks[block].code = false;
+        expect(!check(changed), "KTJL non-executable candidate rejects hook installation");
+    }
+    for (const auto offset : {0, 0x80, 0x84, 0x88, 0x98, 0xD0}) {
+        auto changed = original; changed.blocks[0].bytes[offset] ^= 1;
+        expect(!add_ok(changed) && !texture_ok(changed), "KTJL wrong executable image rejects both repairs");
+    }
+    const auto caller = base + h::texture_return_rva;
+    expect(h::owns_texture_call(base, caller, true, 6008, 2936, 1, 0, 1, false), "KTJL exact viewport transaction is owned");
+    for (const auto size : {0U, 16385U}) {
+        expect(!h::owns_texture_call(base, caller, true, size, 2936, 1, 0, 1, false), "KTJL bad width rejected");
+        expect(!h::owns_texture_call(base, caller, true, 6008, size, 1, 0, 1, false), "KTJL bad height rejected");
+    }
+    expect(!h::owns_texture_call(base, caller + 1, true, 6008, 2936, 1, 0, 1, false), "unrelated texture caller passes through");
+    expect(!h::owns_texture_call(base, caller, false, 6008, 2936, 1, 0, 1, false), "unarmed/other-thread texture call passes through");
+    expect(!h::owns_texture_call(base, caller, true, 6008, 2936, 2, 0, 1, false), "changed mip contract passes through");
+    expect(!h::owns_texture_call(base, caller, true, 6008, 2936, 1, 8, 1, false), "changed creation flags pass through");
+    expect(!h::owns_texture_call(base, caller, true, 6008, 2936, 1, 0, 2, false), "changed target flags pass through");
+    expect(!h::owns_texture_call(base, caller, true, 6008, 2936, 1, 0, 1, true), "separate resolve textures pass through");
+    auto next = [](uintptr_t p, uintptr_t& out) { out = p == 0x20000 ? 0x30000 : 0; return true; };
+    const auto chain = h::collect_class_chain(0x20000, next);
+    expect(chain && chain->count == 2 && chain->classes[0] == 0x20000 && chain->classes[1] == 0x30000,
+        "complete class chain is snapshotted in order");
+    expect(!h::collect_class_chain(0, next) && !h::collect_class_chain(0xFFFFFF01, next), "null/unaligned class is rejected");
+    expect(!h::collect_class_chain(0x20000, [](uintptr_t, uintptr_t&) { return false; }), "unreadable class cannot publish a partial chain");
+    expect(!h::collect_class_chain(0x20000, [](uintptr_t p, uintptr_t& out) { out = p; return true; }), "self-cycle rejected");
+    expect(!h::collect_class_chain(0x20000, [](uintptr_t p, uintptr_t& out) { out = p == 0x20000 ? 0x30000 : 0x20000; return true; }),
+        "multi-node cycle rejected");
+    expect(!h::collect_class_chain(0x20000, [](uintptr_t p, uintptr_t& out) { out = p + 8; return true; }), "class traversal is bounded");
+}
+
+#include "KtjLRendererEntryTests.hpp"
+#include "KtjLCloudResourcesTests.hpp"
+#include "DuneFrameHandoffTests.hpp"
+
+int main(int argc, char** argv) {
+    test_dune_frame_handoff();
+    if (argc == 3 && std::string_view{argv[1]} == "--ktjl-memory-image") { test_ktjl_cloud_memory_image(argv[2]); }
+    test_ktjl_renderer_entry();
+    test_ktjl_cloud_resources();
+    test_ktjl_hook_contracts();
+    test_ktjl_fog_resources();
+    test_breathedge_inventory_world_guard();
     test_scene_view_layouts();
     test_rendering_mode_matrix();
     test_version_gates();
@@ -1453,6 +2011,8 @@ int main() {
     test_family_snapshot_accessors();
     test_stellar_blade_callable_renderer_entry();
     test_hifi_rush_callable_renderer_entry();
+    test_sifu_callable_renderer_entry();
+    test_sifu_native_mesh_commands();
     test_sw_zero_company_binary_revisions();
 
     if (failures != 0) {

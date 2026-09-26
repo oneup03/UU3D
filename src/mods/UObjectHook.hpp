@@ -15,6 +15,7 @@
 
 #include <safetyhook.hpp>
 #include <utility/PointerHook.hpp>
+#include <utility/UObjectMetadataFilter.hpp>
 
 #include "Mod.hpp"
 
@@ -263,6 +264,7 @@ private:
     bool m_fully_hooked{false};
     bool m_wants_activate{false};
     bool m_add_object_hooked{false};
+    std::atomic_bool m_townfall_allocator_valid{false};
     std::atomic_bool m_force_uobject_array_creation_scan{false};
     std::atomic_bool m_add_object_guard_unreliable{false};
     std::atomic_bool m_stalker2_uobject_full_scan_requested{false};
@@ -301,7 +303,7 @@ private:
 
     std::unordered_map<sdk::UClass*, std::function<void (sdk::UObject*)>> m_on_creation_add_component_jobs{};
 
-    std::deque<sdk::UObject*> m_most_recent_objects{};
+    std::deque<utility::uobject::CachedRecentObject<sdk::UObject>> m_most_recent_objects{};
     std::unordered_set<sdk::UObject*> m_motion_controller_attached_objects{};
     int32_t m_uobject_array_scan_cursor{0};
 

@@ -684,6 +684,12 @@ public:
         return m_rendering_method->value() == RenderingMethod::SYNCHRONIZED;
     }
 
+    bool is_nascar_code_preserving_mode() const {
+        static_assert(RenderingMethod::NATIVE_STEREO == 0 && RenderingMethod::SYNCHRONIZED == 1);
+        return uevr::nascar::is_target() &&
+            uevr::nascar::supports_rendering_method(m_rendering_method->value(), m_extreme_compat_mode->value());
+    }
+
     bool should_ignore_native_stereo_fix_for_avowed_sync() const;
     bool should_force_native_stereo_fix_same_pass() const;
 
@@ -692,6 +698,9 @@ public:
     }
 
     SyncedSequentialMethod get_synced_sequential_method() const {
+        if (uevr::nascar::is_target() && is_using_strict_synchronized_afr()) {
+            return SyncedSequentialMethod::SKIP_TICK;
+        }
         return (SyncedSequentialMethod)m_synced_afr_method->value();
     }
 
@@ -885,6 +894,7 @@ public:
     }
 
     bool is_splitscreen_compatibility_enabled() const {
+        if (uevr::nascar::is_target()) { return false; }
         return m_splitscreen_compatibility_mode->value();
     }
 
@@ -937,10 +947,14 @@ public:
     }
 
     bool is_sceneview_compatibility_enabled() const {
+        if (uevr::nascar::is_target()) { return false; }
         return m_sceneview_compatibility_mode->value();
     }
 
     bool is_native_stereo_fix_enabled() const {
+        if (uevr::nascar::is_target()) {
+            return is_nascar_native_stereo_fix_requested() && m_fake_stereo_hook && m_fake_stereo_hook->is_nascar_native_ready();
+        }
         if (should_ignore_native_stereo_fix_for_avowed_sync()) {
             return false;
         }
@@ -963,6 +977,7 @@ public:
     }
 
     bool is_native_stereo_fix_texture_array_submit_enabled() const {
+        if (uevr::nascar::is_target()) { return false; }
         const auto runtime = get_runtime();
         return m_native_stereo_fix_texture_array_submit->value() &&
             is_native_stereo_fix_enabled() &&
@@ -987,6 +1002,7 @@ public:
     }
 
     bool is_ahud_compatibility_enabled() const {
+        if (uevr::nascar::is_target()) { return false; }
         return m_compatibility_ahud->value();
     }
 
@@ -1055,7 +1071,20 @@ public:
     void native_openxr_async_wait_worker_loop(std::stop_token stop_token);
 
     bool is_ghosting_fix_enabled() const {
+        if (uevr::nascar::is_target()) { return false; }
         return m_ghosting_fix->value();
+    }
+
+    bool is_nascar_native_stereo_fix_requested() const {
+        return uevr::nascar::is_validated_build() && m_native_stereo_fix->value() &&
+            is_nascar_code_preserving_mode() && m_rendering_method->value() == RenderingMethod::NATIVE_STEREO &&
+            !is_using_afr() && !is_stereo_emulation_enabled() && !is_using_2d_screen();
+    }
+
+    bool is_nascar_ghosting_fix_requested() const {
+        return uevr::nascar::is_target() && m_ghosting_fix->value() &&
+            is_nascar_code_preserving_mode() && is_using_strict_synchronized_afr() &&
+            !is_stereo_emulation_enabled();
     }
 
     bool is_ghosting_fix_bootstrap_enabled() const {
@@ -1742,6 +1771,7 @@ private:
     const ModToggle::Ptr m_enable_gui{ ModToggle::create(generate_name("EnableGUI"), true) };
     const ModToggle::Ptr m_enable_depth{ ModToggle::create(generate_name("PassDepthToRuntime"), false, true) };
     const ModToggle::Ptr m_enable_hitch_diagnostics{ ModToggle::create(generate_name("EnableHitchDiagnostics"), false, true) };
+    const ModToggle::Ptr m_ktjl_openxr_factory_repair{ ModToggle::create(generate_name("KTJLOpenXRFactoryRepair"), false, true) };
     const ModToggle::Ptr m_decoupled_pitch{ ModToggle::create(generate_name("DecoupledPitch"), false) };
     const ModToggle::Ptr m_decoupled_pitch_ui_adjust{ ModToggle::create(generate_name("DecoupledPitchUIAdjust"), true) };
     const ModToggle::Ptr m_load_blueprint_code{ ModToggle::create(generate_name("LoadBlueprintCode"), false, true) };
@@ -2487,6 +2517,7 @@ public:
             *m_enable_gui,
             *m_enable_depth,
             *m_enable_hitch_diagnostics,
+            *m_ktjl_openxr_factory_repair,
             *m_decoupled_pitch,
             *m_decoupled_pitch_ui_adjust,
             *m_load_blueprint_code,

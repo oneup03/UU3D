@@ -1,3 +1,4 @@
+#include "utility/NascarHookCompatibility.hpp"
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
@@ -8,6 +9,8 @@
 #include <utility/Module.hpp>
 #include <utility/String.hpp>
 #include <utility/ScopeGuard.hpp>
+#include <utility/Scan.hpp>
+#include <utility/UObjectMetadataFilter.hpp>
 
 #include "DumperMode.hpp"
 
@@ -34,6 +37,7 @@
 #include <sdk/FArrayProperty.hpp>
 #include <sdk/UMotionControllerComponent.hpp>
 #include <sdk/Utility.hpp>
+#include <sdk/DiscoveryMemory.hpp>
 #ifdef min
 #undef min
 #endif
@@ -46,6 +50,8 @@
 
 #include "GameSpecific.hpp"
 #include "UObjectHook.hpp"
+#include "vr/KtjLHookContracts.hpp"
+#include "utility/UObjectAllocatorDiscovery.hpp"
 
 //#define VERBOSE_UOBJECTHOOK
 
@@ -63,6 +69,142 @@ constexpr size_t STALKER2_CLASS_BROWSER_CLASS_CAP = 256;
 constexpr size_t STALKER2_CLASS_BROWSER_OBJECT_CAP = 128;
 
 bool is_uobject_array_member(sdk::UObjectBase* object);
+
+bool is_ktjl_uobjecthook() {
+    static const bool target = sdk::ktjl::matches_executable(
+        utility::get_module_pathw(utility::get_executable()).value_or(L""));
+    return target;
+}
+
+bool is_townfall_ue56_uobjecthook() {
+    static const bool target = [] {
+        const auto executable = utility::get_executable();
+        const auto path = utility::get_module_pathw(executable);
+        if (!path || _wcsicmp(std::filesystem::path(*path).filename().c_str(),
+                L"Townfall-Win64-Shipping.exe") != 0) {
+            return false;
+        }
+
+        const auto version = sdk::get_file_version_info();
+        return HIWORD(version.dwFileVersionMS) == 5 && LOWORD(version.dwFileVersionMS) == 6;
+    }();
+    return target;
+}
+
+std::optional<uintptr_t> find_townfall_object_allocator() {
+    const auto fail = [](const char* stage) -> std::optional<uintptr_t> {
+        SPDLOG_WARN("[Townfall][UObjectHook] Allocator discovery rejected at {}", stage);
+        return std::nullopt;
+    };
+
+    const auto executable = utility::get_executable();
+    const auto module_size = utility::get_module_size(executable).value_or(0);
+    if (!executable || module_size < 0x100) {
+        return fail("image bounds");
+    }
+
+    const auto base = reinterpret_cast<uintptr_t>(executable);
+    if (module_size > std::numeric_limits<uintptr_t>::max() - base) {
+        return fail("image overflow");
+    }
+
+    // These three independent UE5.6 diagnostics all belong to
+    // FUObjectArray::AllocateUObjectIndex. Unlike a code-byte signature, their
+    // owning unwind function and GUObjectArray references survive relinking.
+    constexpr std::array<const wchar_t*, 3> markers{
+        L"Attempting to add %s at index %d but another object",
+        L"Unable to add more objects to disregard for GC pool",
+        L"Maximum number of UObjects",
+    };
+    std::array<uintptr_t, markers.size()> strings{};
+    for (size_t i = 0; i < markers.size(); ++i) {
+        const auto matches = utility::scan_strings(executable, std::wstring{markers[i]});
+        if (matches.size() != 1) {
+            return fail("diagnostic uniqueness");
+        }
+        strings[i] = matches.front();
+    }
+
+    const auto initial_refs = utility::scan_displacement_references(executable, strings.front());
+    if (initial_refs.size() != 1) {
+        return fail("primary diagnostic reference");
+    }
+
+    DWORD64 unwind_base{};
+    const auto* unwind = RtlLookupFunctionEntry(initial_refs.front(), &unwind_base, nullptr);
+    if (!unwind || unwind_base != base || unwind->EndAddress <= unwind->BeginAddress ||
+        unwind->EndAddress > module_size) {
+        return fail("unwind bounds");
+    }
+
+    const auto start = base + unwind->BeginAddress;
+    const auto end = base + unwind->EndAddress;
+    const auto resolved_start = utility::find_function_start_unwind(initial_refs.front());
+    if (!resolved_start || *resolved_start != start || end - start > 0x2000) {
+        return fail("function start");
+    }
+
+    uevr::uobject::discovery::AllocatorEvidence evidence{};
+    evidence.image_base = base;
+    evidence.image_size = module_size;
+    evidence.function_start = start;
+    evidence.function_end = end;
+    evidence.diagnostic_references[0] = initial_refs.front();
+    evidence.unwind_matches = true;
+
+    for (size_t i = 1; i < strings.size(); ++i) {
+        const auto refs = utility::scan_displacement_references(start, end - start, strings[i]);
+        if (refs.size() != 1) {
+            return fail("secondary diagnostic reference");
+        }
+        evidence.diagnostic_references[i] = refs.front();
+    }
+
+    const auto executable_page = [executable](uintptr_t address) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) == 0 ||
+            region.AllocationBase != executable || region.State != MEM_COMMIT ||
+            (region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+            return false;
+        }
+        const auto protect = region.Protect & 0xff;
+        return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
+            protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+    };
+    evidence.executable = executable_page(start) && executable_page(end - 1);
+
+    const auto* array = sdk::FUObjectArray::get();
+    if (!array || sdk::UObjectBase::get_internal_index_offset() != 0xc ||
+        sdk::FUObjectArray::get_item_object_offset() != 0) {
+        return fail("object-array layout");
+    }
+
+    const auto array_base = reinterpret_cast<uintptr_t>(array);
+    for (size_t offset = 0; offset <= 0x100; offset += 4) {
+        if (array_base > std::numeric_limits<uintptr_t>::max() - offset) {
+            return fail("object-array address overflow");
+        }
+        if (!utility::scan_displacement_references(start, end - start, array_base + offset).empty()) {
+            ++evidence.object_array_references;
+        }
+    }
+
+    for (const auto reference : utility::scan_displacement_references(executable, start)) {
+        const auto instruction = utility::resolve_instruction(reference);
+        if (instruction && std::string_view{instruction->instrux.Mnemonic}.starts_with("CALL") &&
+            (instruction->addr < start || instruction->addr >= end)) {
+            ++evidence.direct_callers;
+        }
+    }
+
+    if (!uevr::uobject::discovery::validates_allocator_evidence(evidence)) {
+        return fail("independent allocator evidence");
+    }
+
+    SPDLOG_INFO("[Townfall][UObjectHook] Validated FUObjectArray allocator at {:x} ({} array refs, {} callers)",
+        start, evidence.object_array_references, evidence.direct_callers);
+    return start;
+}
 
 bool is_ue_5_1_uobjecthook_guard_enabled() {
     static const bool is_ue_5_1 = []() {
@@ -544,6 +686,45 @@ bool is_safe_uobject_candidate(UObjectHook& hook, sdk::UObjectBase* object, bool
     return is_probably_uobject_layout(cls);
 }
 
+bool ktjl_registered_header(uintptr_t address, sdk::ktjl::ObjectHeader& header) {
+    if (!sdk::ktjl::pointer(address)) { return false; }
+    // This runs for the initial object backfill too. Guard direct reads rather
+    // than issuing many VirtualQuery/ReadProcessMemory calls per superclass.
+    __try {
+        header = *reinterpret_cast<const sdk::ktjl::ObjectHeader*>(address);
+        auto* array = sdk::FUObjectArray::get();
+        if (!array || header.index < 0 || header.index >= array->get_object_count() ||
+            !sdk::ktjl::pointer(header.vtable) || !sdk::ktjl::pointer(header.class_private) ||
+            (header.name_index >> 16) >= 0x4000) { return false; }
+        const auto* item = array->get_object(header.index);
+        return item && reinterpret_cast<uintptr_t>(item->get_object()) == address;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool ktjl_read_super(uintptr_t address, uintptr_t& next) {
+    sdk::ktjl::ObjectHeader header{};
+    if (!ktjl_registered_header(address, header)) { return false; }
+    __try {
+        next = reinterpret_cast<uintptr_t>(reinterpret_cast<sdk::UStruct*>(address)->get_super_struct());
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::optional<uevr::ktjl::hooks::ClassChain> ktjl_class_chain(sdk::UObjectBase* object) {
+    static const bool image_validated = sdk::ktjl::validated_image(sdk::discovery::process_memory(),
+        reinterpret_cast<uintptr_t>(utility::get_executable()));
+    sdk::ktjl::ObjectHeader header{};
+    if (!image_validated || sdk::UObjectBase::get_class_private_offset() != offsetof(sdk::ktjl::ObjectHeader, class_private) ||
+        !ktjl_registered_header(reinterpret_cast<uintptr_t>(object), header)) {
+        return std::nullopt;
+    }
+    return uevr::ktjl::hooks::collect_class_chain(header.class_private, ktjl_read_super);
+}
+
 bool validate_ue4_14_through_4_17_uobject_layout(UObjectHook& hook, sdk::FUObjectArray* object_array) try {
     if (!is_ue4_14_through_4_17_uobjecthook_guard_enabled()) {
         return true;
@@ -749,6 +930,10 @@ void UObjectHook::activate() {
 }
 
 void UObjectHook::hook() {
+    if (uevr::nascar::is_target()) {
+        SPDLOG_WARN_ONCE("[NASCAR][CodePreserving] UObject inline hooks are unavailable in this Native/UI test");
+        return;
+    }
     if (m_hooked) {
         return;
     }
@@ -835,7 +1020,20 @@ void UObjectHook::hook() {
         return;
     }
 
-    auto add_object_fn = sdk::UObjectBase::get_add_object();
+    // Townfall inlines AddObject in its normal constructor. Both constructor
+    // and deferred registration call the same FUObjectArray allocator instead.
+    auto add_object_fn = is_townfall_ue56_uobjecthook() ? find_townfall_object_allocator() :
+        sdk::UObjectBase::get_add_object();
+    if (is_townfall_ue56_uobjecthook() && !add_object_fn) {
+        SPDLOG_WARN("[Townfall][UObjectHook] Allocator evidence changed; using existing array-tracking fallback");
+    }
+
+    if (is_ktjl_uobjecthook() && add_object_fn &&
+        !uevr::ktjl::hooks::validates_add_object(sdk::discovery::process_memory(),
+            reinterpret_cast<uintptr_t>(utility::get_executable()), *add_object_fn)) {
+        SPDLOG_WARN("[KTJL][UObjectHook] AddObject instruction contract changed; using array tracking, not argument guessing");
+        add_object_fn.reset();
+    }
 
     if (!add_object_fn) {
         SPDLOG_WARN("[UObjectHook] UObjectBase::AddObject was not found; using incremental FUObjectArray creation tracking");
@@ -849,7 +1047,21 @@ void UObjectHook::hook() {
     }
 
     if (add_object_fn) {
-        m_add_object_hook = safetyhook::create_inline((void**)add_object_fn.value(), &add_object);
+        // KTJL's hook can run as soon as it is enabled. Publish its trampoline
+        // first; the validated allocator takes the UObject in RDX, not RCX.
+        if (is_ktjl_uobjecthook() || is_townfall_ue56_uobjecthook()) {
+            m_add_object_hook = safetyhook::create_inline((void*)add_object_fn.value(), &add_object,
+                safetyhook::InlineHook::StartDisabled);
+            if (m_add_object_hook && is_townfall_ue56_uobjecthook()) {
+                m_townfall_allocator_valid.store(true, std::memory_order_release);
+            }
+            if (m_add_object_hook && !m_add_object_hook.enable()) {
+                m_add_object_hook.reset();
+                m_townfall_allocator_valid.store(false, std::memory_order_release);
+            }
+        } else {
+            m_add_object_hook = safetyhook::create_inline((void**)add_object_fn.value(), &add_object);
+        }
 
         if (m_add_object_hook) {
             m_add_object_hooked = true;
@@ -909,6 +1121,10 @@ void UObjectHook::hook() {
 }
 
 void UObjectHook::hook_process_event() {
+    if (uevr::nascar::is_target()) {
+        SPDLOG_WARN_ONCE("[NASCAR][CodePreserving] UObject inline hooks are unavailable in this Native/UI test");
+        return;
+    }
     if (m_attempted_hook_process_event) {
         return;
     }
@@ -1240,7 +1456,12 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
         }
     }*/
 
-    const auto c = object->get_class();
+    // Validate the entire chain before inserting anything into the tracking
+    // maps. A partially constructed/stale class must not poison later readers.
+    const auto ktjl_chain = is_ktjl_uobjecthook() ? ktjl_class_chain(object) :
+        std::optional<uevr::ktjl::hooks::ClassChain>{};
+    if (is_ktjl_uobjecthook() && !ktjl_chain) { return false; }
+    const auto c = ktjl_chain ? reinterpret_cast<sdk::UClass*>(ktjl_chain->classes[0]) : object->get_class();
 
     if (c == nullptr) {
         return false;
@@ -1257,15 +1478,28 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
     m_objects.insert(object);
     meta_object->super_classes.clear();
     meta_object->full_name = object->get_full_name();
-    meta_object->uclass = object->get_class();
+    meta_object->uclass = c;
 
-    m_most_recent_objects.push_front((sdk::UObject*)object);
+    const auto object_identity = get_uobject_index_serial(object);
+    std::erase_if(m_most_recent_objects, [object](const auto& recent) {
+        return recent.object == object;
+    });
+    m_most_recent_objects.push_front({
+        (sdk::UObject*)object,
+        meta_object->full_name,
+        object_identity ? object_identity->first : -1,
+        object_identity ? object_identity->second : -1,
+        object_identity.has_value()
+    });
 
     if (m_most_recent_objects.size() > 50) {
         m_most_recent_objects.pop_back();
     }
 
-    for (auto super = (sdk::UStruct*)object->get_class(); super != nullptr; super = super->get_super_struct()) {
+    size_t chain_index{};
+    for (auto super = (sdk::UStruct*)c; super != nullptr;
+         super = ktjl_chain ? (++chain_index < ktjl_chain->count ?
+             reinterpret_cast<sdk::UStruct*>(ktjl_chain->classes[chain_index]) : nullptr) : super->get_super_struct()) {
         meta_object->super_classes.push_back((sdk::UClass*)super);
 
         m_objects_by_class[(sdk::UClass*)super].insert(object);
@@ -1276,7 +1510,14 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
                     return;
                 }
 
-                for (auto super = (sdk::UStruct*)object->get_class(); super != nullptr; super = super->get_super_struct()) {
+                const auto chain = is_ktjl_uobjecthook() ? ktjl_class_chain(object) :
+                    std::optional<uevr::ktjl::hooks::ClassChain>{};
+                if (is_ktjl_uobjecthook() && !chain) { return; }
+                size_t index{};
+                for (auto super = chain ? reinterpret_cast<sdk::UStruct*>(chain->classes[0]) :
+                         (sdk::UStruct*)object->get_class(); super != nullptr;
+                     super = chain ? (++index < chain->count ?
+                         reinterpret_cast<sdk::UStruct*>(chain->classes[index]) : nullptr) : super->get_super_struct()) {
                     std::function<void(sdk::UObject*)> job{};
 
                     {
@@ -4315,15 +4556,39 @@ void UObjectHook::draw_main() {
     }
 
     if (ImGui::TreeNode("Recent Objects")) {
-        for (auto& object : m_most_recent_objects) {
-            if (!this->exists_unsafe(object)) {
+        auto recent_objects = decltype(m_most_recent_objects){};
+
+        {
+            std::shared_lock lock{m_mutex};
+
+            for (const auto& recent : m_most_recent_objects) {
+                if (exists_unsafe(recent.object)) {
+                    recent_objects.push_back(recent);
+                }
+            }
+        }
+
+        for (const auto& recent : recent_objects) {
+            const auto current = utility::uobject::cached_recent_object_is_current(
+                recent,
+                true,
+                [](sdk::UObject* object, int32_t internal_index, int32_t serial_number) {
+                    return is_current_uobject_identity(object, internal_index, serial_number);
+                });
+
+            if (!current) {
                 continue;
             }
 
-            if (ImGui::TreeNode(utility::narrow(object->get_full_name()).data())) {
-                ui_handle_object(object);
+            const auto label = utility::narrow(recent.full_name);
+            ImGui::PushID(recent.object);
+
+            if (ImGui::TreeNode(label.c_str())) {
+                ui_handle_object(recent.object);
                 ImGui::TreePop();
             }
+
+            ImGui::PopID();
         }
 
         ImGui::TreePop();
@@ -4515,13 +4780,41 @@ void UObjectHook::draw_main() {
                 break;
             }
 
-            const auto& objects_ref = m_objects_by_class[uclass];
+            const auto objects_it = m_objects_by_class.find(uclass);
 
-            if (objects_ref.empty()) {
+            if (objects_it == m_objects_by_class.end() || objects_it->second.empty()) {
                 continue;
             }
 
-            if (!m_meta_objects.contains(uclass)) {
+            const auto& objects_ref = objects_it->second;
+            std::string uclass_name{};
+            bool valid = true;
+
+            {
+                std::shared_lock lock{m_mutex};
+                const auto class_meta_it = m_meta_objects.find(uclass);
+
+                if (class_meta_it == m_meta_objects.end() || class_meta_it->second == nullptr) {
+                    continue;
+                }
+
+                const auto& class_meta = *class_meta_it->second;
+                uclass_name = utility::narrow(class_meta.full_name);
+
+                if (!filter_empty) {
+                    valid = utility::uobject::cached_class_chain_matches(
+                        class_meta.full_name,
+                        class_meta.super_classes,
+                        wide_filter,
+                        [this](sdk::UClass* cached_class) -> const std::wstring* {
+                            const auto it = m_meta_objects.find(cached_class);
+                            return it != m_meta_objects.end() && it->second != nullptr ?
+                                &it->second->full_name : nullptr;
+                        });
+                }
+            }
+
+            if (!valid) {
                 continue;
             }
 
@@ -4535,26 +4828,6 @@ void UObjectHook::draw_main() {
                         continue;
                     }
                 }
-            }
-
-            const auto uclass_name = utility::narrow(m_meta_objects[uclass]->full_name);
-            bool valid = true;
-
-            if (!filter_empty) {
-                valid = false;
-
-                for (auto super = (sdk::UStruct*)uclass; super; super = super->get_super_struct()) {
-                    if (auto it = m_meta_objects.find(super); it != m_meta_objects.end()) {
-                        if (it->second->full_name.find(wide_filter) != std::wstring::npos) {
-                            valid = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (!valid) {
-                continue;
             }
 
             if (is_stalker2_uobjecthook_guard_enabled()) {
@@ -6064,6 +6337,24 @@ void* UObjectHook::add_object(void* rcx, void* rdx, void* r8, void* r9, void* st
     auto& hook = UObjectHook::get();
     auto result = hook->m_add_object_hook.unsafe_call<void*>(rcx, rdx, r8, r9, stack1, stack2, stack3, stack4);
 
+    if (is_ktjl_uobjecthook()) {
+        // Installation validated the RDX -> FUObjectItem::Object store. RCX is
+        // FUObjectArray and can look readable enough to fool the generic probe.
+        SPDLOG_INFO_ONCE("[KTJL][UObjectHook] Using instruction-validated RDX UObject argument");
+        hook->add_new_object(reinterpret_cast<sdk::UObjectBase*>(rdx));
+        return result;
+    }
+
+    if (hook->m_townfall_allocator_valid.load(std::memory_order_acquire)) {
+        // UE5.6 AllocateUObjectIndex receives the UObjectBase in RDX. Validate
+        // that the original registered it before adopting it into the hook.
+        auto* object = reinterpret_cast<sdk::UObjectBase*>(rdx);
+        if (is_safe_uobject_candidate(*hook, object, true)) {
+            hook->add_new_object(object, true, true);
+        }
+        return result;
+    }
+
     if (is_stalker2_uobjecthook_guard_enabled() &&
         !hook->m_stalker2_uobject_full_scan_requested.load(std::memory_order_relaxed)) {
         // Stalker2 can create huge UObject bursts during gameplay loads. In lazy
@@ -6247,6 +6538,9 @@ void* UObjectHook::destructor(sdk::UObjectBase* object, void* rdx, void* r8, voi
             }
 
             hook->m_objects.erase(object);
+            std::erase_if(hook->m_most_recent_objects, [object](const auto& recent) {
+                return recent.object == object;
+            });
             hook->m_motion_controller_attached_components.erase((sdk::USceneComponent*)object);
             hook->m_spawned_spheres.erase((sdk::USceneComponent*)object);
             hook->m_spawned_spheres_to_components.erase((sdk::USceneComponent*)object);

@@ -9,9 +9,13 @@
 #include <spdlog/sinks/base_sink.h>
 #include "utility/Logging.hpp"
 #include "utility/SupportDiagnostics.hpp"
+#include "utility/UObjectAllocatorDiscovery.hpp"
 // Some backend translation units still include Windows headers without NOMINMAX.
 #define max(a, b) windows_max_macro_must_not_expand(a, b)
 #include "mods/vr/CVarDiagnostics.hpp"
+#include "utility/BoundedTextureDiagnostics.hpp"
+#include "utility/GpuRetirement.hpp"
+#include "utility/UObjectMetadataFilter.hpp"
 #undef max
 
 int disabled_log_argument_evaluations();
@@ -20,6 +24,7 @@ int test_console_text();
 int test_discovery_validation();
 int test_cadence_replay();
 int test_ue58_ui_initialization();
+int test_ktjl_openxr_factory();
 
 namespace {
 int failures{};
@@ -151,17 +156,226 @@ void test_support_report() {
     expect(pacing(11111111, std::nullopt)["frame_cap_fps"].is_null(), "unknown cap is not guessed");
     expect(pacing(11111111, std::numeric_limits<double>::infinity())["frame_cap_fps"].is_null(), "invalid cap is unavailable");
 }
+
+void test_gpu_retirement() {
+    using utility::gpu::references_retired;
+    unsigned reads{};
+    uint64_t completed{};
+    const auto read_completed = [&] { ++reads; return completed; };
+    expect(references_retired(false,false,false,false,0,read_completed), "unused command context has no GPU references");
+    expect(references_retired(false,false,false,true,4,read_completed), "already reclaimed commands need no GPU query");
+    expect(!references_retired(true,false,false,true,4,read_completed), "unsubmitted recorded commands retain resources");
+    expect(!references_retired(false,true,true,true,4,read_completed), "poisoned submission cannot prove retirement");
+    expect(!references_retired(false,true,false,false,4,read_completed), "missing fence retains old resources");
+    expect(!references_retired(false,true,false,true,0,read_completed), "unproven signal value retains old resources");
+    expect(reads == 0, "unsubmitted or invalid contexts never query a GPU fence");
+    completed=3;
+    expect(!references_retired(false,true,false,true,4,read_completed), "in-flight copy retains resource and descriptors");
+    completed=4;
+    expect(references_retired(false,true,false,true,4,read_completed), "matching completion permits replacement");
+    completed=5;
+    expect(references_retired(false,true,false,true,4,read_completed), "later completion also retires the old reference");
+    expect(!references_retired(false,true,false,true,6,read_completed), "a new submission requires its own completed fence");
+    completed=(std::numeric_limits<uint64_t>::max)();
+    expect(!references_retired(false,true,false,true,4,read_completed), "device removal is not successful GPU retirement");
+
+    struct Consumer { bool recorded{},submitted{},poisoned{}; uint64_t signal{},completed{}; };
+    std::array<Consumer,4> consumers{{{}, {false,true,false,2,2}, {false,true,false,3,2}, {}}};
+    const auto all_retired = [&] {
+        for (auto& c : consumers) {
+            if (!references_retired(c.recorded,c.submitted,c.poisoned,c.submitted,c.signal,[&] { return c.completed; })) { return false; }
+        }
+        return true;
+    };
+    expect(!all_retired(), "one busy consumer prevents replacement even after another completes");
+    consumers[2].completed=3;
+    expect(all_retired(), "retry accepts completion without changing any submission state");
+    expect(consumers[1].submitted && consumers[2].submitted, "retirement observation does not reset command contexts");
+    consumers[3].recorded=true;
+    expect(!all_retired(), "recorded but unsubmitted consumer also blocks replacement");
+}
+
+void test_bounded_texture_diagnostics() {
+    using namespace utility::diagnostics;
+    BoundedTextureObservations<> observations;
+    std::atomic_bool enabled{false};
+    int queries = 0;
+    const auto key_provider = [&]() { ++queries; return uintptr_t{0x1000}; };
+    for (int i = 0; i < 1000; ++i) {
+        expect(!observations.observe(enabled.load(std::memory_order_acquire), key_provider),
+            "disabled texture diagnostics produce no observations");
+    }
+    expect(queries == 0, "disabled diagnostics never query native resources");
+
+    enabled.store(true, std::memory_order_release);
+    const auto first = observations.observe(enabled.load(std::memory_order_acquire), key_provider);
+    expect(queries == 1 && first && first->first_seen && first->seen == 1 && first->tracked_keys == 1,
+        "opt-in diagnostics start with an untouched budget");
+    const auto duplicate = observations.observe(true, key_provider);
+    expect(duplicate && !duplicate->first_seen && duplicate->duplicate_suppressed == 1,
+        "repeated resources are not logged as new allocations");
+
+    TextureObservation last{};
+    size_t detailed = 1;
+    for (uintptr_t key = 0x1001; key < 0x1001 + 10000; ++key) {
+        last = *observations.observe(true, [key]() { return key; });
+        detailed += last.first_seen ? 1 : 0;
+    }
+    expect(detailed == 64 && last.tracked_keys == 64 && last.overflow_suppressed == 10000 - 63,
+        "texture identity churn has fixed storage and at most 64 detailed entries");
+    expect(last.seen == last.tracked_keys + last.duplicate_suppressed + last.overflow_suppressed,
+        "overflow counts observations without claiming exact uniqueness");
+    enabled.store(false, std::memory_order_release);
+    expect(!observations.observe(enabled.load(std::memory_order_acquire), key_provider) && queries == 2,
+        "disabling a running recorder stops native queries immediately on subsequent calls");
+    const auto resumed = observations.observe(true, key_provider);
+    expect(resumed && !resumed->first_seen && resumed->seen == last.seen + 1 && resumed->tracked_keys == 64,
+        "toggle does not reset the per-injection tracking bound");
+
+    BoundedTextureObservations<> reentrant;
+    const auto outer = reentrant.observe(true, [&]() {
+        reentrant.observe(true, []() { return uintptr_t{1}; });
+        return uintptr_t{2};
+    });
+    expect(outer && outer->seen == 2, "resource providers execute outside the diagnostic mutex");
+
+    BoundedTextureObservations<> concurrent;
+    std::atomic<int> first_seen{0};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&]() {
+            for (int i = 0; i < 1000; ++i) {
+                const auto sample = concurrent.observe(true, [i]() { return uintptr_t(i % 128); });
+                if (sample->first_seen) { ++first_seen; }
+            }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    const auto total = concurrent.observe(true, []() { return uintptr_t{0}; });
+    expect(total && first_seen == 64 && total->tracked_keys == 64 && total->seen == 8001,
+        "concurrent texture observations publish coherent bounded counters");
+    expect(total && total->seen == total->tracked_keys + total->duplicate_suppressed + total->overflow_suppressed,
+        "concurrent observation accounting loses no samples");
+
+    using namespace std::chrono_literals;
+    TextureProbeBudget<3> probes;
+    const auto start = TextureProbeBudget<3>::Clock::time_point{};
+    expect(!probes.try_acquire(false, start), "disabled viewport probing consumes no budget");
+    expect(probes.try_acquire(true, start), "first enabled viewport probe is admitted");
+    expect(!probes.try_acquire(true, start - 1s) && !probes.try_acquire(true, start + 1999ms),
+        "viewport probes neither run backwards in time nor exceed their rate limit");
+    expect(!probes.try_acquire(false, start + 2s) && probes.try_acquire(true, start + 2s),
+        "disabled probe attempts do not advance cadence or consume a sample");
+    expect(probes.try_acquire(true, start + 4s) && !probes.try_acquire(true, start + 100s),
+        "viewport probe budget remains bounded for the injection session");
+
+    TextureProbeBudget<> concurrent_probes;
+    std::atomic<int> admitted{0};
+    workers.clear();
+    std::barrier ready{8};
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&]() {
+            ready.arrive_and_wait();
+            if (concurrent_probes.try_acquire(true, start)) { ++admitted; }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    expect(admitted == 1, "concurrent viewport callbacks share one probe cadence");
+}
+
+void test_uobject_metadata_filter() {
+    struct ClassToken {};
+    ClassToken child{};
+    ClassToken parent{};
+    ClassToken missing{};
+    const auto poisoned = reinterpret_cast<ClassToken*>((std::numeric_limits<uintptr_t>::max)());
+
+    const std::wstring child_name = L"Class /Game/BP_Child.BP_Child_C";
+    const std::wstring parent_name = L"Class /Script/Engine.Actor";
+    const std::vector<ClassToken*> chain{&child, poisoned, &missing, &parent};
+    size_t lookups{};
+
+    const auto lookup = [&](ClassToken* pointer) -> const std::wstring* {
+        ++lookups;
+        if (pointer == &child) { return &child_name; }
+        if (pointer == &parent) { return &parent_name; }
+        return nullptr;
+    };
+
+    using utility::uobject::cached_class_chain_matches;
+    expect(cached_class_chain_matches(child_name, chain, L"BP_Child", lookup),
+        "UObject class filtering matches cached direct names");
+    lookups = 0;
+    expect(cached_class_chain_matches(child_name, chain, L"Engine.Actor", lookup) && lookups == 4,
+        "UObject class filtering reaches cached parents without dereferencing opaque pointers");
+    lookups = 0;
+    expect(!cached_class_chain_matches(child_name, chain, L"NotPresent", lookup) && lookups == 4,
+        "missing and poisoned cached class keys fail closed");
+    expect(!cached_class_chain_matches(child_name, chain, L"Engine.Actor", lookup, 2),
+        "UObject class filtering obeys its traversal bound");
+    expect(cached_class_chain_matches(child_name, chain, L"", lookup, 0),
+        "empty UObject class filters preserve the unfiltered list");
+
+    using RecentObject = utility::uobject::CachedRecentObject<ClassToken>;
+    const RecentObject recent{poisoned, L"Object /Game/Cached", 17, 29, true};
+    size_t identity_checks{};
+    const auto validate_identity = [&](ClassToken* pointer, int32_t index, int32_t serial) {
+        ++identity_checks;
+        return pointer == poisoned && index == 17 && serial == 29;
+    };
+
+    expect(utility::uobject::cached_recent_object_is_current(recent, true, validate_identity) && identity_checks == 1,
+        "recent UObject validation treats cached pointers as opaque identity tokens");
+    identity_checks = 0;
+    expect(!utility::uobject::cached_recent_object_is_current(recent, false, validate_identity) && identity_checks == 0,
+        "untracked recent UObjects fail closed without consulting game memory");
+    identity_checks = 0;
+    auto missing_identity = recent;
+    missing_identity.identity_valid = false;
+    expect(!utility::uobject::cached_recent_object_is_current(missing_identity, true, validate_identity) && identity_checks == 0,
+        "recent UObjects without a cached FUObjectArray identity fail closed");
+}
+
+void test_uobject_allocator_discovery() {
+    using uevr::uobject::discovery::AllocatorEvidence;
+    using uevr::uobject::discovery::validates_allocator_evidence;
+
+    AllocatorEvidence evidence{
+        0x140000000, 0x0a978000, 0x1411bbda4, 0x1411bc083,
+        {0x1411bbf93, 0x1411bbe15, 0x1411bbf08}, 13, 2, true, true};
+    expect(validates_allocator_evidence(evidence),
+        "independent diagnostics and GUObjectArray references identify the shared allocator");
+    evidence.diagnostic_references[1] = evidence.function_end;
+    expect(!validates_allocator_evidence(evidence), "a diagnostic outside the unwind function fails closed");
+    evidence.diagnostic_references[1] = 0x1411bbe15;
+    evidence.object_array_references = 2;
+    expect(!validates_allocator_evidence(evidence), "insufficient object-array references fail closed");
+    evidence.object_array_references = 13;
+    evidence.direct_callers = 0;
+    expect(!validates_allocator_evidence(evidence), "an uncalled function fails closed");
+    evidence.direct_callers = 2;
+    evidence.unwind_matches = false;
+    expect(!validates_allocator_evidence(evidence), "unmatched unwind metadata fails closed");
+    evidence.unwind_matches = true;
+    evidence.function_end = evidence.image_base + evidence.image_size + 1;
+    expect(!validates_allocator_evidence(evidence), "out-of-image allocator fails closed");
+}
 }
 
 int main() {
     test_logging();
     test_readbacks();
     test_support_report();
+    test_gpu_retirement();
+    test_bounded_texture_diagnostics();
+    test_uobject_metadata_filter();
+    test_uobject_allocator_discovery();
     failures += test_cached_cvar_reads();
     failures += test_console_text();
     failures += test_discovery_validation();
     failures += test_cadence_replay();
     failures += test_ue58_ui_initialization();
+    failures += test_ktjl_openxr_factory();
     if (failures != 0) { return 1; }
     std::cout << "Diagnostic safety tests passed\n";
     return 0;

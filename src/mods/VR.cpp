@@ -53,6 +53,7 @@
 #include <safetyhook.hpp>
 #include "UObjectHook.hpp"
 #include "GameSpecific.hpp"
+#include "vr/KtjLOpenXRFactory.hpp"
 
 namespace {
 bool is_stalker2_executable_cached();
@@ -3665,7 +3666,25 @@ std::optional<std::string> VR::initialize_openxr() {
         instance_create_info.applicationInfo.applicationName[XR_MAX_APPLICATION_NAME_SIZE - 1] = '\0';
         instance_create_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
         
+        std::unique_ptr<uevr::ktjl::openxr_factory::Repair> ktjl_factory_repair;
+        if (m_ktjl_openxr_factory_repair->value() && g_framework->is_dx12()) {
+            const auto path = utility::get_module_pathw(utility::get_executable());
+            if (path) {
+                ktjl_factory_repair = std::make_unique<uevr::ktjl::openxr_factory::Repair>(true, true,
+                    *path, m_requested_runtime_name->value());
+            }
+        }
+
         result = xrCreateInstance(&instance_create_info, &m_openxr->instance);
+        if (ktjl_factory_repair && ktjl_factory_repair->retry_after_failure(
+                static_cast<int32_t>(result), m_openxr->instance == XR_NULL_HANDLE)) {
+            // Same embedded loader, arguments, extensions, and thread; only WMR's
+            // validated Factory1 import differs during this one bounded retry.
+            result = xrCreateInstance(&instance_create_info, &m_openxr->instance);
+            spdlog::info("[KTJL][OpenXR][FactoryRepair] Corrected create result={}, instance={}",
+                static_cast<int32_t>(result), (void*)m_openxr->instance);
+            ktjl_factory_repair->finish(result == XR_SUCCESS && m_openxr->instance != XR_NULL_HANDLE);
+        }
 
         // we can't convert the result to a string here
         // because the function requires the instance to be valid
@@ -8326,14 +8345,20 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
             const auto last_frame = (frame_count - 1) % runtimes::OpenXR::QUEUE_SIZE;
             const auto now_frame = frame_count % runtimes::OpenXR::QUEUE_SIZE;
             m_openxr->pipeline_states[now_frame] = m_openxr->pipeline_states[last_frame];
-            if (is_dead_island_2_ue425_executable_cached() && is_using_synchronized_afr()) {
+            const bool nascar_synced = uevr::nascar::is_validated_build() &&
+                is_nascar_code_preserving_mode() && is_using_strict_synchronized_afr();
+            if ((is_dead_island_2_ue425_executable_cached() && is_using_synchronized_afr()) || nascar_synced) {
                 // Synced Sequential consumes the full frame token, not the
                 // circular queue index. Advance it even when this eye reuses
                 // the previous pose or every later eye decision stays stale.
                 m_openxr->pipeline_states[now_frame].frame_count = frame_count;
                 m_openxr->internal_frame_count = frame_count;
-                SPDLOG_INFO_ONCE(
-                    "[DeadIsland2][UE4.25][Synced] Advancing the cloned OpenXR pose with its full frame token");
+                if (nascar_synced) {
+                    SPDLOG_INFO_ONCE("[NASCAR][Synced] Advancing the cloned OpenXR pose with its full frame token");
+                } else {
+                    SPDLOG_INFO_ONCE(
+                        "[DeadIsland2][UE4.25][Synced] Advancing the cloned OpenXR pose with its full frame token");
+                }
             } else {
                 m_openxr->pipeline_states[now_frame].frame_count = now_frame;
             }
@@ -9828,7 +9853,17 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
     }
 
     if (selected_page == PAGE_UNREAL) {
-        m_rendering_method->draw("Rendering Method");
+        if (uevr::nascar::is_target()) {
+            ImGui::TextWrapped("NASCAR: Native or Synced (Skip Tick) + UI. Ghost Fix uses engine-owned histories in Synced. Native Fix uses validated linked families without image hooks. Reinject after changing HMD resolution while testing Native Fix.");
+            int method = is_nascar_code_preserving_mode() ? m_rendering_method->value() : -1;
+            const char* methods[]{"Native Stereo", "Synced Sequential (Skip Tick)"};
+            if (ImGui::Combo("Rendering Method", &method, methods, 2)) {
+                m_rendering_method->value() = method;
+                m_extreme_compat_mode->value() = false;
+            }
+        } else {
+            m_rendering_method->draw("Rendering Method");
+        }
 
         if (is_using_synchronized_afr()) {
             ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
@@ -9937,8 +9972,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TextWrapped(
                 "Default is remap-only for safety. Enable bootstrap only if Ghosting Fix stays inactive/"
                 "learning and the game needs UEVR to force Unreal to create a second scene history.");
-            ImGui::TextWrapped(
-                "Risky/legacy path: enable before injection or a scene load when possible; avoid live toggle spam.");
+            if (uevr::nascar::is_target()) {
+                ImGui::TextWrapped("NASCAR: bounded lazy allocation during normal view setup. No PostInitProperties replay, extra rendered views, or protected-image hooks. Native is unchanged.");
+            } else {
+                ImGui::TextWrapped(
+                    "Risky/legacy path: enable before injection or a scene load when possible; avoid live toggle spam.");
+            }
             ImGui::Unindent();
         }
 
@@ -9951,7 +9990,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 draw_status_badge("Native Fix status:", "skipped: Native Stereo rendering required", skipped_color);
             } else if (m_fake_stereo_hook == nullptr) {
                 draw_status_badge("Native Fix status:", "unavailable: stereo hook not installed", blocked_color);
-            } else if (is_native_stereo_fix_enabled()) {
+            } else if (is_native_stereo_fix_enabled() || is_nascar_native_stereo_fix_requested()) {
                 const auto* status = m_fake_stereo_hook->get_native_stereo_fix_status_text();
                 const auto color = m_fake_stereo_hook->is_native_stereo_fix_operational()
                     ? active_color
@@ -9963,6 +10002,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 draw_status_badge("Native Fix status:", "skipped: title/runtime guard", blocked_color);
             }
 
+            if (uevr::nascar::is_target()) { ImGui::BeginDisabled(); }
             if (should_force_native_stereo_fix_same_pass()) {
                 m_native_stereo_fix_same_pass->value() = true;
                 ImGui::BeginDisabled();
@@ -9973,6 +10013,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             }
             m_native_stereo_fix_preserve_secondary_pass->draw("Preserve Secondary Pass on UE5.5+");
+            if (uevr::nascar::is_target()) {
+                ImGui::EndDisabled();
+                ImGui::TextWrapped("NASCAR keeps the original eye indices/history and temporarily gives the right singleton a primary pass only while creating its renderer. These generic pass options are not used.");
+            }
             ImGui::TextWrapped(
                 "Recommended for UE5.5 and newer. Keeps the real secondary-eye pass identity for per-eye water, "
                 "post-process, and renderer paths while retaining the Native Fix constructor safety guard. "
@@ -10715,6 +10759,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_show_fps->draw("Show FPS");
         m_show_statistics->draw("Show Engine Statistics");
         m_enable_hitch_diagnostics->draw("Enable Hitch Diagnostics");
+        m_ktjl_openxr_factory_repair->draw("KTJL OpenXR DXGI repair (next launch)");
+        if (m_ktjl_openxr_factory_repair->value()) {
+            ImGui::TextWrapped("Opt-in for the validated KTJL DX12 + WMR runtime only. Restart the game to test. OpenVR and the game's DXGI route are unchanged.");
+        }
         if (m_enable_hitch_diagnostics->value()) {
             ImGui::TextWrapped("Records recent OpenXR/D3D12 state and writes hitch_snapshot JSON files after large tick gaps.");
         } else {
