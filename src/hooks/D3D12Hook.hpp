@@ -15,6 +15,8 @@
 #include "utility/PointerHook.hpp"
 #include "utility/VtableHook.hpp"
 
+#include "DXGIVBlankGuard.hpp"
+
 // Consumers may observe DSV creation and resource barriers without taking
 // ownership. The barrier callback runs immediately before the original barrier
 // so an opt-in consumer can make a short, self-contained copy while the game
@@ -212,6 +214,20 @@ public:
         m_next_present_interval = interval;
     }
 
+    // One-shot: after this present returns, hold the present thread on the
+    // display's vblank until `interval` refreshes have passed since the last
+    // paced release. Enforces a forced sync interval when DXGI itself does not
+    // block (game window covered by another process's fullscreen output, i.e.
+    // the Katanga consumers) so the game stays on the display clock instead of
+    // the t.MaxFPS timer. See DXGIVBlankGuard.
+    void set_next_present_vblank_guard(uint32_t interval, double period_ms) {
+        m_vblank_guard.request(interval, period_ms);
+    }
+
+    DXGIVBlankGuard& vblank_guard() {
+        return m_vblank_guard;
+    }
+
     void set_depth_stencil_observer(D3D12DepthStencilObserver* observer) {
         m_depth_stencil_observer.store(observer, std::memory_order_release);
     }
@@ -250,6 +266,7 @@ protected:
 
     std::optional<uint32_t> m_next_present_interval{};
     bool m_next_present_no_tearing{false};
+    DXGIVBlankGuard m_vblank_guard{};
 
     bool m_using_proton_swapchain{ false };
     bool m_using_frame_generation_swapchain{ false };

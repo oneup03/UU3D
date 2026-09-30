@@ -2470,8 +2470,11 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
     auto runtime = get_runtime();
     if (m_uncap_framerate->value()) {
-        // The 3D Display 2x-refresh cap owns t.MaxFPS while active.
-        if (!(is_using_flat3d() && m_flat3d_vsync->value() == 3)) {
+        // The 3D Display VSync Override owns t.MaxFPS while active (No-Tear
+        // Fast caps it, Force 1/2 uncaps it). This used to test == 3 against a
+        // three-entry combo (No-Tear Fast is 2), so both writers hit the cvar
+        // every frame and the limiter engaged at random.
+        if (!flat3d_owns_max_fps()) {
             sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
         }
     }

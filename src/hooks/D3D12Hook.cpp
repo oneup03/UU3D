@@ -1158,7 +1158,10 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
 
     auto result = S_OK;
     
+    bool presented = false;
+
     if (!d3d12->m_ignore_next_present) {
+        presented = true;
         result = present_fn(swap_chain, sync_interval, flags, params);
 
         if (result != S_OK) {
@@ -1173,6 +1176,13 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
     if (d3d12->m_on_post_present) {
         d3d12->m_on_post_present(*d3d12);
     }
+
+    // Force 1/2: enforce the interval on vblank when DXGI did not block (see
+    // DXGIVBlankGuard). Last thing before returning, so the game's next frame
+    // starts on the vblank edge. An occluded present still counts as
+    // presented (DXGI_STATUS_OCCLUDED is a success code) - that is exactly the
+    // case the guard exists for.
+    d3d12->m_vblank_guard.after_present(swap_chain, presented && SUCCEEDED(result));
 
     d3d12->m_inside_present = false;
 

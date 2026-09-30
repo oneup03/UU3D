@@ -614,6 +614,22 @@ std::optional<Flat3DDisplayInfo> query_display_info(HWND hwnd) {
     return info;
 }
 
+// query_display_info() walks EnumDisplaySettings; the per-present callers
+// (t.MaxFPS ownership, frame params) only need the refresh rate, so serve them
+// from a 1s cache. Present thread only.
+std::optional<Flat3DDisplayInfo> query_display_info_cached(HWND hwnd) {
+    static std::optional<Flat3DDisplayInfo> cached{};
+    static std::chrono::steady_clock::time_point cached_at{};
+    const auto now = std::chrono::steady_clock::now();
+
+    if (!cached.has_value() || now - cached_at >= std::chrono::seconds(1)) {
+        cached = query_display_info(hwnd);
+        cached_at = now;
+    }
+
+    return cached;
+}
+
 // Drives UGameUserSettings the way the in-game options menu does — games
 // with custom resolution pipelines (e.g. Gotham Knights) ignore r.SetRes,
 // but their UGameUserSettings subclass override of the Apply path is exactly
@@ -2898,19 +2914,27 @@ void VR::update_flat3d_params() {
         }
     }
 
-    // --- VSync override 2x-refresh framerate cap (AFR/Synced Sequential) ----
-    // Force Off + 2x cap: each present is one eye under AFR, so running the
-    // game at twice the display refresh gives each eye a full-refresh update
-    // rate with sane pacing. Owns t.MaxFPS while active (update_hmd_state
-    // skips the UncapFramerate write); restores uncapped on exit.
+    // --- VSync override: t.MaxFPS ownership -----------------------------------
+    // No-Tear Fast (2): interval 0 + a 2x/1x cap. Each present is one eye under
+    // AFR, so running the game at twice the display refresh gives each eye a
+    // full-refresh update; the flip queue paces a visible window.
+    // Force 1/2 (3): the present interval paces the game (DXGI while the window
+    // is visible, the hook's vblank guard once a Katanga consumer covers it)
+    // and t.MaxFPS stays UNCAPPED. A second limiter at the same nominal rate is
+    // a second clock, and two nominally equal clocks beat - that beat is the
+    // "stutter every few minutes" this mode exists to remove. Only when the
+    // guard has no output to wait on does a timer cap at the paced rate take
+    // over as a runaway stop.
+    // Owns t.MaxFPS while active (update_hmd_state skips the UncapFramerate
+    // write); restores uncapped on exit.
     {
-        static bool cap_was_active = false;
-        const bool cap_active = m_flat3d_vsync->value() >= 2; // No-Tear Fast
+        static bool owned_was_active = false;
+        const bool owns = flat3d_owns_max_fps();
 
-        if (cap_active) {
+        if (owns) {
             int hz = 0;
 
-            if (const auto di = query_display_info(g_framework->get_window())) {
+            if (const auto di = query_display_info_cached(g_framework->get_window())) {
                 hz = di->refresh_hz;
             }
 
@@ -2918,24 +2942,77 @@ void VR::update_flat3d_params() {
                 hz = 60;
             }
 
-            // AFR-family: one eye per present -> 2x refresh gives each eye a
-            // full-refresh update. Native stereo: both eyes per present ->
-            // 2x would render twice what the display can show; cap at 1x.
+            // AFR-family: one eye per present. Native stereo: both eyes per
+            // present.
             const int mult = is_using_afr() ? 2 : 1;
-            const int cap = mult * hz;
+            const bool half_rate = m_flat3d_vsync->value() == 3;
 
-            static int s_last_logged_cap = -1;
-            if (cap != s_last_logged_cap) {
-                s_last_logged_cap = cap;
-                spdlog::info("[Flat3D] No-Tear Fast cap: t.MaxFPS={} (display {} Hz x {})", cap, hz, mult);
+            if (half_rate) {
+                DXGIVBlankGuard* guard = nullptr;
+
+                if (g_framework->is_dx11()) {
+                    if (auto& h = g_framework->get_d3d11_hook(); h != nullptr) {
+                        guard = &h->vblank_guard();
+                    }
+                } else if (auto& h = g_framework->get_d3d12_hook(); h != nullptr) {
+                    guard = &h->vblank_guard();
+                }
+
+                const bool guard_unavailable = guard != nullptr && guard->unavailable();
+                // Pair rate = hz/2: interval 2 under native (hz/2 presents/s),
+                // interval 1 under the AFR family (hz presents/s).
+                const int interval = mult == 2 ? 1 : 2;
+                const int paced = std::max(1, (mult * hz) / 2);
+
+                static int s_last_logged_half = -2;
+                const int key = guard_unavailable ? paced : -1;
+
+                if (key != s_last_logged_half) {
+                    s_last_logged_half = key;
+
+                    if (guard_unavailable) {
+                        spdlog::warn("[Flat3D] Force 1/2: no vblank output to pace on - t.MaxFPS={} timer cap "
+                                     "(display {} Hz, interval {})", paced, hz, interval);
+                    } else {
+                        spdlog::info("[Flat3D] Force 1/2: interval {} (display {} Hz, pair rate {}/s), t.MaxFPS uncapped",
+                                     interval, hz, hz / 2);
+                    }
+                }
+
+                sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", guard_unavailable ? (float)paced : 0.0f);
+
+                // 5s pacing diagnostic: presents the guard had to hold on
+                // vblank (window covered, guard is the pacer) vs let through
+                // (DXGI blocked, or the frame was late).
+                static auto s_last_pace_diag = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+
+                if (guard != nullptr && now - s_last_pace_diag >= std::chrono::seconds(5)) {
+                    s_last_pace_diag = now;
+                    const auto stats = guard->consume_stats();
+                    spdlog::info("[Flat3D][pace] Force 1/2: presents={} guard_waits={} measured_period={:.2f}ms{}",
+                                 stats.presents, stats.waits, guard->measured_period_ms(),
+                                 stats.unavailable ? " (guard unavailable)" : "");
+                }
+            } else {
+                // No-Tear Fast: AFR-family -> 2x refresh gives each eye a
+                // full-refresh update. Native stereo -> 2x would render twice
+                // what the display can show; cap at 1x.
+                const int cap = mult * hz;
+
+                static int s_last_logged_cap = -1;
+                if (cap != s_last_logged_cap) {
+                    s_last_logged_cap = cap;
+                    spdlog::info("[Flat3D] No-Tear Fast cap: t.MaxFPS={} (display {} Hz x {})", cap, hz, mult);
+                }
+
+                sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", (float)cap);
             }
-
-            sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", (float)cap);
-        } else if (cap_was_active) {
+        } else if (owned_was_active) {
             sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 0.0f);
         }
 
-        cap_was_active = cap_active;
+        owned_was_active = owns;
     }
 
     // --- 3D render resolution follows the in-game setting --------------------
@@ -3000,6 +3077,15 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
 
     p.mode = m_flat3d_output_mode->value();
     p.vsync_override = m_flat3d_vsync->value();
+
+    // Force 1/2: the hook's vblank guard needs the refresh period to count
+    // vblanks (it refines it from measured vblank spacing).
+    if (p.vsync_override == 3) {
+        if (const auto di = query_display_info_cached(g_framework->get_window()); di && di->refresh_hz > 0) {
+            p.refresh_period_ms = 1000.0 / (double)di->refresh_hz;
+        }
+    }
+
     p.eye_swap = m_flat3d_eye_swap->value();
     // AFW: the engine renders one eye/frame (rides is_using_afr()); the other eye
     // is reprojected. warp_frame drives the compositor to take both eyes fresh (the
@@ -3616,7 +3702,13 @@ void VR::on_draw_sidebar_flat3d() {
                           "tear-free AND both AFR eye frames land each refresh. t.MaxFPS\n"
                           "auto-caps at 2x refresh under AFR/Synced/AFW, 1x under Native Stereo.\n"
                           "(DX11 exclusive-fullscreen can still tear at interval 0 - use Force On\n"
-                          "there, or run borderless windowed.)");
+                          "there, or run borderless windowed.)\n"
+                          "Force 1/2 = stereo pair rate at HALF the display refresh, locked to the\n"
+                          "display: for frame-sequential outputs (3D Vision via Katanga, NV3D-Glass,\n"
+                          "WibbleWobble). Native Stereo presents every 2nd refresh; AFR/Synced/AFW\n"
+                          "present every refresh (one eye each). Paced on the display's vblank even\n"
+                          "while the 3D app covers the game window, with t.MaxFPS uncapped - use\n"
+                          "this if you see a stutter every few minutes with those outputs.");
     }
 
     m_flat3d_force_sdr->draw("Force SDR Output");
