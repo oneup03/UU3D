@@ -651,10 +651,18 @@ public:
     }
 
     bool is_using_afr() const {
-        return m_rendering_method->value() == RenderingMethod::ALTERNATING || 
+        return m_rendering_method->value() == RenderingMethod::ALTERNATING ||
                m_rendering_method->value() == RenderingMethod::SYNCHRONIZED ||
                m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP ||
                m_extreme_compat_mode->value() == true;
+    }
+
+    // Whether the 3D Display VSync Override owns t.MaxFPS: No-Tear Fast (2)
+    // caps it at the display rate, Force 1/2 (3) uncaps it while the present
+    // interval paces the game. update_hmd_state must not write its
+    // UncapFramerate value over either.
+    bool flat3d_owns_max_fps() {
+        return is_using_flat3d() && m_flat3d_vsync->value() >= 2;
     }
 
     bool is_using_native_stereo() const {
@@ -2060,6 +2068,7 @@ private:
         "Use In-Game Setting",
         "Force On",
         "No-Tear Fast",
+        "Force 1/2",
     };
     static const inline std::vector<std::string> s_flat3d_hud_depth_names{
         "Flat (GUI Depth)",
@@ -2127,6 +2136,14 @@ private:
     // refresh (t.MaxFPS auto-caps at 2x refresh under AFR, 1x under native).
     // Force On stays for DX11 blit-model exclusive fullscreen, which tears at
     // interval 0 no matter the flags.
+    // Force 1/2 (3): stereo pair rate at half the display refresh, locked to
+    // the display - Native Stereo presents at interval 2, AFR/Synced/AFW at
+    // interval 1 (one eye per present). For frame-sequential outputs (3D
+    // Vision via Katanga / NV3D-Glass / WibbleWobble) whose consumer covers
+    // the game window: there DXGI no longer blocks the game, the No-Tear Fast
+    // t.MaxFPS timer becomes its only pacer and beats against the panel clock
+    // (a hitch every few minutes). The present hook's vblank guard enforces
+    // the interval on the panel's vblank instead and t.MaxFPS stays uncapped.
     const ModCombo::Ptr m_flat3d_vsync{ ModCombo::create(generate_name("Flat3D_VSyncOverride"), s_flat3d_vsync_names, 2) };
     // HDR swapchains (PQ/scRGB) wash out the SDR-defined 3D output modes and
     // color correction — ask the engine to switch HDR output off while on.

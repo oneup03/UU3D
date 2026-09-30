@@ -103,12 +103,16 @@ enum class Flat3DColorSpace : int32_t {
 // consumed by both compositors.
 struct Flat3DFrameParams {
     int32_t mode{0};            // Flat3DOutputMode
-    // 0 = respect the game's present interval, 1 = force vsync on,
-    // 0 = respect the game, 1 = force interval 1, >=2 = "No-Tear Fast":
-    // interval 0 with ALLOW_TEARING stripped (flip-model scanout stays
-    // tear-free while both AFR eye frames present every refresh; t.MaxFPS
-    // auto-caps at 2x refresh under AFR, 1x under native stereo).
+    // 0 = respect the game, 1 = force interval 1, 2 = "No-Tear Fast" (interval
+    // 0 with ALLOW_TEARING stripped: flip-model scanout stays tear-free while
+    // both AFR eye frames present every refresh; t.MaxFPS auto-caps at 2x
+    // refresh under AFR, 1x under native stereo), 3 = "Force 1/2" (stereo pair
+    // rate at half the display refresh: interval 2 under native stereo, 1 under
+    // the AFR family, enforced on vblank by the present hook when DXGI does
+    // not block; t.MaxFPS uncapped).
     int32_t vsync_override{0};
+    // Display refresh period for the Force 1/2 vblank guard (0 = unknown).
+    double refresh_period_ms{0.0};
     bool eye_swap{false};
     bool afr_frame{false};      // only one eye is fresh this frame
     bool afr_left_eye{false};   // which eye is fresh (when afr_frame OR warp_frame)

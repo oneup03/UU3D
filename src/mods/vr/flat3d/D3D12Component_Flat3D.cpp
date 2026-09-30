@@ -281,6 +281,15 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     // present hook, so re-assert every frame). 0 = respect the game.
     if (params.vsync_override == 1) {
         hook->set_next_present_interval(1);
+    } else if (params.vsync_override == 3) {
+        // Force 1/2: stereo pair rate at half the display refresh, locked to
+        // the display. Native stereo presents both eyes per frame (interval
+        // 2); the AFR family presents one eye per frame (interval 1, so a pair
+        // spans two refreshes). The guard enforces the interval on vblank when
+        // DXGI does not block (game window covered by a Katanga consumer).
+        const uint32_t interval = vr->is_using_afr() ? 1u : 2u;
+        hook->set_next_present_interval(interval);
+        hook->set_next_present_vblank_guard(interval, params.refresh_period_ms);
     } else if (params.vsync_override >= 2) {
         // No-Tear Fast: interval 0 with ALLOW_TEARING stripped — flip-model
         // scanout stays tear-free while presents run unthrottled, so both

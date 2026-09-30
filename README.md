@@ -152,15 +152,26 @@ Pick how the stereo pair is packed into the screen image:
 **Swap Eyes** — flips left/right if the depth looks inverted (also flips the
 interlace phase for passive displays).
 
-**VSync Override** — *No-Tear Fast* (default), *Force On*, or *Use In-Game
-Setting*. No-Tear Fast overrides the game's own VSync: presents run uncapped
-at sync interval 0 with the DXGI tearing flag stripped, so a flip-model
-swapchain (all DX12 games) still flips on vblank only — tear-free **and**
-both eyes of an AFR-family pair land every refresh. The frame cap
+**VSync Override** — *No-Tear Fast* (default), *Force On*, *Force 1/2*, or
+*Use In-Game Setting*. No-Tear Fast overrides the game's own VSync: presents
+run uncapped at sync interval 0 with the DXGI tearing flag stripped, so a
+flip-model swapchain (all DX12 games) still flips on vblank only — tear-free
+**and** both eyes of an AFR-family pair land every refresh. The frame cap
 (`t.MaxFPS`) is managed automatically: twice the display refresh under
 Synced Sequential / AFR / AFW, native refresh under Native Stereo. (DX11
 exclusive-fullscreen can still tear at interval 0 — use *Force On* there, or
 run borderless windowed.)
+
+*Force 1/2* is for frame-sequential outputs (3D Vision through Katanga,
+NV3D-Glass or WibbleWobble): the stereo pair rate becomes half the display
+refresh, locked to the display. Native Stereo presents every second refresh,
+AFR / Synced Sequential / AFW present every refresh (one eye each). Those
+consumers cover the game window with their own fullscreen output, which stops
+DXGI from throttling the game; under No-Tear Fast the only pacer left is the
+`t.MaxFPS` timer, which drifts against the panel's clock and shows up as a
+stutter every few minutes. Force 1/2 paces presents on the display's vblank
+even while covered, with `t.MaxFPS` uncapped, so there is no second clock to
+beat against.
 
 **Force SDR Output** — HDR output washes out the 3D modes and disables color
 correction. Leave this on unless you specifically want to experiment with HDR

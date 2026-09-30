@@ -735,9 +735,11 @@ HRESULT WINAPI D3D11Hook::present(IDXGISwapChain* swap_chain, UINT sync_interval
     }
 
     HRESULT result = S_OK;
+    bool presented = false;
     g_inside_d3d11_present = true;
 
     if (!d3d11->m_ignore_next_present) {
+        presented = true;
         result = present_fn(swap_chain, sync_interval, flags);
         last_d3d11_present_result = result;
     } else {
@@ -752,6 +754,14 @@ HRESULT WINAPI D3D11Hook::present(IDXGISwapChain* swap_chain, UINT sync_interval
     }
 
     d3d11->m_last_depthstencil_used.Reset();
+
+    // Force 1/2: enforce the interval on vblank when DXGI did not block (see
+    // DXGIVBlankGuard). Last thing before returning, so the game's next frame
+    // starts on the vblank edge. An occluded present still counts as
+    // presented (DXGI_STATUS_OCCLUDED is a success code) - that is exactly the
+    // case the guard exists for.
+    d3d11->m_vblank_guard.after_present(swap_chain, presented && SUCCEEDED(result));
+
     d3d11->m_inside_present = false;
 
     return result;

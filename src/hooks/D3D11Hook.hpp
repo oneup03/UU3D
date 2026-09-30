@@ -16,6 +16,8 @@
 
 #include "utility/PointerHook.hpp"
 
+#include "DXGIVBlankGuard.hpp"
+
 class D3D11Hook {
 public:
     typedef std::function<void(D3D11Hook&)> OnPresentFn;
@@ -45,6 +47,20 @@ public:
     // D3D12Hook::set_next_present_no_tearing).
     void set_next_present_no_tearing() {
         m_next_present_no_tearing = true;
+    }
+
+    // One-shot: after this present returns, hold the present thread on the
+    // display's vblank until `interval` refreshes have passed since the last
+    // paced release. Enforces a forced sync interval when DXGI itself does not
+    // block (game window covered by another process's fullscreen output, i.e.
+    // the Katanga consumers) so the game stays on the display clock instead of
+    // the t.MaxFPS timer. See DXGIVBlankGuard.
+    void set_next_present_vblank_guard(uint32_t interval, double period_ms) {
+        m_vblank_guard.request(interval, period_ms);
+    }
+
+    DXGIVBlankGuard& vblank_guard() {
+        return m_vblank_guard;
     }
 
     bool hook();
@@ -151,6 +167,7 @@ protected:
 
     std::optional<uint32_t> m_next_present_interval{};
     bool m_next_present_no_tearing{false};
+    DXGIVBlankGuard m_vblank_guard{};
 
     // Forced minimum swapchain size (0 = off).
     std::atomic<uint32_t> m_forced_resize_w{ 0 };
