@@ -1119,6 +1119,7 @@ list(APPEND uevr_SOURCES
 	"src/hooks/D3D11Hook.hpp"
 	"src/hooks/D3D12Hook.hpp"
 	"src/hooks/DInputHook.hpp"
+	"src/hooks/DXGIVBlankGuard.hpp"
 	"src/hooks/WindowsMessageHook.hpp"
 	"src/hooks/XInputHook.hpp"
 	"src/mods/FrameworkConfig.hpp"
