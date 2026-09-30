@@ -1118,6 +1118,12 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
             d3d12->m_next_present_interval = std::nullopt;
             d3d12->m_next_present_no_tearing = false;
 
+            // Apply the override. This assignment had been lost on this branch
+            // (the requested interval was read and then ignored, and the block
+            // below tested the GAME's interval twice), so Force On / Force 1/2
+            // were no-ops for DX12 titles: upstream and flat3d-afw both assign.
+            sync_interval = requested_sync_interval;
+
             if (sync_interval == 0) {
                 BOOL is_fullscreen = 0;
                 swap_chain->GetFullscreenState(&is_fullscreen, nullptr);
@@ -1126,30 +1132,21 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
                 DXGI_SWAP_CHAIN_DESC swap_desc{};
                 swap_chain->GetDesc(&swap_desc);
 
-                if (sync_interval == 0) {
-                    BOOL is_fullscreen = 0;
-                    swap_chain->GetFullscreenState(&is_fullscreen, nullptr);
-                    flags &= ~DXGI_PRESENT_DO_NOT_SEQUENCE;
-
-                    DXGI_SWAP_CHAIN_DESC swap_desc{};
-                    swap_chain->GetDesc(&swap_desc);
-
-                    if (no_tearing) {
-                        // No-Tear Fast: interval 0 WITHOUT ALLOW_TEARING. On a
-                        // flip-model swapchain this cannot tear (the display
-                        // still flips on vblank; the newest present wins) while
-                        // presents run unthrottled — both AFR eye frames land
-                        // each refresh.
-                        flags &= ~DXGI_PRESENT_ALLOW_TEARING;
-                    } else if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
-                        flags |= DXGI_PRESENT_ALLOW_TEARING;
-                    }
-                } else {
-                    // Forcing vsync ON while the game presents with tearing
-                    // enabled: ALLOW_TEARING is only valid with interval 0 —
-                    // leaving it set fails DXGI_ERROR_INVALID_CALL (fatal in UE).
+                if (no_tearing) {
+                    // No-Tear Fast: interval 0 WITHOUT ALLOW_TEARING. On a
+                    // flip-model swapchain this cannot tear (the display
+                    // still flips on vblank; the newest present wins) while
+                    // presents run unthrottled — both AFR eye frames land
+                    // each refresh.
                     flags &= ~DXGI_PRESENT_ALLOW_TEARING;
+                } else if (!is_fullscreen && (swap_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+                    flags |= DXGI_PRESENT_ALLOW_TEARING;
                 }
+            } else {
+                // Forcing vsync ON while the game presents with tearing
+                // enabled: ALLOW_TEARING is only valid with interval 0 —
+                // leaving it set fails DXGI_ERROR_INVALID_CALL (fatal in UE).
+                flags &= ~DXGI_PRESENT_ALLOW_TEARING;
             }
         }
     }
