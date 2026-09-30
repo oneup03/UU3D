@@ -42,6 +42,15 @@ inline bool is_breathedge2_inventory_runtime(
         filename == L"breathedge2-win64-shipping.exe";
 }
 
+inline bool is_halloween_ue574_dx12_runtime(
+    std::wstring_view path, uint32_t version_ms, uint32_t version_ls, bool dx12) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return dx12 && filename == L"halloween.exe" && version_ms == 0x00050007 && version_ls == 0x00040000;
+}
+
 inline bool should_use_stellar_blade_callable_renderer_entry(
     std::wstring_view path,
     bool ue426,
@@ -166,10 +175,26 @@ inline bool is_prospi_executable_path(std::wstring_view path) {
            lowered.find(L"prospi24-win64-shipping") != std::wstring::npos;
 }
 
+inline bool is_dune_awakening_gdk_executable_path(std::wstring_view path) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"dunesandbox-wingdk-shipping.exe";
+}
+
 inline bool is_dune_awakening_executable_path(std::wstring_view path) {
     const auto lowered = lowercase_path(path);
     return lowered.find(L"dunesandbox-win64-shipping") != std::wstring::npos ||
-           lowered.find(L"duneawakening") != std::wstring::npos;
+           lowered.find(L"duneawakening") != std::wstring::npos ||
+           is_dune_awakening_gdk_executable_path(path);
+}
+
+inline bool is_dune_awakening_source_view_extension_path(std::wstring_view path) {
+    // GDK may try signature-validated guards, but its callback ABI is not yet
+    // validated. Keep the existing Win64 mappings separate from title detection.
+    return !is_dune_awakening_gdk_executable_path(path) &&
+           is_dune_awakening_executable_path(path);
 }
 
 inline bool is_mechwarrior_clans_executable_path(std::wstring_view path) {

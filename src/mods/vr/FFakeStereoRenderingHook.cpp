@@ -43,6 +43,7 @@
 #include <sdk/MafiaDiscovery.hpp>
 #include <sdk/DiscoveryMemory.hpp>
 #include <sdk/KtjLStereoBootstrap.hpp>
+#include <sdk/KingdomHearts3Runtime.hpp>
 #include <sdk/ObjectLivenessPolicy.hpp>
 #include <sdk/RtmDiscovery.hpp>
 #include <sdk/Slate.hpp>
@@ -81,6 +82,8 @@
 #include "SifuRendererEntry.hpp"
 #include "SifuMeshCommands.hpp"
 #include "DuneFrameHandoff.hpp"
+#include "HalloweenRenderTargets.hpp"
+#include "HalloweenNativeFix.hpp"
 #include "KtjLFogResources.hpp"
 #include "KtjLCloudResources.hpp"
 #include "KtjLCloudHook.hpp"
@@ -129,6 +132,7 @@ namespace {
 bool is_writable_process_range(uintptr_t address, size_t size);
 bool is_readable_process_range(uintptr_t address, size_t size);
 bool is_executable_process_range(uintptr_t address, size_t size);
+bool halloween_ue574_dx12_runtime();
 bool get_d3d12_resource_desc_guarded(ID3D12Resource* resource, D3D12_RESOURCE_DESC& out);
 bool get_d3d12_resource_device_guarded(ID3D12Resource* resource, ID3D12Device4** out);
 
@@ -401,6 +405,32 @@ std::optional<UE57FSceneViewFamilyFunctions> resolve_ue57_fsceneviewfamily_funct
             copy_constructor_vtable = *resolved_vtable;
             deleting_destructor_address = *candidate_deleting_destructor;
             ++copy_constructor_candidates;
+        }
+    }
+
+    if (copy_constructor_candidates == 0 && halloween_ue574_dx12_runtime()) {
+        namespace h = uevr::halloween_native;
+        const auto memory = sdk::discovery::process_memory();
+        scan_cursor = module_base;
+        while (module_size != 0 && scan_cursor < module_end) {
+            const auto match = utility::scan(scan_cursor, module_end - scan_cursor, h::family_copy_signature);
+            if (!match) { break; }
+            scan_cursor = *match + 1;
+            const auto entry = utility::find_function_entry(*match);
+            const auto start = utility::find_function_start_unwind(*match);
+            if (!entry || !start || *start != *match || module_base + entry->BeginAddress != *match) { continue; }
+            const auto table = h::family_copy_vtable(memory, *match,
+                entry->EndAddress - entry->BeginAddress, module_base, module_size);
+            if (!table || !is_readable_process_range(*table, sizeof(uintptr_t))) { continue; }
+            const auto destructor = resolve_deleting_destructor(*table);
+            if (!destructor) { continue; }
+            copy_constructor_address = *match;
+            copy_constructor_vtable = *table;
+            deleting_destructor_address = *destructor;
+            ++copy_constructor_candidates;
+        }
+        if (copy_constructor_candidates == 1) {
+            SPDLOG_INFO("[Halloween][UE5.7][NativeStereoFix] Validated outlined Views/AllViews family copy and existing owned-interface destructor contract");
         }
     }
 
@@ -1683,6 +1713,15 @@ bool dune_native_fix_renderer_resolver_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
         return exe_path && uevr::games::is_dune_awakening_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+
+bool dune_source_view_extension_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_dune_awakening_source_view_extension_path(*exe_path);
     }();
 
     return result;
@@ -3663,6 +3702,82 @@ sdk::UTexture* create_daysgone_legacy_render_target(
         width,
         height);
     return texture;
+}
+
+sdk::UTexture* create_kh3_native_capture_target(
+    sdk::UGameplayStatics* gameplay_statics, sdk::UWorld* world, uint32_t width, uint32_t height)
+{
+    namespace kh3 = sdk::kh3;
+    const auto vr = VR::get();
+    if (!kh3::is_process() || !kh3::validated_objects_code() || g_framework == nullptr ||
+        !g_framework->is_dx11() || vr == nullptr || !vr->is_native_stereo_fix_enabled() ||
+        gameplay_statics == nullptr || world == nullptr || !kh3::valid_capture_extent(width, height)) {
+        return nullptr;
+    }
+
+    const auto memory = sdk::discovery::process_memory();
+    const auto base = kh3::module_base();
+    static const auto factory = kh3::render_target_factory(memory, base);
+    if (!factory || !sdk::FField::is_ufield_only()) {
+        SPDLOG_ERROR_ONCE("[KH3][NativeFix] Rejected the legacy capture-target instruction contract");
+        return nullptr;
+    }
+
+    try {
+        const auto target_class = sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.TextureRenderTarget2D");
+        if (!kh3::registered_object(memory, base, reinterpret_cast<uintptr_t>(target_class)) ||
+            target_class->get_properties_size() != kh3::target_object_size) {
+            SPDLOG_ERROR_ONCE("[KH3][NativeFix] Rejected the TextureRenderTarget2D class layout");
+            return nullptr;
+        }
+
+        constexpr std::array<std::pair<std::wstring_view, int32_t>, 7> properties{{
+            {L"SizeX", 0x100}, {L"SizeY", 0x104}, {L"ClearColor", 0x108},
+            {L"bForceLinearGamma", 0x11C}, {L"RenderTargetFormat", 0x120},
+            {L"bAutoGenerateMips", 0x124}, {L"OverrideFormat", 0x128},
+        }};
+        for (const auto& [name, offset] : properties) {
+            const auto property = target_class->find_property(name);
+            if (!kh3::registered_object(memory, base, reinterpret_cast<uintptr_t>(property)) ||
+                property->get_offset() != offset) {
+                SPDLOG_ERROR_ONCE("[KH3][NativeFix] Capture-target reflection does not match the validated factory");
+                return nullptr;
+            }
+        }
+
+        // KH3's reflected Kismet factory has no Format parameter and creates
+        // RGBA16F. Initialize our own empty target once, before exposing it to
+        // the render thread; never reformat the game or a published resource.
+        auto* object = gameplay_statics->spawn_object(target_class, world);
+        const auto address = reinterpret_cast<uintptr_t>(object);
+        if (!kh3::fresh_render_target(memory, base, address,
+                reinterpret_cast<uintptr_t>(target_class), reinterpret_cast<uintptr_t>(world)) ||
+            !is_writable_process_range(address, kh3::target_object_size)) {
+            SPDLOG_ERROR_ONCE("[KH3][NativeFix] Refused a nonempty or invalid capture-target object");
+            return nullptr;
+        }
+
+        constexpr std::array<float, 4> clear_color{0.0f, 0.0f, 0.0f, 1.0f};
+        std::memcpy(reinterpret_cast<void*>(address + 0x108), clear_color.data(), sizeof(clear_color));
+        *reinterpret_cast<uint8_t*>(address + 0x120) = 2; // RTF_RGBA8; EPixelFormat is specified separately below.
+        *reinterpret_cast<uint32_t*>(address + 0x124) &= ~2u;
+        using InitCustomFormatFn = void(__fastcall*)(sdk::UTexture*, uint32_t, uint32_t, uint8_t, bool);
+        auto* texture = static_cast<sdk::UTexture*>(object);
+        // The traced main-eye RTV is BGRA8 UNORM, not sRGB. Suppress the extra
+        // sRGB encode on this new owned target; the existing post-RHI gamma
+        // hook still matches the viewport for scene rendering.
+        reinterpret_cast<InitCustomFormatFn>(*factory)(texture, width, height, 2, true); // PF_B8G8R8A8, force linear.
+        if (!kh3::initialized_capture_target(memory, address, width, height)) {
+            SPDLOG_ERROR_ONCE("[KH3][NativeFix] Capture-target initialization did not retain the requested format/extent/linear encoding");
+            return nullptr;
+        }
+
+        SPDLOG_INFO("[KH3][NativeFix] Created validated linear BGRA8 capture target {:x} [{}x{}, one mip]", address, width, height);
+        return texture;
+    } catch (...) {
+        SPDLOG_ERROR_ONCE("[KH3][NativeFix] Legacy capture-target creation raised an exception");
+        return nullptr;
+    }
 }
 
 bool strikers_club_is_current_game() {
@@ -6227,6 +6342,17 @@ bool supports_ue57_dedicated_ui_target() {
     return g_framework->is_dx12() || g_framework->is_dx11();
 }
 
+bool halloween_ue574_dx12_runtime() {
+    if (g_framework == nullptr || !g_framework->is_dx12()) { return false; }
+    static const bool exact_title_and_version = [] {
+        const auto path = utility::get_module_pathw(utility::get_executable());
+        const auto version = sdk::get_file_version_info();
+        return path && uevr::games::is_halloween_ue574_dx12_runtime(
+            *path, version.dwFileVersionMS, version.dwFileVersionLS, true);
+    }();
+    return exact_title_and_version;
+}
+
 bool supports_borderlands4_ue554_dedicated_ui_target() {
     if (g_framework == nullptr || !g_framework->is_dx12()) {
         return false;
@@ -6250,6 +6376,9 @@ bool supports_borderlands4_ue554_dedicated_ui_target() {
 }
 
 bool supports_ue55_dedicated_ui_target_for_current_game() {
+    // Halloween uses the same RegisterExternalTexture ABI, but its UE5.7
+    // input structure is parsed separately before the legacy Slate path.
+    if (halloween_ue574_dx12_runtime()) { return true; }
     // These UE5.5/5.6 titles expose a valid Slate UI texture but route Slate to
     // the wrong target, leaving the HUD clipped in the upper-left/left-eye path.
     // Keep this allowlisted and DX12-only until more games validate it.
@@ -7187,27 +7316,38 @@ bool ue58_ui_validate_accessor(uintptr_t object, size_t slot, const std::array<u
         uevr::ue58_owned_ui::matches_accessor(code, expected);
 }
 
-std::optional<Microsoft::WRL::ComPtr<ID3D12Resource>> ue58_pooled_ui_validate_native_texture(
+bool ue58_dx12_has_proven_native_accessor(uintptr_t rhi) {
+    uintptr_t vtable{};
+    if (rhi == 0 || !safe_read_value(rhi, vtable) || vtable == 0) {
+        return false;
+    }
+    // Cache only immutable game code, never an instance or an inferred offset.
+    static std::atomic<uintptr_t> proven_native_vtable{};
+    if (proven_native_vtable.load(std::memory_order_acquire) != vtable) {
+        if (!ue58_ui_validate_accessor(rhi, 5, uevr::ue58_owned_ui::native_resource_accessor)) {
+            return false;
+        }
+        proven_native_vtable.store(vtable, std::memory_order_release);
+    }
+    return true;
+}
+
+std::optional<Microsoft::WRL::ComPtr<ID3D12Resource>> ue58_dx12_validate_native_texture(
     FRHITexture2D* texture, FRHITexture2D* scene, uint32_t width, uint32_t height)
 try {
     namespace layout = uevr::ue58_owned_ui;
     const auto rhi = reinterpret_cast<uintptr_t>(texture);
     const auto scene_rhi = reinterpret_cast<uintptr_t>(scene);
     uintptr_t vtable{}, scene_vtable{};
-    if (!uses_ue58_pooled_ui_owned_resource_path() || rhi == 0 || scene_rhi == 0 || rhi == scene_rhi ||
+    if (!is_validated_ue58_slate_ui_runtime() || !is_ue58_dx12_backend() ||
+        rhi == 0 || scene_rhi == 0 || rhi == scene_rhi ||
         !safe_read_value(rhi, vtable) || !safe_read_value(scene_rhi, scene_vtable) || vtable != scene_vtable)
     {
         return std::nullopt;
     }
 
-    // Only cache immutable code proof. No UESDK offset/vtable is learned from a
-    // partially initialized object, and no engine virtual function is invoked.
-    static std::atomic<uintptr_t> proven_native_vtable{};
-    if (proven_native_vtable.load(std::memory_order_acquire) != vtable) {
-        if (!ue58_ui_validate_accessor(rhi, 5, layout::native_resource_accessor)) {
-            return std::nullopt;
-        }
-        proven_native_vtable.store(vtable, std::memory_order_release);
+    if (!ue58_dx12_has_proven_native_accessor(rhi)) {
+        return std::nullopt;
     }
 
     uintptr_t d3d_resource{}, native_address{}, scene_resource{}, scene_native{};
@@ -7261,17 +7401,25 @@ try {
     return std::nullopt;
 }
 
-struct UE58OwnedUIResource {
+struct UE58OwnedTextureResource {
     uevr::ue58_owned_ui::Resource identity{};
     Microsoft::WRL::ComPtr<ID3D12Resource> native{};
 };
 
-std::optional<UE58OwnedUIResource> ue58_pooled_ui_validate_owned_resource(
-    sdk::UTexture* texture, FRHITexture2D* scene, uint32_t width, uint32_t height, const char*& reason)
+std::optional<UE58OwnedTextureResource> ue58_dx12_validate_owned_resource(
+    sdk::UTexture* texture, FRHITexture2D* scene, uint32_t width, uint32_t height, const char*& reason,
+    bool* recognized_layout = nullptr)
 try {
     namespace layout = uevr::ue58_owned_ui;
     reason = "owner or scene is unavailable";
-    if (!uses_ue58_pooled_ui_owned_resource_path() || texture == nullptr || scene == nullptr) {
+    if (!is_validated_ue58_slate_ui_runtime() || !is_ue58_dx12_backend() || texture == nullptr) {
+        return std::nullopt;
+    }
+    // Establish the RHI ABI from the live scene before claiming this owner.
+    // Custom RHIs/compiler shapes must keep their existing discovery path, not
+    // become permanently pending just because FTextureResource looks stock.
+    reason = "scene native-resource accessor is unavailable or unsupported";
+    if (!ue58_dx12_has_proven_native_accessor(reinterpret_cast<uintptr_t>(scene))) {
         return std::nullopt;
     }
     const auto owner = reinterpret_cast<uintptr_t>(texture);
@@ -7286,11 +7434,17 @@ try {
         return std::nullopt;
     }
     const auto read = [](uintptr_t address, auto& out) { return safe_read_value(address, out); };
-    const auto validate = [&](uintptr_t resource, uintptr_t rhi) {
-        uintptr_t rhi_vtable{}, scene_vtable{};
+    const auto validate_layout = [&](uintptr_t resource) {
         return is_readable_process_range(resource, layout::resource_size) &&
             ue58_ui_validate_accessor(resource, 6, layout::size_x_accessor) &&
-            ue58_ui_validate_accessor(resource + layout::render_target_offset, 2, layout::render_target_accessor) &&
+            ue58_ui_validate_accessor(resource + layout::render_target_offset, 2, layout::render_target_accessor);
+    };
+    if (recognized_layout != nullptr && layout::recognizes_resource(owner, size, read, validate_layout)) {
+        *recognized_layout = true;
+    }
+    const auto validate = [&](uintptr_t resource, uintptr_t rhi) {
+        uintptr_t rhi_vtable{}, scene_vtable{};
+        return validate_layout(resource) &&
             safe_read_value(rhi, rhi_vtable) &&
             safe_read_value(reinterpret_cast<uintptr_t>(scene), scene_vtable) && rhi_vtable == scene_vtable;
     };
@@ -7300,8 +7454,8 @@ try {
     if (!identity) {
         return std::nullopt;
     }
-    reason = "native UI texture, format or device is not ready";
-    auto native = ue58_pooled_ui_validate_native_texture(
+    reason = "native texture, format or device is not ready";
+    auto native = ue58_dx12_validate_native_texture(
         reinterpret_cast<FRHITexture2D*>(identity->rhi_texture), scene, width, height);
     if (!native) {
         return std::nullopt;
@@ -7312,7 +7466,7 @@ try {
         return std::nullopt;
     }
     reason = "ready";
-    return UE58OwnedUIResource{*identity, std::move(*native)};
+    return UE58OwnedTextureResource{*identity, std::move(*native)};
 } catch (...) {
     reason = "owned resource became unreadable during validation";
     return std::nullopt;
@@ -11471,6 +11625,11 @@ bool ghosting_is_live_uobject(
         return false;
     }
 
+    // KH3 stores an independent flag in the index's high bit. Use the same
+    // validated interpretation as UObjectHook before comparing array identity.
+    internal_index = static_cast<int32_t>(sdk::UObjectBase::normalize_internal_index(
+        static_cast<uint32_t>(internal_index)));
+
     if (expected_identity != nullptr &&
         (vtable != expected_identity->vtable ||
          object_class != expected_identity->object_class ||
@@ -11939,6 +12098,34 @@ bool ghosting_resolve_direct_view_state_slots(
     sdk::FSceneViewStateInterface* right_state,
     GhostingFixOwnerCandidate& out)
 {
+    if (sdk::kh3::is_process()) {
+        if (g_framework == nullptr || !g_framework->is_dx11() || !sdk::kh3::validated_local_player_code()) {
+            return false;
+        }
+        const auto states = sdk::kh3::local_player_states(
+            sdk::discovery::process_memory(), sdk::kh3::module_base(), local_player_address);
+        if (!states) { return false; }
+        const auto left = reinterpret_cast<uintptr_t>(left_state);
+        const auto right = reinterpret_cast<uintptr_t>(right_state);
+        const bool natural_order = states->primary == left && states->secondary == right;
+        const bool swapped_order = states->primary == right && states->secondary == left;
+        if (!natural_order && !swapped_order) { return false; }
+
+        const auto first = local_player_address + sdk::kh3::primary_reference_offset;
+        const auto second = local_player_address + sdk::kh3::secondary_reference_offset;
+        out.view_states_header = 0;
+        out.view_states_data = first;
+        out.view_states_count = 2;
+        out.view_states_capacity = 2;
+        out.view_state_stride = sdk::kh3::reference_stride;
+        out.view_state_reference_vtable = states->reference_vtable;
+        out.eye_state_slot[0] = (natural_order ? first : second) + sizeof(uintptr_t);
+        out.eye_state_slot[1] = (natural_order ? second : first) + sizeof(uintptr_t);
+        out.view_states_are_array = false;
+        SPDLOG_INFO_ONCE("[KH3][StereoOwner] Validated primary/secondary LocalPlayer references +430/+458; auxiliary +480 excluded");
+        return true;
+    }
+
     if (daysgone_is_current_game()) {
         constexpr uintptr_t FIRST_REFERENCE_OFFSET = 0x90;
         constexpr uintptr_t SECOND_REFERENCE_OFFSET = 0xB8;
@@ -12166,13 +12353,20 @@ bool ghosting_resolve_current_owner(
         // Days Gone's UE4.11 fork does not expose ControllerId through the
         // reflected LocalPlayer layout. Resolve its two exact, BN-validated
         // scene-state references before relying on reflected boundaries.
-        if (daysgone_is_current_game()) {
+        if (daysgone_is_current_game() || sdk::kh3::is_process()) {
             found_view_states = ghosting_resolve_direct_view_state_slots(
                 local_player_address,
                 controller_id_data,
                 left_state,
                 right_state,
                 candidate);
+        }
+
+        // KH3 also has a third, auxiliary reference. Do not let the broad
+        // legacy search adopt it when the exact primary/secondary pair fails.
+        if (sdk::kh3::is_process() && !found_view_states) {
+            diagnostic.failure = GhostingOwnerResolveFailure::ViewStateStorage;
+            continue;
         }
 
         if (!found_view_states && controller_id_data == 0) {
@@ -13072,7 +13266,7 @@ std::string FFakeStereoRenderingHook::build_hook_provenance_json() {
                 {"validated_source_runtime", is_validated_ue58_slate_ui_runtime()},
                 {"diagnostic_only", false},
                 {"phase2_capability_routing", true},
-                {"validated_source_versions", {"5.8.0", "5.8.1", "5.8.2"}},
+                {"validated_source_versions", {"5.8.0", "5.8.1", "5.8.2", "5.8.3"}},
                 {"source_contract", "DrawWindowViewport_RenderThread -> RegisterExternalTexture(SlateOutputTexture)"},
                 {"scanner", {
                     {"state", uevr::vr_compatibility::to_string(scanner_state)},
@@ -14586,6 +14780,18 @@ void FFakeStereoRenderingHook::attempt_hook_ue55_slate_output_texture_register()
 
     if (slate_output_ref_ip == 0 || register_callsite == 0) {
         SPDLOG_ERROR("[UE5.5][SlateUI] Failed to find SlateOutputTexture RegisterExternalTexture callsite in DrawWindow_RenderThread");
+        return;
+    }
+
+    if (halloween_ue574_dx12_runtime() &&
+        (!uevr::halloween_rt::code_matches(sdk::discovery::process_memory(),
+            draw_window + 0x36, uevr::halloween_rt::slate_entry_contract) ||
+         register_callsite < uevr::halloween_rt::slate_register_arguments.size() ||
+         !uevr::halloween_rt::code_matches(sdk::discovery::process_memory(),
+            register_callsite - uevr::halloween_rt::slate_register_arguments.size(),
+            uevr::halloween_rt::slate_register_arguments)))
+    {
+        SPDLOG_ERROR("[Halloween][UE5.7][SlateUI] RegisterExternalTexture argument contract changed; preserving engine routing");
         return;
     }
 
@@ -20633,7 +20839,7 @@ struct SceneViewExtensionAnalyzer {
     }
 
     static bool try_apply_dune_ue52_source_layout(uint32_t observed_is_active_index) {
-        if (!dune_native_fix_renderer_resolver_is_current_game() ||
+        if (!dune_source_view_extension_is_current_game() ||
             index_0_called ||
             observed_is_active_index != DUNE_UE52_IS_ACTIVE_INTERNAL_INDEX ||
             has_found_begin_render_viewfamily)
@@ -20708,7 +20914,7 @@ struct SceneViewExtensionAnalyzer {
             has_found_is_active_this_frame_index = true;
             is_active_this_frame_index = max_index;
 
-            // Dune's UE5.2 interface layout is known. Bypass the generic
+            // Dune's Win64 UE5.2 interface layout is known. Bypass the generic
             // frame-counter heuristic, which can confuse PreRenderView's
             // FSceneView argument (or stale registers from GetPriority) for an
             // FSceneViewFamily and install an ABI-incompatible callback.
@@ -20728,7 +20934,7 @@ struct SceneViewExtensionAnalyzer {
             return false;
         }
 
-        if (dune_native_fix_renderer_resolver_is_current_game() && has_found_is_active_this_frame_index) {
+        if (dune_source_view_extension_is_current_game() && has_found_is_active_this_frame_index) {
             SPDLOG_WARN_ONCE(
                 "[Dune][ViewExtension] Source mapping validation failed; refusing unsafe heuristic callback discovery");
             return false;
@@ -20926,7 +21132,7 @@ struct SceneViewExtensionAnalyzer {
         }
 
         const bool use_dune_ue52_source_callbacks =
-            dune_native_fix_renderer_resolver_is_current_game() &&
+            dune_source_view_extension_is_current_game() &&
             !index_0_called &&
             begin_render_viewfamily_index == DUNE_UE52_BEGIN_RENDER_VIEWFAMILY_INDEX &&
             (pre_render_viewfamily_renderthread_index == DUNE_UE52_PRE_RENDER_VIEWFAMILY_INDEX ||
@@ -21473,8 +21679,9 @@ bool FFakeStereoRenderingHook::bind_ghosting_fix_owner(GhostingFixPair& pair, co
     return true;
 }
 
-bool FFakeStereoRenderingHook::orient_daysgone_ghosting_fix_pair_from_owner(GhostingFixPair& pair) {
-    if (!daysgone_is_current_game() ||
+bool FFakeStereoRenderingHook::orient_legacy_ghosting_fix_pair_from_owner(GhostingFixPair& pair) {
+    const bool kh3 = sdk::kh3::validated_local_player_code();
+    if ((!daysgone_is_current_game() && !kh3) ||
         g_framework == nullptr ||
         !g_framework->is_dx11() ||
         !ghosting_is_valid_scene_state(pair.eye_state[0]) ||
@@ -21503,9 +21710,9 @@ bool FFakeStereoRenderingHook::orient_daysgone_ghosting_fix_pair_from_owner(Ghos
             object_hook_diagnostic);
     }
 
-    constexpr uintptr_t FIRST_REFERENCE_OFFSET = 0x90;
-    constexpr uintptr_t SECOND_REFERENCE_OFFSET = 0xB8;
-    constexpr uint32_t REFERENCE_STRIDE =
+    const uintptr_t FIRST_REFERENCE_OFFSET = kh3 ? sdk::kh3::primary_reference_offset : 0x90;
+    const uintptr_t SECOND_REFERENCE_OFFSET = kh3 ? sdk::kh3::secondary_reference_offset : 0xB8;
+    const uint32_t REFERENCE_STRIDE =
         static_cast<uint32_t>(SECOND_REFERENCE_OFFSET - FIRST_REFERENCE_OFFSET);
 
     if (!resolved ||
@@ -21562,8 +21769,9 @@ bool FFakeStereoRenderingHook::orient_daysgone_ghosting_fix_pair_from_owner(Ghos
     pair.logged_naturally_separated = false;
 
     SPDLOG_INFO(
-        "[GhostingFix][DaysGone] Confirmed AFR eye ownership from exact LocalPlayer "
+        "[GhostingFix][{}] Confirmed AFR eye ownership from exact LocalPlayer "
         "ViewState/StereoViewState slots owner={:x} generation={} primary={:x} secondary={:x} swapped={}",
+        kh3 ? "KH3" : "DaysGone",
         reinterpret_cast<uintptr_t>(candidate.local_player),
         pair.generation,
         primary_state_address,
@@ -22594,8 +22802,8 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         const auto scene_id = (uintptr_t)init_options_scene;
         const auto eye_index = true_index & 1;
         const auto other_eye_index = eye_index ^ 1;
-        const bool daysgone_exact_owner_orientation =
-            daysgone_is_current_game() &&
+        const bool exact_legacy_owner_orientation =
+            (daysgone_is_current_game() || sdk::kh3::validated_local_player_code()) &&
             g_framework != nullptr &&
             g_framework->is_dx11();
         const bool bootstrap_enabled = vr->is_ghosting_fix_bootstrap_enabled();
@@ -22856,15 +23064,15 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 ghosting_pair.eye_state[0] != ghosting_pair.eye_state[1];
 
             if (has_valid_pair) {
-                if (daysgone_exact_owner_orientation && !ghosting_pair.orientation_confirmed) {
-                    orient_daysgone_ghosting_fix_pair_from_owner(ghosting_pair);
+                if (exact_legacy_owner_orientation && !ghosting_pair.orientation_confirmed) {
+                    orient_legacy_ghosting_fix_pair_from_owner(ghosting_pair);
                 }
 
                 // Bootstrap can construct both candidate states in one engine
                 // frame, before AFR eye ownership is stable. Treat the pair as
                 // unordered until the same raw state is observed repeatedly
                 // on later left-eye frames.
-                if (!daysgone_exact_owner_orientation && eye_index == 0) {
+                if (!exact_legacy_owner_orientation && eye_index == 0) {
                     const bool is_new_engine_frame =
                         !ghosting_pair.pending_left_source_frame_valid ||
                         ghosting_pair.pending_left_source_frame != g_frame_count;
@@ -22984,10 +23192,10 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                                     ghosting_pair.owner.view_state_stride);
                             }
                         } else {
-                            const bool daysgone_has_applied_remap =
-                                daysgone_exact_owner_orientation &&
+                            const bool legacy_has_applied_remap =
+                                exact_legacy_owner_orientation &&
                                 g_hook->m_sceneview_data.ghosting_last_right_eye_remap_observation != 0;
-                            ghosting_state = daysgone_has_applied_remap
+                            ghosting_state = legacy_has_applied_remap
                                 ? GhostingFixState::Active
                                 : GhostingFixState::NaturallySeparated;
 
@@ -23004,7 +23212,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                         }
                     }
                 } else if (
-                    !(daysgone_exact_owner_orientation && owner_is_current) &&
+                    !(exact_legacy_owner_orientation && owner_is_current) &&
                     ghosting_state != GhostingFixState::NaturallySeparated &&
                     (g_hook->m_sceneview_data.ghosting_last_right_eye_remap_time.time_since_epoch().count() == 0 ||
                      now - g_hook->m_sceneview_data.ghosting_last_right_eye_remap_time > std::chrono::milliseconds{500}))
@@ -24830,10 +25038,28 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     }
 
     const auto rt = rtm->get_scene_capture_utexture();
-    const auto rtrsrc = rt != nullptr ? reinterpret_cast<sdk::FTextureRenderTargetResource*>(rt->get_resource()) : nullptr;
-    const auto rtfrt = rtrsrc != nullptr ? rtrsrc->as_render_target() : nullptr;
-    auto* const rt_texture_ref = rtfrt != nullptr ? rtfrt->get_render_target_texture() : nullptr;
-    auto* const scene_capture_rhi = rt_texture_ref != nullptr ? *rt_texture_ref : nullptr;
+    sdk::FTextureRenderTargetResource* rtrsrc{};
+    sdk::FRenderTarget* rtfrt{};
+    FRHITexture2D* scene_capture_rhi{};
+    if (native_capture_snapshot != nullptr && native_capture_snapshot->ue58_owned_resource) {
+        namespace layout = uevr::ue58_owned_ui;
+        const auto& identity = *native_capture_snapshot->ue58_owned_resource;
+        if (rt != nullptr && reinterpret_cast<uintptr_t>(rt) == native_capture_snapshot->owner_texture &&
+            native_capture_snapshot->generation == rtm->get_scene_capture_generation() &&
+            layout::resource_matches(reinterpret_cast<uintptr_t>(rt), identity,
+                native_capture_snapshot->width, native_capture_snapshot->height,
+                [](uintptr_t address, auto& out) { return safe_read_value(address, out); }))
+        {
+            rtrsrc = reinterpret_cast<sdk::FTextureRenderTargetResource*>(identity.resource);
+            rtfrt = reinterpret_cast<sdk::FRenderTarget*>(identity.resource + layout::render_target_offset);
+            scene_capture_rhi = reinterpret_cast<FRHITexture2D*>(identity.rhi_texture);
+        }
+    } else {
+        rtrsrc = rt != nullptr ? reinterpret_cast<sdk::FTextureRenderTargetResource*>(rt->get_resource()) : nullptr;
+        rtfrt = rtrsrc != nullptr ? rtrsrc->as_render_target() : nullptr;
+        auto* const rt_texture_ref = rtfrt != nullptr ? rtfrt->get_render_target_texture() : nullptr;
+        scene_capture_rhi = rt_texture_ref != nullptr ? *rt_texture_ref : nullptr;
+    }
     const auto scene_capture_native = avowed_try_get_native_resource(scene_capture_rhi);
     const bool capture_transaction_valid =
         native_capture_snapshot != nullptr && rt != nullptr && rtfrt != nullptr &&
@@ -26244,7 +26470,7 @@ void FFakeStereoRenderingHook::pre_render_view_renderthread(
     sdk::FRHICommandListBase* cmd_list,
     sdk::FSceneView& view)
 {
-    if (!dune_native_fix_renderer_resolver_is_current_game()) {
+    if (!dune_source_view_extension_is_current_game()) {
         return;
     }
 
@@ -26347,7 +26573,7 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
         }
     }};
 
-    if (dune_native_fix_renderer_resolver_is_current_game() &&
+    if (dune_source_view_extension_is_current_game() &&
         SceneViewExtensionAnalyzer::frame_count_offset == SceneViewExtensionAnalyzer::DUNE_UE52_FRAME_NUMBER_OFFSET)
     {
         const auto family_address = reinterpret_cast<uintptr_t>(&view_family);
@@ -35526,6 +35752,45 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
     UE55SlateDrawWindowPassInputsHead ue55_inputs{};
     UE55SlateDrawWindowPassInputs ue55_inputs_full{};
 
+    if (halloween_ue574_dx12_runtime()) {
+        const auto previous_inside = g_hook->m_inside_slate_draw_window;
+        const auto previous_thread = g_hook->m_slate_draw_window_thread_id;
+        g_hook->m_inside_slate_draw_window = false;
+        utility::ScopeGuard restore_slate_scope{[&] {
+            g_hook->m_inside_slate_draw_window = previous_inside;
+            g_hook->m_slate_draw_window_thread_id = previous_thread;
+        }};
+        static const bool slate_contract = uevr::halloween_rt::code_matches(
+            sdk::discovery::process_memory(), g_hook->m_slate_thread_hook.target_address() + 0x36,
+            uevr::halloween_rt::slate_entry_contract);
+        const auto match = slate_contract ? uevr::halloween_rt::slate_inputs(
+            sdk::discovery::process_memory(), reinterpret_cast<uintptr_t>(renderer),
+            reinterpret_cast<uintptr_t>(a2), reinterpret_cast<uintptr_t>(a3), reinterpret_cast<uintptr_t>(a4),
+            [](uintptr_t object) { return looks_like_vtable_object(reinterpret_cast<void*>(object)); })
+            : std::nullopt;
+        if (!match || !is_readable_process_range(match->command_list, 0x100)) {
+            SPDLOG_WARNING_EVERY_N_SEC(10,
+                "[Halloween][UE5.7][SlateUI] No validated stock input/command-list contract; preserving original draw");
+            return g_hook->m_slate_thread_hook.call<void*>(renderer, a2, a3, a4, params, unk1, unk2);
+        }
+
+        // This is the engine's RHICmdList reference, not hidden sret storage.
+        g_hook->get_slate_thread_worker()->execute(reinterpret_cast<FRHICommandListImmediate*>(match->command_list));
+        const auto vr = VR::get();
+        auto* rtm = g_hook->get_render_target_manager();
+        if (vr != nullptr && vr->is_hmd_active() && !vr->is_stereo_emulation_enabled() && rtm != nullptr) {
+            g_hook->note_stable_slate_draw();
+            g_hook->attempt_hook_ue55_slate_output_texture_register();
+            rtm->request_dedicated_ui_target(match->width, match->height);
+            rtm->ensure_dedicated_ui_target(0);
+            g_hook->m_inside_slate_draw_window = true;
+            g_hook->m_slate_draw_window_thread_id = GetCurrentThreadId();
+            SPDLOG_INFO_ONCE("[Halloween][UE5.7][SlateUI] Validated stock input/sret ABI; UI extent {}x{}",
+                match->width, match->height);
+        }
+        return g_hook->m_slate_thread_hook.call<void*>(renderer, a2, a3, a4, params, unk1, unk2);
+    }
+
     if (sw_zero_company_ue56_is_current_game() &&
         is_ue_5_6_dx12_backend() &&
         sw_zero_company_has_source_matched_slate_sret_abi() &&
@@ -38462,7 +38727,9 @@ uint64_t VRRenderTargetManager_Base::invalidate_scene_capture_generation(const c
 bool VRRenderTargetManager_Base::publish_scene_capture_target_snapshot(
     sdk::UTexture* owner_texture,
     FRHITexture2D* rhi_texture,
-    uint64_t generation)
+    uint64_t generation,
+    const uevr::ue58_owned_ui::Resource* ue58_owned_resource,
+    IUnknown* validated_native)
 {
     if (owner_texture == nullptr || rhi_texture == nullptr ||
         generation == 0 || generation != scene_capture_generation.load(std::memory_order_acquire))
@@ -38470,7 +38737,13 @@ bool VRRenderTargetManager_Base::publish_scene_capture_target_snapshot(
         return false;
     }
 
-    auto* native = reinterpret_cast<IUnknown*>(rhi_texture->get_native_resource());
+    if (ue58_owned_resource != nullptr &&
+        (validated_native == nullptr || ue58_owned_resource->rhi_texture != reinterpret_cast<uintptr_t>(rhi_texture)))
+    {
+        return false;
+    }
+    auto* native = ue58_owned_resource != nullptr
+        ? validated_native : reinterpret_cast<IUnknown*>(rhi_texture->get_native_resource());
     if (native == nullptr) {
         return false;
     }
@@ -38497,6 +38770,15 @@ bool VRRenderTargetManager_Base::publish_scene_capture_target_snapshot(
                 expected_device != nullptr && resource_device.Get() == expected_device &&
                 bgra_compatible && desc.Width == expected_width && desc.Height == expected_height &&
                 desc.MipLevels == 1 && desc.ArraySize == 1 && desc.SampleDesc.Count == 1;
+            if (!resource_valid && sdk::kh3::is_process()) {
+                static std::atomic_uint32_t rejected_descriptors{};
+                if (rejected_descriptors.fetch_add(1, std::memory_order_relaxed) < 4) {
+                    SPDLOG_WARN("[KH3][NativeFix] Rejected capture: DXGI format={}, {}x{} (expected {}x{}), mips={}, array={}, samples={}, same_device={}",
+                        static_cast<uint32_t>(desc.Format), desc.Width, desc.Height, expected_width, expected_height,
+                        desc.MipLevels, desc.ArraySize, desc.SampleDesc.Count,
+                        expected_device != nullptr && resource_device.Get() == expected_device);
+                }
+            }
         }
     } else if (g_framework->get_renderer_type() == Framework::RendererType::D3D12) {
         Microsoft::WRL::ComPtr<ID3D12Resource> texture{};
@@ -38540,6 +38822,15 @@ bool VRRenderTargetManager_Base::publish_scene_capture_target_snapshot(
     snapshot->generation = generation;
     snapshot->width = expected_width;
     snapshot->height = expected_height;
+    if (ue58_owned_resource != nullptr) {
+        if (!uevr::ue58_owned_ui::resource_matches(reinterpret_cast<uintptr_t>(owner_texture),
+                *ue58_owned_resource, expected_width, expected_height,
+                [](uintptr_t address, auto& out) { return safe_read_value(address, out); }))
+        {
+            return false;
+        }
+        snapshot->ue58_owned_resource = *ue58_owned_resource;
+    }
 
     if (generation != scene_capture_generation.load(std::memory_order_acquire)) {
         return false;
@@ -38715,6 +39006,7 @@ struct VRRenderTargetManager_Base::UE58UITextureOwner {
     inline static std::atomic_bool servicing_enabled{};
     sdk::UObjectReference<sdk::UTexture> texture{nullptr};
     uevr::ue58_owned_ui::StableResource stability{};
+    bool recognized_stock_layout{};
     bool rooted{};
     UE58UITextureOwner* next_retired{};
 
@@ -38864,11 +39156,14 @@ void VRRenderTargetManager_Base::service_ue58_ui_initialization(uevr::ue58_ui::S
             return;
         }
         FRHITexture2D* ready_texture{};
-        std::optional<UE58OwnedUIResource> validated{};
-        if (uses_ue58_pooled_ui_owned_resource_path()) {
-            const char* reason{};
-            validated = ue58_pooled_ui_validate_owned_resource(
-                owner.texture.get(), get_render_target(), ticket->width, ticket->height, reason);
+        std::optional<UE58OwnedTextureResource> validated{};
+        const char* reason{};
+        if (is_validated_ue58_slate_ui_runtime() && is_ue58_dx12_backend()) {
+            validated = ue58_dx12_validate_owned_resource(
+                owner.texture.get(), get_render_target(), ticket->width, ticket->height, reason,
+                &owner.recognized_stock_layout);
+        }
+        if (uses_ue58_pooled_ui_owned_resource_path() || owner.recognized_stock_layout || validated) {
             if (!validated) {
                 owner.stability.observe(std::nullopt);
                 retry(reason);
@@ -38882,8 +39177,7 @@ void VRRenderTargetManager_Base::service_ue58_ui_initialization(uevr::ue58_ui::S
             }
             ready_texture = reinterpret_cast<FRHITexture2D*>(validated->identity.rhi_texture);
         } else {
-            // Retain the cache-aware discovery path used by existing working
-            // UE5.8 DX12 sessions; this patch changes scheduling, not layouts.
+            // Unrecognized custom layouts retain their existing discovery path.
             if (!sdk::UTexture::update_render_resource_offset_texture2d(owner.texture)) {
                 retry("UTexture resource offset is not ready");
                 return;
@@ -38919,6 +39213,10 @@ void VRRenderTargetManager_Base::service_ue58_ui_initialization(uevr::ue58_ui::S
         {
             SPDLOG_INFO("[UE5.8][SlateUI][Init] Published UI generation {} [{}x{}] via {}",
                 ticket->generation, ticket->width, ticket->height, uevr::ue58_ui::to_string(source));
+            if (validated) {
+                SPDLOG_INFO("[UE5.8][SlateUI][Init] Validated owned resource at owner+0x{:x}, "
+                    "FRenderTarget+0x40; no global texture offset updates", validated->identity.private_resource_offset);
+            }
         }
     } catch (...) {
         retry("UI resource validation raised an exception");
@@ -39480,6 +39778,12 @@ bool VRRenderTargetManager_Base::can_attempt_dedicated_ui_creation() {
         return false;
     }
 
+    if (halloween_ue574_dx12_runtime() && get_render_target() == nullptr) {
+        // Do not create a UObject render target during the first viewport
+        // allocation. Wait until the engine's completed native scene validates.
+        return false;
+    }
+
     const bool automatic_ue58_synthetic_route =
         is_ue_5_8() &&
         !supports_legacy_allowlisted_ue58_ui_route() &&
@@ -39951,7 +40255,7 @@ bool VRRenderTargetManager_Base::create_dedicated_ui_texture() {
                             }
                         } else if (uses_ue58_pooled_ui_owned_resource_path()) {
                             const char* reason{};
-                            const auto validated = ue58_pooled_ui_validate_owned_resource(
+                            const auto validated = ue58_dx12_validate_owned_resource(
                                 tgt.get(), this->get_render_target(), width, height, reason);
                             if (!validated) {
                                 stability.observe(std::nullopt);
@@ -40145,7 +40449,7 @@ void VRRenderTargetManager_Base::ensure_dedicated_ui_target(uintptr_t command_li
     // republish the UI target; a miss preserves the original Slate input.
     if (uses_ue58_pooled_ui_owned_resource_path()) {
         if (existing_target != nullptr) {
-            if (ue58_pooled_ui_validate_native_texture(
+            if (ue58_dx12_validate_native_texture(
                     existing_target, get_render_target(), dedicated_ui_width, dedicated_ui_height))
             {
                 return;
@@ -40155,7 +40459,7 @@ void VRRenderTargetManager_Base::ensure_dedicated_ui_target(uintptr_t command_li
         }
         if (dedicated_ui_texture != nullptr && dedicated_ui_texture.valid()) {
             const char* reason{};
-            const auto validated = ue58_pooled_ui_validate_owned_resource(
+            const auto validated = ue58_dx12_validate_owned_resource(
                 dedicated_ui_texture.get(), get_render_target(), dedicated_ui_width, dedicated_ui_height, reason);
             if (validated) {
                 set_dedicated_ui_target(reinterpret_cast<FRHITexture2D*>(validated->identity.rhi_texture),
@@ -40703,7 +41007,9 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     const auto target_width = VR::get()->get_hmd_width();
     const auto target_height = VR::get()->get_hmd_height();
     sdk::UTexture* tgt_raw{};
-    if (kismet_rendering != nullptr) {
+    if (sdk::kh3::is_process() && g_framework->is_dx11() && VR::get()->is_native_stereo_fix_enabled()) {
+        tgt_raw = create_kh3_native_capture_target(ugs, world, target_width, target_height);
+    } else if (kismet_rendering != nullptr) {
         tgt_raw = kismet_rendering->create_render_target_2d(
             world,
             target_width,
@@ -40825,7 +41131,8 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     };
 
     RenderThreadWorker::ConditionalJobFunc render_thread_conditional_task =
-        [this, tgt, generation, fail_generation]() -> bool {
+        [this, tgt, generation, fail_generation, recognized_stock_layout = false,
+            stability = uevr::ue58_owned_ui::StableResource{}]() mutable -> bool {
         if (generation != scene_capture_generation.load(std::memory_order_acquire)) {
             return true;
         }
@@ -40840,6 +41147,27 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
             sdk::FTextureRenderTargetResource* rsrc{};
             sdk::FRenderTarget* frt{};
             FRHITexture2D* rhi_texture{};
+            std::optional<UE58OwnedTextureResource> ue58_owned{};
+            if (is_validated_ue58_slate_ui_runtime() && is_ue58_dx12_backend()) {
+                const char* reason{};
+                ue58_owned = ue58_dx12_validate_owned_resource(tgt.get(), get_render_target(),
+                    static_cast<uint32_t>(VR::get()->get_hmd_width()),
+                    static_cast<uint32_t>(VR::get()->get_hmd_height()), reason, &recognized_stock_layout);
+                if (recognized_stock_layout || ue58_owned) {
+                    recognized_stock_layout = true;
+                    if (!ue58_owned) {
+                        stability.observe(std::nullopt);
+                        SPDLOG_INFO_EVERY_N_SEC(2,
+                            "[UE5.8][NativeStereoFix] Waiting for initialized owned capture resource: {}", reason);
+                        return false;
+                    }
+                    if (!stability.observe(uevr::ue58_owned_ui::Observation{
+                            generation, ue58_owned->identity, reinterpret_cast<uintptr_t>(ue58_owned->native.Get())}))
+                    {
+                        return false;
+                    }
+                }
+            }
 
             const bool use_stalker2_capture_layout =
                 stalker2_uses_validated_ue55_native_fix_capture_layout();
@@ -40848,7 +41176,15 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
             const bool use_storm_escape_capture_layout =
                 storm_escape_uses_validated_ue561_native_fix_capture_layout();
 
-            if (use_stalker2_capture_layout || use_bodycam_capture_layout || use_storm_escape_capture_layout) {
+            if (ue58_owned) {
+                // The complete owned chain, not Slate's ABI or a title name,
+                // selects this path. Keep it local to this capture generation.
+                rsrc = reinterpret_cast<sdk::FTextureRenderTargetResource*>(ue58_owned->identity.resource);
+                frt = reinterpret_cast<sdk::FRenderTarget*>(
+                    ue58_owned->identity.resource + uevr::ue58_owned_ui::render_target_offset);
+                rhi_texture = reinterpret_cast<FRHITexture2D*>(ue58_owned->identity.rhi_texture);
+                sdk::FRenderTarget::update_offsets(frt);
+            } else if (use_stalker2_capture_layout || use_bodycam_capture_layout || use_storm_escape_capture_layout) {
                 // These targets can exist before the engine initializes their
                 // nested render resources. Never let the broad pointer scan run
                 // while the stock chain is merely pending.
@@ -40966,6 +41302,19 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
                 }
             }
 
+            // If publication is deferred, restore the stock table so the next
+            // observation can prove its code again. Successful captures retain
+            // the established viewport-matching gamma hook.
+            uintptr_t ue58_original_table{};
+            if (ue58_owned && !safe_read_value(reinterpret_cast<uintptr_t>(frt), ue58_original_table)) {
+                return false;
+            }
+            bool keep_ue58_gamma_hook = false;
+            utility::ScopeGuard restore_pending_ue58_table{[&] {
+                if (ue58_owned && !keep_ue58_gamma_hook) {
+                    *reinterpret_cast<uintptr_t*>(frt) = ue58_original_table;
+                }
+            }};
             hook_frt(frt);
 
             // The RHI worker can be starved on newer parallel-RHI paths. Publish
@@ -40974,13 +41323,22 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
             if (!publish_scene_capture_target_snapshot(
                     reinterpret_cast<sdk::UTexture*>(tgt.get()),
                     rhi_texture,
-                    generation))
+                    generation,
+                    ue58_owned ? &ue58_owned->identity : nullptr,
+                    ue58_owned ? ue58_owned->native.Get() : nullptr))
             {
                 SPDLOG_INFO_EVERY_N_SEC(
                     2,
                     "[NativeStereoFix] Waiting for scene-capture generation {} native resource publication",
                     generation);
                 return false;
+            }
+            keep_ue58_gamma_hook = true;
+            if (ue58_owned) {
+                SPDLOG_INFO(
+                    "[UE5.8][NativeStereoFix] Validated capture generation {}: owner+0x{:x}, "
+                    "FRenderTarget+0x40, RHI={:x}; no global texture offset updates",
+                    generation, ue58_owned->identity.private_resource_offset, ue58_owned->identity.rhi_texture);
             }
 
             RHIThreadWorker::get().enqueue([this, tgt, generation]() {
@@ -41409,7 +41767,102 @@ void VRRenderTargetManager_Base::ktjl_create_texture_hook(uint32_t width, uint32
         size.x, size.y, width, height);
 }
 
+namespace {
+struct HalloweenPendingAllocation {
+    VRRenderTargetManager_Base* manager{};
+    FTexture2DRHIRef* target{};
+    FTexture2DRHIRef* shader{};
+};
+thread_local HalloweenPendingAllocation halloween_pending_allocation{};
+}
+
+bool VRRenderTargetManager_Base::prepare_halloween_texture_hook(uintptr_t return_address) {
+    std::call_once(halloween_texture_install_once, [&] {
+        const auto memory = sdk::discovery::process_memory();
+        const auto join = uevr::halloween_rt::allocation_join(memory, return_address);
+        const auto release = join ? uevr::halloween_rt::allocation_release(memory, *join) : std::nullopt;
+        if (!join || !release) {
+            SPDLOG_ERROR("[Halloween][UE5.7][RT] Completed-allocation contract mismatch; no allocator replay or speculative hooks");
+            return;
+        }
+        auto result = safetyhook::MidHook::create(reinterpret_cast<void*>(*join), &halloween_texture_completed);
+        if (!result) {
+            SPDLOG_ERROR("[Halloween][UE5.7][RT] Could not install completed-allocation observer; preserving engine allocation");
+            return;
+        }
+        halloween_texture_hook = std::move(*result);
+        halloween_allocate_return = return_address;
+        halloween_texture_release = *release;
+        halloween_texture_ready.store(true, std::memory_order_release);
+        SPDLOG_INFO("[Halloween][UE5.7][RT] Observing completed engine allocation at {:x}; descriptor/initializer replay disabled", *join);
+    });
+    return halloween_texture_ready.load(std::memory_order_acquire) && halloween_allocate_return == return_address;
+}
+
+void VRRenderTargetManager_Base::halloween_texture_completed(safetyhook::Context& ctx) {
+    namespace h = uevr::halloween_rt;
+    const auto pending = std::exchange(halloween_pending_allocation, {});
+    auto* rtm = pending.manager;
+    if (rtm == nullptr || !rtm->halloween_texture_ready.load(std::memory_order_acquire) ||
+        reinterpret_cast<uintptr_t>(pending.target) != ctx.rsp + 0x78 ||
+        reinterpret_cast<uintptr_t>(pending.shader) != ctx.rsp + 0x70) { return; }
+
+    const auto memory = sdk::discovery::process_memory();
+    uintptr_t target{}, shader{};
+    if (!memory.load(reinterpret_cast<uintptr_t>(pending.target), target) ||
+        !memory.load(reinterpret_cast<uintptr_t>(pending.shader), shader) || target == 0 || target != shader) {
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[Halloween][UE5.7][RT] Completed RT/SRV references do not agree; publication deferred");
+        return;
+    }
+    const auto native = h::native_resource(memory, target);
+    auto* resource = native ? reinterpret_cast<ID3D12Resource*>(*native) : nullptr;
+    D3D12_RESOURCE_DESC desc{};
+    ID3D12Device4* device_raw{};
+    if (resource == nullptr || !is_probable_d3d_native_resource(resource) ||
+        !get_d3d12_resource_desc_guarded(resource, desc) || !get_d3d12_resource_device_guarded(resource, &device_raw)) {
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[Halloween][UE5.7][RT] Completed texture has no validated native resource; publication deferred");
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Device4> device;
+    device.Attach(device_raw);
+    Microsoft::WRL::ComPtr<IUnknown> actual, expected;
+    const auto& d3d = g_framework->get_d3d12_hook();
+    const auto vr = VR::get();
+    const h::NativeDescription description{desc.Width, desc.Height, static_cast<uint32_t>(desc.Dimension),
+        static_cast<uint32_t>(desc.Format), static_cast<uint32_t>(desc.Flags), desc.SampleDesc.Count,
+        desc.SampleDesc.Quality, desc.DepthOrArraySize, desc.MipLevels};
+    if (!d3d || !vr || !ktjl_query_identity(device.Get(), actual.GetAddressOf()) ||
+        !ktjl_query_identity(d3d->get_device(), expected.GetAddressOf()) || actual.Get() != expected.Get() ||
+        !h::valid_scene(description, vr->get_hmd_width() * 2, vr->get_hmd_height())) {
+        SPDLOG_WARNING_EVERY_N_SEC(5, "[Halloween][UE5.7][RT] Rejected scene device/extent/format: {}x{} format={} flags={:x}",
+            desc.Width, desc.Height, static_cast<uint32_t>(desc.Format), static_cast<uint32_t>(desc.Flags));
+        return;
+    }
+
+    auto* texture = reinterpret_cast<FRHITexture2D*>(target);
+    FRHITexture2D::set_vtable(*reinterpret_cast<void**>(texture));
+    // Pair the proven +8 AddRef with the engine's validated Release, including
+    // deferred deletion. A decrement-only SDK ref would leak retired targets.
+    texture->add_ref();
+    auto owner = std::shared_ptr<FRHITexture2D>(texture, [release = rtm->halloween_texture_release](FRHITexture2D* value) {
+        reinterpret_cast<uint32_t (*)(FRHITexture2D*)>(release)(value);
+    });
+    rtm->render_target = texture;
+    rtm->halloween_scene_owner = std::move(owner);
+    VR::get()->reinitialize_renderer();
+    SPDLOG_INFO("[Halloween][UE5.7][RT] Published completed engine scene texture {:x} native={:x} {}x{} format={}",
+        target, *native, desc.Width, desc.Height, static_cast<uint32_t>(desc.Format));
+}
+
 bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return_address, FTexture2DRHIRef* tex, FTexture2DRHIRef* shader_resource) {
+    if (halloween_ue574_dx12_runtime()) {
+        texture_hook_ref = nullptr;
+        shader_resource_hook_ref = nullptr;
+        allocate_texture_called = false;
+        halloween_pending_allocation = prepare_halloween_texture_hook(return_address)
+            ? HalloweenPendingAllocation{this, tex, shader_resource} : HalloweenPendingAllocation{};
+        return false;
+    }
     if (ktjl_is_current_game() && g_framework != nullptr && g_framework->is_dx12()) {
         texture_hook_ref = nullptr;
         shader_resource_hook_ref = nullptr;

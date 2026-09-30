@@ -815,10 +815,10 @@ void test_ue58_pooled_slate_fallback() {
         .pooled_wrapper_transactions = 1,
         .shared_strict_pooled_transactions = 1,
     };
-    for (uint32_t patch = 0; patch <= 3; ++patch) {
+    for (uint32_t patch = 0; patch <= 4; ++patch) {
         input.exact_ue58 = is_validated_ue58_slate_source_version(0x00050008, patch << 16);
-        expect(should_use_ue58_pooled_slate_fallback(input) == (patch <= 2),
-            "pooled fallback must be restricted to validated UE5.8.0-5.8.2 source versions");
+        expect(should_use_ue58_pooled_slate_fallback(input) == (patch <= 3),
+            "pooled fallback must be restricted to validated UE5.8.0-5.8.3 source versions");
     }
     input.exact_ue58 = false;
     expect(!should_use_ue58_pooled_slate_fallback(input),
@@ -883,6 +883,14 @@ void test_ue58_owned_ui_resource() {
         return accessor_valid && (candidate == resource || candidate == wrong_reference) && texture == rhi;
     };
     auto find = [&] { return layout::find_resource(owner, owner_size, 1920, 1080, read, validate); };
+    auto recognize = [&] {
+        return layout::recognizes_resource(owner, owner_size, read, [&](uintptr_t candidate) {
+            return accessor_valid && (candidate == resource || candidate == wrong_reference);
+        });
+    };
+    const auto matches = [&](const layout::Resource& identity) {
+        return layout::resource_matches(owner, identity, 1920, 1080, read);
+    };
     auto initialize_resource = [&](uintptr_t candidate) {
         put(candidate + layout::owner_offset, owner);
         put(candidate + layout::texture_rhi_offset, rhi);
@@ -892,12 +900,19 @@ void test_ue58_owned_ui_resource() {
     };
 
     expect(!find(), "uninitialized resources must not publish offsets");
+    expect(!recognize(), "empty owner fields provide no proof of a stock layout");
     put(owner + 0x128, resource);
+    put(resource + layout::owner_offset, owner);
+    expect(recognize(), "stock accessors and exact ownership must defer discovery even before InitRHI");
+    expect(!find(), "recognizing a pending stock resource must not publish it");
     initialize_resource(resource);
     expect(!find(), "game-thread resource alone must wait for the render-thread mirror");
     put(owner + 0x130, resource);
     auto valid = find();
-    expect(valid == layout::Resource{0x128, resource, rhi}, "fully initialized GT/RT resource pair must resolve");
+    expect(valid == layout::Resource{0x128, resource, rhi, owner_size}, "fully initialized GT/RT resource pair must resolve");
+    expect(matches(*valid), "consumer must accept the exact generation's proved resource chain");
+    expect(!matches(layout::Resource{0x1d0, wrong_reference, rhi, owner_size}),
+        "a stale broad-scan PrivateResource offset must not substitute for the proved chain");
 
     // Reproduce the false-positive shape: TextureReference has a coincidental
     // RHI pointer at +0xc8 and a cleanup table at +0xe0, not an owned render resource.
@@ -908,20 +923,26 @@ void test_ue58_owned_ui_resource() {
     put(owner + 0x128, uintptr_t{});
     put(owner + 0x130, uintptr_t{});
     expect(!find(), "a matching RHI inside TextureReference is not a render resource");
+    expect(!recognize(), "coincidental RHI and cleanup-table pointers cannot identify an owned stock layout");
+    expect(!matches(*valid), "resource retirement must invalidate a consumer observation");
     put(owner + 0x128, resource);
     put(owner + 0x130, resource);
 
     put(resource + layout::owner_offset, owner + 8);
     expect(!find(), "resource must point back to the exact rooted UI UObject");
+    expect(!recognize() && !matches(*valid), "ownership mismatch must reject both recognition and consumption");
     put(resource + layout::owner_offset, owner);
     put(resource + layout::render_target_texture_offset, rhi + 8);
     expect(!find(), "incomplete, multisample or separated RHI references must not be adopted");
+    expect(recognize() && !matches(*valid), "recognized stock layouts must wait, not rescan, during RHI replacement");
     put(resource + layout::render_target_texture_offset, rhi);
     put(resource + layout::width_offset, uint32_t{4944});
     expect(!find(), "scene-sized resources must not be adopted as UI");
+    expect(!matches(*valid), "resize must invalidate the previously published resource dimensions");
     put(resource + layout::width_offset, uint32_t{1920});
     accessor_valid = false;
     expect(!find(), "ownership alone must not bypass instruction validation");
+    expect(!recognize(), "custom accessor layouts must retain the pre-existing discovery path");
     accessor_valid = true;
 
     initialize_resource(wrong_reference);
@@ -933,8 +954,9 @@ void test_ue58_owned_ui_resource() {
     put(owner + 0x130, uintptr_t{});
     put(owner + 0x118, resource);
     put(owner + 0x120, resource);
-    expect(find() == layout::Resource{0x118, resource, rhi},
+    expect(find() == layout::Resource{0x118, resource, rhi, owner_size},
         "owner discovery must validate the pair, not hardcode FarFarWest's +0x128 field");
+    expect(!matches(*valid), "an obsolete generation must not follow a changed owner-field offset");
     put(owner + 0x118, uintptr_t{});
     put(owner + 0x120, uintptr_t{});
     put(owner + 0x128, resource);
@@ -942,6 +964,17 @@ void test_ue58_owned_ui_resource() {
     expect(!escaped_owner_bounds, "discovery must stay inside the reflected UObject size");
     expect(!layout::find_resource(owner, 0x301, 1920, 1080, read, validate), "unexpected object layouts must fail closed");
     expect(!layout::find_resource(UINTPTR_MAX - 8, owner_size, 1920, 1080, read, validate), "owner bounds overflow must fail closed");
+    expect(!layout::recognizes_resource(UINTPTR_MAX - 8, owner_size, read, [](uintptr_t) { return true; }),
+        "recognition must reject overflowing owner bounds before reading");
+    expect(!layout::resource_matches(UINTPTR_MAX - 8, *valid, 1920, 1080, read),
+        "consumer must reject overflowing owner bounds before reading");
+    expect(!matches(layout::Resource{0x128, UINTPTR_MAX - 8, rhi, owner_size}), "resource-end overflow must fail closed");
+    expect(!matches(layout::Resource{0x2f8, resource, rhi, owner_size}), "owner pair must fit inside the validated maximum size");
+    expect(!matches(layout::Resource{0x129, resource, rhi, owner_size}), "owner pair must stay pointer-aligned");
+    put(owner + 0x130, wrong_reference);
+    expect(recognize() && !matches(*valid), "GT/RT disagreement must retain the stock retry path without publishing");
+    put(owner + 0x130, resource);
+    expect(matches(*valid), "a completed RT mirror must recover without any global cache changes");
 
     expect(layout::matches_accessor(layout::render_target_accessor, layout::render_target_accessor), "raw accessor must match");
     auto cleanup = layout::render_target_accessor;
@@ -977,10 +1010,20 @@ void test_ue58_slate_ui_capability() {
         "UE5.8.1 must be eligible for validated Slate capability routing");
     expect(is_validated_ue58_slate_source_version(0x00050008, 0x00020000),
         "UE5.8.2 must be eligible for validated Slate capability routing");
-    expect(!is_validated_ue58_slate_source_version(0x00050008, 0x00030000),
-        "an unvalidated future UE5.8 patch must fail automatic Slate routing closed");
+    expect(is_validated_ue58_slate_source_version(0x00050008, 0x00030000),
+        "source-reviewed UE5.8.3 must be eligible for validated Slate capability routing");
+    for (uint32_t revision : {0u, 1u, 0xffffu}) {
+        for (uint32_t patch : {0u, 1u, 2u, 3u, 4u, 5u, 0xffffu}) {
+            expect(is_validated_ue58_slate_source_version(0x00050008, (patch << 16) | revision) == (patch <= 3),
+                "the build revision must not exclude reviewed patches or admit unreviewed UE5.8 patches");
+        }
+    }
     expect(!is_validated_ue58_slate_source_version(0x00050007, 0x00020000),
         "UE5.7 must remain outside the UE5.8 Slate capability route");
+    expect(!is_validated_ue58_slate_source_version(0x00050009, 0x00000000) &&
+        !is_validated_ue58_slate_source_version(0x00040008, 0x00030000) &&
+        !is_validated_ue58_slate_source_version(0x00060008, 0x00030000),
+        "different engine minors and majors must not inherit the reviewed UE5.8.3 contract");
 
     UE58SlateCallABIObservation direct_call{
         .rcx_builder = true,
@@ -1985,8 +2028,13 @@ void test_ktjl_hook_contracts() {
 #include "KtjLRendererEntryTests.hpp"
 #include "KtjLCloudResourcesTests.hpp"
 #include "DuneFrameHandoffTests.hpp"
+#include "HalloweenRenderTargetsTests.hpp"
 
 int main(int argc, char** argv) {
+    test_halloween_render_targets();
+    test_halloween_native_family();
+    if (argc == 3 && std::string_view{argv[1]} == "--halloween-allocation-fixture") { test_halloween_allocation_fixture(argv[2]); }
+    if (argc == 3 && std::string_view{argv[1]} == "--halloween-native-family-fixture") { test_halloween_native_family_fixture(argv[2]); }
     test_dune_frame_handoff();
     if (argc == 3 && std::string_view{argv[1]} == "--ktjl-memory-image") { test_ktjl_cloud_memory_image(argv[2]); }
     test_ktjl_renderer_entry();

@@ -32,6 +32,7 @@
 #include "IXRTrackingSystemHook.hpp"
 #include "CompatibilityPolicy.hpp"
 #include "UE58UIInitialization.hpp"
+#include "UE58OwnedUITexture.hpp"
 #include "NativeFrameDiagnostics.hpp"
 #include "UE57SlateSymbols.hpp"
 #include "utility/NascarHookCompatibility.hpp"
@@ -72,6 +73,7 @@ public:
         uint64_t generation{};
         uint32_t width{};
         uint32_t height{};
+        std::optional<uevr::ue58_owned_ui::Resource> ue58_owned_resource{};
     };
 
     struct Everspace2D3D12SceneTargetSnapshot {
@@ -347,7 +349,9 @@ protected:
     bool publish_scene_capture_target_snapshot(
         sdk::UTexture* owner_texture,
         FRHITexture2D* rhi_texture,
-        uint64_t generation);
+        uint64_t generation,
+        const uevr::ue58_owned_ui::Resource* ue58_owned_resource = nullptr,
+        IUnknown* validated_native = nullptr);
     std::shared_ptr<const SceneCaptureTargetSnapshot> get_preservable_scene_capture_for_same_size_reallocation(
         uint32_t width,
         uint32_t height) const;
@@ -405,6 +409,15 @@ protected:
     VerifiedFTexture2D render_target{};
     static void pre_texture_hook_callback(safetyhook::Context& ctx, bool from_second = false); // only used if pixel format cvar is missing
     static void texture_hook_callback(safetyhook::Context& ctx, bool from_second = false);
+
+    bool prepare_halloween_texture_hook(uintptr_t return_address);
+    static void halloween_texture_completed(safetyhook::Context& ctx);
+    std::once_flag halloween_texture_install_once{};
+    safetyhook::MidHook halloween_texture_hook{};
+    uintptr_t halloween_allocate_return{};
+    uintptr_t halloween_texture_release{};
+    std::atomic_bool halloween_texture_ready{};
+    std::shared_ptr<FRHITexture2D> halloween_scene_owner{};
 
     bool prepare_ktjl_texture_hook(uintptr_t return_address);
     static void ktjl_create_texture_hook(uint32_t width, uint32_t height, uint8_t format, uint32_t mips,
@@ -1368,7 +1381,7 @@ private:
     };
 
     static bool bind_ghosting_fix_owner(GhostingFixPair& pair, const char* log_label = "GhostingFix");
-    static bool orient_daysgone_ghosting_fix_pair_from_owner(GhostingFixPair& pair);
+    static bool orient_legacy_ghosting_fix_pair_from_owner(GhostingFixPair& pair);
     static bool validate_ghosting_fix_owner(const GhostingFixPair& pair, const char** failure_stage = nullptr);
     static bool refresh_ghosting_fix_owner(GhostingFixPair& pair, const char* log_label = "GhostingFix");
 
