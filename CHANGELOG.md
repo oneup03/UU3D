@@ -30,9 +30,13 @@ bases depending on which branch produced them.
   read through a shader pass, and Per-Draw Capture also hooks the
   render-target bind UE4's D3D11 path uses whenever compute resources are
   bound, which it had been missing. The log now records each depth resource
-  it reads (`[depth-src]`) and a per-draw summary. Still being verified on a
-  D3D11 title (*RAIN CODE*): the Engine Pool source there returns a buffer
-  that reads as cleared through either path.
+  it reads (`[depth-src]`) and a per-draw summary. Confirmed on *RAIN CODE*
+  with the **Engine Pool** source: adaptive crosshair, auto-convergence and
+  HUD depth all read real depth there now, the first D3D11 title to. The
+  earlier all-zero readback through the new path was taken on a loading
+  screen, where the depth buffer is simply cleared. **Per-Draw Capture on
+  D3D11 still does not publish** (it sees the depth targets but attributes no
+  draws to them) - use Engine Pool on D3D11 for now.
 
 ### Changed
 - **Auto-convergence snaps on camera cuts** instead of easing over a second
