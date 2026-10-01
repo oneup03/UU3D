@@ -177,9 +177,42 @@ beat against.
 correction. Leave this on unless you specifically want to experiment with HDR
 passthrough.
 
-> Output is always held at the display's native resolution. To lower GPU cost,
-> turn down the **in-game** resolution (or resolution scale) — that path is
-> upscaled correctly and won't break interlaced/checkerboard modes.
+**Hold Window Size** — keeps the game window pinned borderless at the display's
+native rect: the game's own resize and move calls are rewritten to it instead of
+obeyed. Fixes titles that fight the forced fullscreen by re-applying their
+in-game resolution to the window every few frames (*Hellblade 2*). Turn it off
+if a game needs to own its window (windowed play, odd alt-tab).
+
+**Keep Game's Saved Video Settings** — native output switches the game to
+borderless-at-native through its own settings, and some games then *save* that
+and boot at full native render resolution next time. With this on, a save of
+our imposed state writes your own resolution and window mode instead; anything
+you change in-game yourself is saved as-is. Turn off to let the game save
+whatever it holds. On a display scaled above 100% see the high-DPI note under
+*Compatibility notes*: a UE4 title can present the desktop *divided by the
+scale* as its resolution, and this guard then keeps writing that back.
+
+Output is always held at the display's native resolution; the **in-game**
+resolution setting controls the 3D render resolution, which is upscaled
+correctly and won't break interlaced/checkerboard modes.
+
+**3D Render Resolution** — the scene render resolution as a fraction of the
+display (*Auto* leaves the game's own value alone), applied through
+`r.ScreenPercentage`. **Applied To** picks where: *Primary* is the upscaler's
+own input resolution (a DLSS/TSR preset overrides it rather than stacking),
+*Secondary* runs after the upscale and multiplies with it, and *Stereo Render
+Target (legacy)* shrinks UU3D's own render target for games that ignore both
+cvars — it can crop the frame to a corner, so try it last.
+
+**Camera FoV Axis** — which axis the game's FoV angle refers to. *Horizontal*
+is right for most titles; switch to *Vertical* if the view looks zoomed in, or
+back to *Horizontal* if it's too wide. *Auto* reads the engine's own
+constraint, which doesn't always match what the game renders — use it only if
+both fixed choices look wrong.
+
+**3D FoV Multiplier** — scales the game's FoV on top of its live camera value,
+so ADS zoom and cine cameras keep working; above 1.0 widens the frustum, which
+zooms the scene out. 1.0 = as-is.
 
 ### Full-width side-by-side panels (32:9)
 
@@ -199,20 +232,30 @@ rare title that ignores this.
 
 ## 3D Calibration
 
-Three settings form one calibrated set, saved together per game:
+Two settings, saved together per game:
 
-- **Depth** — eye separation (how strong the 3D is).
+- **Separation** — the 3D strength: how far apart the two eyes see the distant
+  background, as a fraction of your screen's width. The default 0.05 puts far
+  objects 5% of the screen apart. The comfort ceiling is roughly your eye
+  spacing divided by the screen width — about 0.10 on a 27" 16:9 monitor;
+  beyond that the eyes have to diverge and the image won't fuse. On
+  autostereo (SR) panels it doubles as a crosstalk budget: lower it if you see
+  ghosting.
 - **Convergence** — the distance that sits exactly on the screen plane. Things
   nearer than this pop out toward you; things farther sit behind the screen.
-- **Reference FoV** — the field of view at which Depth and Convergence were
-  dialed in (recommended to set this to gameplay FoV).
+  It only moves what is in front of the screen — the background stays where
+  Separation put it.
 
-Separation then auto-scales with the game's live FoV (always on), so zooming or
-aiming down sights keeps the perceived depth constant. The game's FoV is never
-overridden — only the stereo shear is injected into its own projection.
+Separation is a screen-space quantity, so the 3D effect holds through zoom and
+ADS by construction: nothing to calibrate against the game's FoV, and nothing
+to settle after a hard FoV cut. The game's FoV is never overridden — only the
+stereo shear is injected into its own projection.
 
-Hotkeys (hold to repeat): **Ctrl+F3 / F4** depth −/+, **Ctrl+F5 / F6**
-convergence −/+. **Ctrl+F12** (or the **Take 3D Screenshot** button at the
+Profiles saved before this scheme (Depth / Convergence / Reference FoV) convert
+automatically the first time they load, and the picture is unchanged.
+
+Hotkeys (hold to repeat): **Ctrl+F3 / F4** separation −/+, **Ctrl+F5 / F6**
+convergence −/+ (proportional, so the whole 0.001–25 m range is reachable). **Ctrl+F12** (or the **Take 3D Screenshot** button at the
 top of the menu) saves the composited stereo pair — the game, its own HUD, the
 crosshair and the stereo cursor at the current convergence, with only the UU3D
 menu hidden for the capture and both eyes valid even under AFR — as two PNGs
@@ -245,6 +288,9 @@ The scene-depth source for **Adaptive Crosshair**, **HUD Depth**, and
   data while DLSS is enabled in the game's graphics settings; works in any
   rendering method and is the natural choice when playing with AFW.
 
+On DirectX 11 only the first two sources exist; selecting a D3D12-only source
+there runs Per-Draw Capture.
+
 ## Auto-Convergence
 
 Automatically pulls the screen plane just in front of the nearest significant
@@ -252,13 +298,22 @@ object so its pop-out never exceeds **Target Disparity** (a fraction of screen
 width). Your manual Convergence acts as the ceiling; turning this off snaps back
 to it.
 
-- **Smoothing** — how gently the convergence follows depth changes.
+- **Smoothing** — how fast convergence chases its target when pulling *in*.
+  Easing back out is deliberately slower (about half this rate), so a
+  receding object never reads as the image drifting.
 - **Min Convergence** — never pulls the plane closer than this (raise it if
   nearby objects drag the whole scene too deep).
-- **Log Samples** — diagnostic logging.
+- **Log Samples** — diagnostic logging of the control loop.
 
-Separation auto-scales with the pull-in, so the background stays exactly where
-you calibrated it. This reads the engine depth buffer (see above).
+Camera cuts snap rather than ease: a cut to a close framing is detected within
+a couple of frames and convergence jumps to it, instead of taking a second to
+arrive at the wrong depth. Only cuts *toward* the camera snap; cuts away ease
+on the normal path, which is the comfortable direction to be slow in and also
+stops anything moving close to the camera from making convergence thrash.
+
+Only the screen plane moves: background depth is set by Separation alone, so
+the pull-in costs nothing at the back of the scene. This reads the scene depth
+buffer (see above).
 
 ## Crosshair
 
@@ -268,8 +323,10 @@ floating on the screen plane.
 - **Mode** — *Off*, *Game Crosshair* (re-projects the game's own reticle to the
   aimed depth by extracting a small region of its UI), or *Laser Sight* (a
   separate depth-aware dot, classic 3D-Vision style).
-- **Adaptive Depth** — read the aim depth from the depth buffer. When it's
-  unavailable the **Static Depth** slider is used instead.
+- **Adaptive Depth** — read the aim depth from the depth buffer, at the spot
+  the reticle is actually on: a near object just *beside* the reticle is
+  ignored until you aim at it. When no depth is available the **Static
+  Depth** slider is used instead.
 - Game Crosshair: **Region Radius** (size of the extracted center patch — HUD
   inside it rides along) and **Region Center Y** (its vertical position).
 - Laser Sight: **Dot Size** and **Dot Color**.
@@ -288,7 +345,9 @@ UU3D menu, and the mouse cursor.
   needs a working scene depth source. See tuning below.
 - **World Markers (Auto-Detected)** — hooks the engine's world→screen
   projection and puts UI at each marker's true 3D position. Coverage depends on
-  how the game drives its HUD.
+  how the game drives its HUD. **Marker Region Radius** sets how far around
+  each detected marker that depth applies, with a soft edge back to the flat
+  plane.
 
 **Full-Screen UI Coverage %** — when the game's UI covers at least this much of
 the screen, HUD/crosshair depth flattens automatically. This catches full-screen
@@ -300,6 +359,10 @@ disables the coverage check (paused-game detection still applies).
 
 - **Icon Region Radius** — how far around a detected moving element the depth
   shift spreads, so a whole icon and its text move as one piece.
+- **Stem Reach** — for markers with a thin leader line hanging off the icon:
+  extends the depth region only along that line (positive = the stem hangs
+  down, negative = up), so the stem inherits the icon's depth without widening
+  the region sideways. 0 = off.
 - **Show Classification (debug)** — tints the HUD so you can tune it: red =
   treated as world (gets scene depth), green = treated as flat HUD. Look around
   to train it.
@@ -422,10 +485,20 @@ output only (ignored under HDR), and 3D screenshots are captured without them.
   pair. The in-game HUD, which respects the perceived per-eye size, is
   unaffected, and standard 16:9 displays are never affected. There is no
   per-game fix for this today.
+- **High-DPI displays (Windows scaling above 100%).** If the image sits in the
+  top-left of the screen with black bars at the bottom and right, the engine is
+  holding a smaller swapchain than the window. UE4 sizes *Windowed Fullscreen*
+  to the desktop *divided by the scale factor* (2560×1440 on a 4K panel at
+  150%) and substitutes that for any larger request, and **Keep Game's Saved
+  Video Settings** can then write it back into the game's saved settings as if
+  you had chosen it, so every launch starts there. Workaround: in the game's
+  own video settings pick **Windowed** at the display's native resolution (UE
+  applies a windowed size literally, and native output keeps it borderless),
+  then let the game save. Seen on *RAIN CODE* (UE 4.27).
 - Both UE4 (float) and UE5 (double-precision) projection paths are supported.
-- Quick sanity check: Side by Side with Depth 0 gives two identical halves;
-  raise Depth and nearer-than-convergence objects show crossed disparity (use
-  **Swap Eyes** if it's inverted).
+- Quick sanity check: Side by Side with Separation 0 gives two identical
+  halves; raise Separation and nearer-than-convergence objects show crossed
+  disparity (use **Swap Eyes** if it's inverted).
 
 ## Thanks to
 
