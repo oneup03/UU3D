@@ -482,6 +482,8 @@ public:
     // Queues a 3D screenshot of the next composited stereo frame (Ctrl+F12 /
     // the menu-header button drawn by Framework).
     void request_flat3d_screenshot();
+    // Steps the Convergence slider to the next entry of Flat3D_ConvergenceCycleValues.
+    void cycle_flat3d_convergence();
 
     float get_flat3d_opentrack_rot_scale() const { return m_flat3d_opentrack_rot_scale->value(); }
     float get_flat3d_opentrack_pos_scale() const { return m_flat3d_opentrack_pos_scale->value(); }
@@ -2194,6 +2196,10 @@ private:
     // used to disagree (slider 5m, hotkeys 25m), so the hotkeys could drive
     // convergence into a range the slider could not display or recover from.
     const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.001f, 25.0f, 1.0f) };
+    // Convergence presets: the key (keyboard or gamepad button - a ModKey holds
+    // either) steps the Convergence slider through the comma-separated list.
+    const ModKey::Ptr m_flat3d_conv_cycle_key{ ModKey::create(generate_name("Flat3D_ConvergenceCycleKey"), VK_F2) };
+    const ModString::Ptr m_flat3d_conv_cycle_values{ ModString::create(generate_name("Flat3D_ConvergenceCycleValues"), "0.5, 1, 2, 4") };
     const ModToggle::Ptr m_flat3d_autoconv_enabled{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
     const ModSlider::Ptr m_flat3d_autoconv_target_disparity{ ModSlider::create(generate_name("Flat3D_AutoConvTargetDisparity"), 0.001f, 0.03f, 0.005f) };
     const ModSlider::Ptr m_flat3d_autoconv_smoothing{ ModSlider::create(generate_name("Flat3D_AutoConvSmoothing"), 0.005f, 0.25f, 0.08f) };
@@ -2475,6 +2481,8 @@ public:
             *m_flat3d_fov_axis,
             *m_flat3d_separation,
             *m_flat3d_convergence,
+            *m_flat3d_conv_cycle_key,
+            *m_flat3d_conv_cycle_values,
             *m_flat3d_autoconv_enabled,
             *m_flat3d_autoconv_target_disparity,
             *m_flat3d_autoconv_smoothing,

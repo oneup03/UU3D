@@ -4467,6 +4467,33 @@ void VR::update_imgui_state_from_xinput_state(XINPUT_STATE& state, bool is_vr_co
     const auto is_using_vr_controller_recently = is_using_controllers_within(std::chrono::seconds(1));
     const auto is_gamepad = !is_vr_controller;
 
+    // Mirror the pad's buttons into the Framework's gamepad key snapshot as
+    // VK_GAMEPAD_* codes, so a ModKey bind can name a controller button. Any
+    // pad, any user index: a bind should fire from whichever controller is in
+    // hand. Triggers use XInput's own threshold; stick directions are left out
+    // on purpose (a nudge during "Press any key..." would bind a direction).
+    if (is_gamepad) {
+        const auto& gp = state.Gamepad;
+        const auto set = [](int32_t vk, bool down) { g_framework->set_gamepad_key((uint8_t)vk, down); };
+        set(ModKey::GAMEPAD_A, (gp.wButtons & XINPUT_GAMEPAD_A) != 0);
+        set(ModKey::GAMEPAD_B, (gp.wButtons & XINPUT_GAMEPAD_B) != 0);
+        set(ModKey::GAMEPAD_X, (gp.wButtons & XINPUT_GAMEPAD_X) != 0);
+        set(ModKey::GAMEPAD_Y, (gp.wButtons & XINPUT_GAMEPAD_Y) != 0);
+        set(ModKey::GAMEPAD_RIGHT_SHOULDER, (gp.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
+        set(ModKey::GAMEPAD_LEFT_SHOULDER, (gp.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
+        set(ModKey::GAMEPAD_LEFT_TRIGGER, gp.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD);
+        set(ModKey::GAMEPAD_RIGHT_TRIGGER, gp.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD);
+        set(ModKey::GAMEPAD_DPAD_UP, (gp.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0);
+        set(ModKey::GAMEPAD_DPAD_DOWN, (gp.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0);
+        set(ModKey::GAMEPAD_DPAD_LEFT, (gp.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0);
+        set(ModKey::GAMEPAD_DPAD_RIGHT, (gp.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0);
+        set(ModKey::GAMEPAD_MENU, (gp.wButtons & XINPUT_GAMEPAD_START) != 0);
+        set(ModKey::GAMEPAD_VIEW, (gp.wButtons & XINPUT_GAMEPAD_BACK) != 0);
+        set(ModKey::GAMEPAD_LEFT_THUMB, (gp.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) != 0);
+        set(ModKey::GAMEPAD_RIGHT_THUMB, (gp.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) != 0);
+        g_framework->mark_gamepad_updated();
+    }
+
     if (is_vr_controller && !is_using_vr_controller_recently) {
         is_using_this_controller = false;
     } else if (is_gamepad && is_using_vr_controller_recently) { // dont allow gamepad navigation if using vr controllers
