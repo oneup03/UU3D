@@ -511,6 +511,45 @@ bool Flat3DCompositorD3D11::create_pipeline(ID3D11Device* device) {
         }
     }
 
+    // Depth stripe extraction (the D3D11 readback path). Optional: on failure
+    // the readback simply stays unavailable, like a missing depth source.
+    {
+        Microsoft::WRL::ComPtr<ID3DBlob> xvs_blob{};
+        Microsoft::WRL::ComPtr<ID3DBlob> xps_blob{};
+
+        auto compile_depthx = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
+            Microsoft::WRL::ComPtr<ID3DBlob> err{};
+            const auto hr = D3DCompile(g_flat3d_depthextract_hlsl, strlen(g_flat3d_depthextract_hlsl), "flat3d_depthextract",
+                                       nullptr, nullptr, entry, target, 0, 0, &out, &err);
+            if (FAILED(hr)) {
+                spdlog::error("[Flat3D] Depth extract shader compile failed ({}): {}", entry,
+                              err != nullptr ? (const char*)err->GetBufferPointer() : "unknown error");
+                return false;
+            }
+            return true;
+        };
+
+        if (compile_depthx("vs_main", "vs_5_0", xvs_blob) && compile_depthx("ps_main", "ps_5_0", xps_blob)) {
+            if (SUCCEEDED(device->CreateVertexShader(xvs_blob->GetBufferPointer(), xvs_blob->GetBufferSize(), nullptr, &m_depthx_vs)) &&
+                SUCCEEDED(device->CreatePixelShader(xps_blob->GetBufferPointer(), xps_blob->GetBufferSize(), nullptr, &m_depthx_ps))) {
+                D3D11_BUFFER_DESC xcb_desc{};
+                xcb_desc.ByteWidth = sizeof(DepthExtractConstants);
+                xcb_desc.Usage = D3D11_USAGE_DEFAULT;
+                xcb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+                if (FAILED(device->CreateBuffer(&xcb_desc, nullptr, &m_depthx_cb))) {
+                    spdlog::error("[Flat3D] Failed to create depth extract constant buffer");
+                    m_depthx_vs.Reset();
+                    m_depthx_ps.Reset();
+                }
+            } else {
+                spdlog::error("[Flat3D] Failed to create depth extract shaders");
+                m_depthx_vs.Reset();
+                m_depthx_ps.Reset();
+            }
+        }
+    }
+
     // Premultiplied alpha (matches the UI target's blend model / SpriteBatch).
     D3D11_BLEND_DESC oblend_desc{};
     oblend_desc.RenderTarget[0].BlendEnable = TRUE;
@@ -1479,20 +1518,57 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     D3D11_TEXTURE2D_DESC sd_desc{};
     scene_depth->GetDesc(&sd_desc);
 
-    // Supported depth layouts.
-    const bool is_d32s8 = sd_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
-                          sd_desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    const bool is_r32 = is_d32s8 || sd_desc.Format == DXGI_FORMAT_R32_TYPELESS ||
-                        sd_desc.Format == DXGI_FORMAT_R32_FLOAT || sd_desc.Format == DXGI_FORMAT_D32_FLOAT;
-    const bool is_r24g8 = sd_desc.Format == DXGI_FORMAT_R24G8_TYPELESS || sd_desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    // Supported depth layouts, as the SHADER RESOURCE VIEW format the extract
+    // pass reads them through.
+    DXGI_FORMAT srv_fmt = DXGI_FORMAT_UNKNOWN;
+    switch (sd_desc.Format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        srv_fmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        break;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        srv_fmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        break;
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_D32_FLOAT:
+        srv_fmt = DXGI_FORMAT_R32_FLOAT;
+        break;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_D16_UNORM:
+        srv_fmt = DXGI_FORMAT_R16_UNORM;
+        break;
+    default:
+        break;
+    }
 
-    if (!is_r32 && !is_r24g8) {
+    // One line per distinct depth resource: the facts a failed readback needs.
+    // Without SHADER_RESOURCE it cannot be read this way at all, and a
+    // multisampled one could never have been read by the old boxed copy.
+    if (scene_depth != m_depth_logged_src) {
+        m_depth_logged_src = scene_depth;
+        spdlog::info("[Flat3D][depth-src] SceneDepthZ {}x{} fmt={} samples={} bind=0x{:x} usage={} -> srv_fmt={}",
+                     sd_desc.Width, sd_desc.Height, (uint32_t)sd_desc.Format, sd_desc.SampleDesc.Count,
+                     sd_desc.BindFlags, (uint32_t)sd_desc.Usage, (uint32_t)srv_fmt);
+    }
+
+    if (srv_fmt == DXGI_FORMAT_UNKNOWN || (sd_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
+        m_depthx_vs == nullptr || m_depthx_ps == nullptr || m_depthx_cb == nullptr) {
         if (!m_depth_format_warned) {
             m_depth_format_warned = true;
-            spdlog::warn("[Flat3D] SceneDepthZ format {} unsupported for depth sampling", (uint32_t)sd_desc.Format);
+            spdlog::warn("[Flat3D] SceneDepthZ fmt={} bind=0x{:x} cannot be read for depth sampling "
+                         "(needs a known depth format, SHADER_RESOURCE, and the extract pipeline)",
+                         (uint32_t)sd_desc.Format, sd_desc.BindFlags);
         }
         return;
     }
+
+    // The staging ring is always R32_FLOAT now (the extract target's format):
+    // the reader below takes 4-byte float texels whatever the source was.
+    const bool is_r32 = true;
+    const bool is_d32s8 = false;
 
     // SceneDepthZ under stereo is double-wide; use the left-eye half. If it
     // isn't (single-wide), use the whole width.
@@ -1521,7 +1597,7 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
         st_desc.Height = kDepthStripes * kStripeRows;
         st_desc.MipLevels = 1;
         st_desc.ArraySize = 1;
-        st_desc.Format = sd_desc.Format;
+        st_desc.Format = DXGI_FORMAT_R32_FLOAT; // the extract target's format, not the source's
         st_desc.SampleDesc.Count = 1;
         st_desc.Usage = D3D11_USAGE_STAGING;
         st_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -1534,8 +1610,52 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
             }
         }
 
+        // The extract target the shader writes and the ring copies from.
+        m_depthx_tex.Reset();
+        m_depthx_rtv.Reset();
+        D3D11_TEXTURE2D_DESC x_desc = st_desc;
+        x_desc.Usage = D3D11_USAGE_DEFAULT;
+        x_desc.CPUAccessFlags = 0;
+        x_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(device->CreateTexture2D(&x_desc, nullptr, &m_depthx_tex)) ||
+            FAILED(device->CreateRenderTargetView(m_depthx_tex.Get(), nullptr, &m_depthx_rtv))) {
+            spdlog::error("[Flat3D] Failed to create depth extract target");
+            m_depthx_tex.Reset();
+            m_depthx_rtv.Reset();
+            for (auto& t : m_depth_staging) t.Reset();
+            return;
+        }
+
+        // A format change means a different resource: drop the source SRV too.
+        m_depthx_src_srv.Reset();
+        m_depthx_src = nullptr;
+
         m_depth_roi_w = roi_w;
         m_depth_format = sd_desc.Format;
+    }
+
+    // SRV over the game's depth, rebuilt when the pooled resource changes.
+    const bool src_msaa = sd_desc.SampleDesc.Count > 1;
+    if (m_depthx_src_srv == nullptr || m_depthx_src != scene_depth) {
+        m_depthx_src_srv.Reset();
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = srv_fmt;
+        if (src_msaa) {
+            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+        } else {
+            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+        }
+        if (FAILED(device->CreateShaderResourceView(scene_depth, &srv_desc, &m_depthx_src_srv))) {
+            if (!m_depth_format_warned) {
+                m_depth_format_warned = true;
+                spdlog::warn("[Flat3D] CreateShaderResourceView over SceneDepthZ failed (fmt={} srv_fmt={} samples={})",
+                             (uint32_t)sd_desc.Format, (uint32_t)srv_fmt, sd_desc.SampleDesc.Count);
+            }
+            return;
+        }
+        m_depthx_src = scene_depth;
+        m_depthx_src_msaa = src_msaa;
     }
 
     // Copy this frame's stripes into the current ring slot.
@@ -1555,20 +1675,65 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     m_depth_aim[write_slot].eye_w = (float)eye_w;
     m_depth_aim[write_slot].dir = sampled_eye_dir(params, sd_desc.Width >= m_eye_w * 2);
 
-    for (uint32_t s = 0; s < kDepthStripes; ++s) {
-        const float frac = ((float)s + 0.5f) / (float)kDepthStripes; // evenly spread stripe centers
-        uint32_t y = roi_y0 + (uint32_t)((roi_y1 - roi_y0 - kStripeRows) * frac);
+    // Extract the stripes through the SRV into the R32_FLOAT target, then copy
+    // THAT - whole, single-sample, not a depth format - into the staging ring.
+    // A direct copy out of the depth resource is what D3D11 silently refuses:
+    // a boxed region of a depth-stencil format, or anything out of a
+    // multisampled one. The refused copy returns void and leaves the staging
+    // zero-filled, which read back as "every texel exactly 0.0".
+    {
+        ScopedD3D11State state{context};
 
-        D3D11_BOX box{};
-        box.left = roi_x0;
-        box.right = roi_x1;
-        box.top = y;
-        box.bottom = y + kStripeRows;
-        box.front = 0;
-        box.back = 1;
+        DepthExtractConstants xc{};
+        xc.roi_x0 = roi_x0;
+        xc.roi_y0 = roi_y0;
+        xc.roi_y_span = roi_y1 - roi_y0 - kStripeRows;
+        xc.stripes = kDepthStripes;
+        xc.stripe_rows = kStripeRows;
+        xc.msaa_samples = src_msaa ? sd_desc.SampleDesc.Count : 1u;
+        context->UpdateSubresource(m_depthx_cb.Get(), 0, nullptr, &xc, 0, 0);
 
-        context->CopySubresourceRegion(dst, 0, 0, s * kStripeRows, 0, scene_depth, 0, &box);
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(m_depthx_vs.Get(), nullptr, 0);
+        context->PSSetShader(m_depthx_ps.Get(), nullptr, 0);
+        context->GSSetShader(nullptr, nullptr, 0);
+        context->HSSetShader(nullptr, nullptr, 0);
+        context->DSSetShader(nullptr, nullptr, 0);
+        context->RSSetState(m_rasterizer.Get());
+        context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        context->OMSetDepthStencilState(m_depth.Get(), 0);
+        ID3D11Buffer* cbs[] = {m_depthx_cb.Get()};
+        context->PSSetConstantBuffers(0, 1, cbs);
+
+        // The game may still have this very resource bound as its DSV. Bind our
+        // target (which drops that DSV) BEFORE the SRV, or D3D11 resolves the
+        // read/write hazard by silently nulling the SRV - and we would read
+        // zeros again by a different route. The scoped state puts the game's
+        // DSV back afterwards.
+        ID3D11RenderTargetView* rtvs[] = {m_depthx_rtv.Get()};
+        context->OMSetRenderTargets(1, rtvs, nullptr);
+        ID3D11ShaderResourceView* srvs[2] = {src_msaa ? nullptr : m_depthx_src_srv.Get(),
+                                             src_msaa ? m_depthx_src_srv.Get() : nullptr};
+        context->PSSetShaderResources(0, 2, srvs);
+
+        D3D11_VIEWPORT vp{};
+        vp.Width = (float)roi_w;
+        vp.Height = (float)(kDepthStripes * kStripeRows);
+        vp.MaxDepth = 1.0f;
+        context->RSSetViewports(1, &vp);
+        D3D11_RECT sc{0, 0, (LONG)roi_w, (LONG)(kDepthStripes * kStripeRows)};
+        context->RSSetScissorRects(1, &sc);
+
+        context->Draw(3, 0);
+
+        ID3D11ShaderResourceView* null_srvs[2] = {};
+        context->PSSetShaderResources(0, 2, null_srvs);
+        ID3D11RenderTargetView* null_rtv[] = {nullptr};
+        context->OMSetRenderTargets(1, null_rtv, nullptr);
     }
+
+    context->CopyResource(dst, m_depthx_tex.Get());
 
     ++m_depth_frame;
 
@@ -2231,6 +2396,15 @@ void Flat3DCompositorD3D11::reset() {
     m_hud_depth_src = nullptr;
     m_hud_depth_uscale = 1.0f;
     m_depth_sampled_dir = 1.0f;
+    m_depthx_tex.Reset();
+    m_depthx_rtv.Reset();
+    m_depthx_src_srv.Reset();
+    m_depthx_src = nullptr;
+    m_depthx_src_msaa = false;
+    m_depth_logged_src = nullptr;
+    m_depthx_vs.Reset();
+    m_depthx_ps.Reset();
+    m_depthx_cb.Reset();
     m_anchor_cb.Reset();
     m_hud_mode_effective = 0;
 

@@ -37,6 +37,9 @@ using PFN_DrawIndexedInstanced12 = void(STDMETHODCALLTYPE*)(ID3D12GraphicsComman
 
 using PFN_OMSetRTs11 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+using PFN_OMSetRTsUAV11 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+    ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT, UINT,
+    ID3D11UnorderedAccessView* const*, const UINT*);
 using PFN_ClearDSV11 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
 using PFN_DrawIndexed11 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using PFN_Draw11 = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
@@ -54,6 +57,7 @@ std::atomic<void*> g_orig_draw12{nullptr};
 std::atomic<void*> g_orig_draw_indexed12{nullptr};
 
 std::atomic<void*> g_orig_om_set_rts11{nullptr};
+std::atomic<void*> g_orig_om_set_rts_uav11{nullptr};
 std::atomic<void*> g_orig_clear_dsv11{nullptr};
 std::atomic<void*> g_orig_draw_indexed11{nullptr};
 std::atomic<void*> g_orig_draw11{nullptr};
@@ -84,6 +88,7 @@ constexpr size_t k11_Draw                 = 13;
 constexpr size_t k11_DrawIndexedInstanced = 20;
 constexpr size_t k11_DrawInstanced        = 21;
 constexpr size_t k11_OMSetRenderTargets   = 33;
+constexpr size_t k11_OMSetRenderTargetsAndUnorderedAccessViews = 34;
 constexpr size_t k11_ClearDepthStencilView = 53;
 
 inline size_t ptr_hash(void* p) {
@@ -663,6 +668,7 @@ void GameDepthCapture::ensure_installed_d3d11(ID3D11Device* device) {
     }
 
     g_orig_om_set_rts11.store(vtbl[k11_OMSetRenderTargets], std::memory_order_relaxed);
+    g_orig_om_set_rts_uav11.store(vtbl[k11_OMSetRenderTargetsAndUnorderedAccessViews], std::memory_order_relaxed);
     g_orig_clear_dsv11.store(vtbl[k11_ClearDepthStencilView], std::memory_order_relaxed);
     g_orig_draw_indexed11.store(vtbl[k11_DrawIndexed], std::memory_order_relaxed);
     g_orig_draw11.store(vtbl[k11_Draw], std::memory_order_relaxed);
@@ -670,13 +676,18 @@ void GameDepthCapture::ensure_installed_d3d11(ID3D11Device* device) {
     g_orig_draw_instanced11.store(vtbl[k11_DrawInstanced], std::memory_order_relaxed);
 
     m_h11_om_set_rts               = std::make_unique<PointerHook>(&vtbl[k11_OMSetRenderTargets],    reinterpret_cast<void*>(&thunk_om_set_rts_d3d11));
+    // UE4's D3D11 RHI binds through the UAV variant whenever UAVs are in play.
+    // Without this hook those binds are invisible, the per-context entry goes
+    // stale, and every draw into the real scene depth is uncounted or credited
+    // to whatever the last plain bind set (a shadow map) - "never published".
+    m_h11_om_set_rts_uav           = std::make_unique<PointerHook>(&vtbl[k11_OMSetRenderTargetsAndUnorderedAccessViews], reinterpret_cast<void*>(&thunk_om_set_rts_uav_d3d11));
     m_h11_clear_dsv                = std::make_unique<PointerHook>(&vtbl[k11_ClearDepthStencilView], reinterpret_cast<void*>(&thunk_clear_dsv_d3d11));
     m_h11_draw_indexed             = std::make_unique<PointerHook>(&vtbl[k11_DrawIndexed],           reinterpret_cast<void*>(&thunk_draw_indexed_d3d11));
     m_h11_draw                     = std::make_unique<PointerHook>(&vtbl[k11_Draw],                  reinterpret_cast<void*>(&thunk_draw_d3d11));
     m_h11_draw_indexed_instanced   = std::make_unique<PointerHook>(&vtbl[k11_DrawIndexedInstanced],  reinterpret_cast<void*>(&thunk_draw_indexed_instanced_d3d11));
     m_h11_draw_instanced           = std::make_unique<PointerHook>(&vtbl[k11_DrawInstanced],         reinterpret_cast<void*>(&thunk_draw_instanced_d3d11));
 
-    SPDLOG_INFO("[GameDepthCapture] D3D11 vtable hooks installed (per-draw scene-depth counting active)");
+    SPDLOG_INFO("[GameDepthCapture] D3D11 vtable hooks installed (per-draw scene-depth counting active; OMSetRenderTargets + UAV variant)");
 }
 
 GameDepthCapture::D3D11DepthEntry* GameDepthCapture::d3d11_entry_for(ID3D11DepthStencilView* dsv) {
@@ -746,6 +757,9 @@ void GameDepthCapture::handle_draw_d3d11(ID3D11DeviceContext* ctx) {
 }
 
 void GameDepthCapture::end_frame_d3d11(uint32_t render_w, uint32_t render_h) {
+    int diag_entries = 0;
+    uint64_t diag_total_draws = 0, diag_best_draws = 0;
+    uint32_t diag_bw = 0, diag_bh = 0;
     D3D11DepthEntry* winner = nullptr;
     uint64_t winner_draws = 0;
     uint32_t win_w = 0, win_h = 0;
@@ -797,9 +811,32 @@ void GameDepthCapture::end_frame_d3d11(uint32_t render_w, uint32_t render_h) {
             win_res = winner->resource;
         }
 
+        // Snapshot for the throttled diagnostic (pre-reset).
+        diag_entries = m_d11_entry_count;
+        for (int i = 0; i < m_d11_entry_count; ++i) {
+            const uint64_t d = m_d11_entries[i].draw_count.load(std::memory_order_relaxed);
+            diag_total_draws += d;
+            if (d > diag_best_draws) {
+                diag_best_draws = d;
+                diag_bw = m_d11_entries[i].w;
+                diag_bh = m_d11_entries[i].h;
+            }
+        }
+
         for (int i = 0; i < m_d11_entry_count; ++i) {
             m_d11_entries[i].draw_count.store(0, std::memory_order_relaxed);
         }
+    }
+
+    // Throttled visibility (~every 2s @ 60fps). entries=0 means no depth-format
+    // DSV was ever bound through a hooked call; entries>0 with total_draws=0
+    // means binds are seen but draws are not being attributed.
+    static uint32_t s_diag11 = 0;
+    if ((s_diag11++ % 120u) == 0) {
+        SPDLOG_INFO("[GameDepthCapture] D3D11 end_frame: entries={} total_draws={} best={}x{}(draws={}) "
+                    "render={}x{} published={} fmt={}",
+                    diag_entries, diag_total_draws, diag_bw, diag_bh, diag_best_draws,
+                    render_w, render_h, winner != nullptr ? 1 : 0, (int)win_fmt);
     }
 
     if (winner == nullptr || win_res == nullptr) {
@@ -829,6 +866,22 @@ void STDMETHODCALLTYPE GameDepthCapture::thunk_om_set_rts_d3d11(
     auto orig = reinterpret_cast<PFN_OMSetRTs11>(g_orig_om_set_rts11.load(std::memory_order_relaxed));
     if (orig != nullptr) {
         orig(self, NumViews, ppRenderTargetViews, pDepthStencilView);
+    }
+}
+
+void STDMETHODCALLTYPE GameDepthCapture::thunk_om_set_rts_uav_d3d11(
+    ID3D11DeviceContext* self, UINT NumRTVs, ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView, UINT UAVStartSlot, UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews, const UINT* pUAVInitialCounts) {
+    // D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL changes only the UAVs and
+    // leaves the RTV/DSV binding alone, so the tracked entry must not move.
+    if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+        get().handle_om_set_rts_d3d11(self, pDepthStencilView);
+    }
+    auto orig = reinterpret_cast<PFN_OMSetRTsUAV11>(g_orig_om_set_rts_uav11.load(std::memory_order_relaxed));
+    if (orig != nullptr) {
+        orig(self, NumRTVs, ppRenderTargetViews, pDepthStencilView, UAVStartSlot, NumUAVs,
+             ppUnorderedAccessViews, pUAVInitialCounts);
     }
 }
 
