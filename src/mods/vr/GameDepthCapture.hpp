@@ -182,6 +182,10 @@ private:
     static void STDMETHODCALLTYPE thunk_om_set_rts_d3d11(
         ID3D11DeviceContext* self, UINT NumViews,
         ID3D11RenderTargetView* const* ppRenderTargetViews, ID3D11DepthStencilView* pDepthStencilView);
+    static void STDMETHODCALLTYPE thunk_om_set_rts_uav_d3d11(
+        ID3D11DeviceContext* self, UINT NumRTVs, ID3D11RenderTargetView* const* ppRenderTargetViews,
+        ID3D11DepthStencilView* pDepthStencilView, UINT UAVStartSlot, UINT NumUAVs,
+        ID3D11UnorderedAccessView* const* ppUnorderedAccessViews, const UINT* pUAVInitialCounts);
     static void STDMETHODCALLTYPE thunk_clear_dsv_d3d11(
         ID3D11DeviceContext* self, ID3D11DepthStencilView* pDepthStencilView,
         UINT ClearFlags, FLOAT Depth, UINT8 Stencil);
@@ -232,6 +236,7 @@ private:
     void* m_d11_last_logged{nullptr};
 
     std::unique_ptr<PointerHook> m_h11_om_set_rts{};
+    std::unique_ptr<PointerHook> m_h11_om_set_rts_uav{};
     std::unique_ptr<PointerHook> m_h11_clear_dsv{};
     std::unique_ptr<PointerHook> m_h11_draw_indexed{};
     std::unique_ptr<PointerHook> m_h11_draw{};

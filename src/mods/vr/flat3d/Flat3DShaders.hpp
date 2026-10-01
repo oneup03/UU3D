@@ -472,6 +472,24 @@ struct HudClassifyConstants {
 static_assert(sizeof(HudClassifyConstants) == 36 * sizeof(uint32_t), "hud classify constant size");
 
 // HUD classification mask resolution (small: one texel per UI tile).
+// D3D11 depth stripe extraction (Flat3DCompositorD3D11::sample_depth).
+// D3D11 refuses to copy a BOXED region out of a depth-stencil resource, and
+// refuses any copy out of a multisampled one into a single-sample texture.
+// Both return void and leave the staging texture untouched, which reads back
+// as every texel exactly 0.0 - the first D3D11 title this ran on showed that
+// signature on 105 consecutive readbacks. So the stripes are READ through a
+// shader resource view and written to a small R32_FLOAT target, which is then
+// copied whole. 12 dwords / 48 bytes (the D3D11 cbuffer ByteWidth rule).
+struct DepthExtractConstants {
+    uint32_t roi_x0{0};        // first depth texel column of the ROI
+    uint32_t roi_y0{0};        // first ROI row
+    uint32_t roi_y_span{0};    // roi_y1 - roi_y0 - stripe_rows: stripe centres spread over this
+    uint32_t stripes{9};
+    uint32_t stripe_rows{2};
+    uint32_t msaa_samples{1};  // > 1: read the Texture2DMS at t1 and keep the NEAREST sample
+    uint32_t pad_[6]{};
+};
+
 constexpr uint32_t kHudMaskW = 64;
 constexpr uint32_t kHudMaskH = 36;
 
@@ -1688,6 +1706,63 @@ float ps_main(VSOut input) : SV_Target {
         }
     }
     return best;
+}
+)";
+
+// Depth stripe extraction (D3D11 readback path). One output texel per (stripe
+// row, ROI column); device depth passes through untouched and the CPU reader
+// owns the reversed-Z inversion exactly as before. See DepthExtractConstants.
+static const char* const g_flat3d_depthextract_hlsl = R"(
+cbuffer ExtractParams : register(b0) {
+    uint roi_x0;
+    uint roi_y0;
+    uint roi_y_span;
+    uint stripes;
+    uint stripe_rows;
+    uint msaa_samples;
+    uint2 pad_;
+    uint4 pad2_;
+};
+
+Texture2D<float>   depth_tex : register(t0); // single-sample source
+Texture2DMS<float> depth_ms  : register(t1); // multisampled source
+
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut vs_main(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+// Output row y belongs to stripe y / stripe_rows, placed at the same evenly
+// spread centres the CPU reader lays its rows out from.
+float ps_main(VSOut input) : SV_Target {
+    uint x = (uint)input.pos.x;
+    uint y = (uint)input.pos.y;
+    uint s = y / stripe_rows;
+    uint r = y - s * stripe_rows;
+    float frac = ((float)s + 0.5) / (float)stripes;
+    uint src_y = roi_y0 + (uint)((float)roi_y_span * frac) + r;
+    int2 coord = int2(roi_x0 + x, src_y);
+
+    if (msaa_samples > 1) {
+        // Reversed-Z: the NEAREST covered surface is the LARGEST device depth,
+        // which is the sample "nearest object" statistics want.
+        float d = 0.0;
+        [loop]
+        for (uint i = 0; i < msaa_samples; ++i) {
+            d = max(d, depth_ms.Load(coord, (int)i));
+        }
+        return d;
+    }
+
+    return depth_tex.Load(int3(coord, 0));
 }
 )";
 

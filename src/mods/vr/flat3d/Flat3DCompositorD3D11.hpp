@@ -226,6 +226,20 @@ private:
     static constexpr uint32_t kDepthStripes = 9;
     static constexpr uint32_t kStripeRows = 2;
     ComPtr<ID3D11Texture2D> m_depth_staging[kDepthRing]{};
+    // Depth stripe extraction pass (g_flat3d_depthextract_hlsl): the stripes
+    // are read through an SRV over the game's depth into an R32_FLOAT target
+    // and THAT is copied into the staging ring. D3D11 refuses boxed copies out
+    // of depth-stencil resources and any copy out of a multisampled one, and
+    // a refused copy leaves the staging zero-filled - silently.
+    ComPtr<ID3D11VertexShader> m_depthx_vs{};
+    ComPtr<ID3D11PixelShader> m_depthx_ps{};
+    ComPtr<ID3D11Buffer> m_depthx_cb{};
+    ComPtr<ID3D11Texture2D> m_depthx_tex{};
+    ComPtr<ID3D11RenderTargetView> m_depthx_rtv{};
+    ComPtr<ID3D11ShaderResourceView> m_depthx_src_srv{}; // over the game's depth; keyed on the resource
+    ID3D11Texture2D* m_depthx_src{nullptr};               // identity key only (not held)
+    bool m_depthx_src_msaa{false};
+    void* m_depth_logged_src{nullptr};                    // last resource the [depth-src] line described
     // Stereo state each slot's stripes were captured under - the readback is a
     // few frames old, so the live convergence is the wrong one to correct the
     // sample position with.
