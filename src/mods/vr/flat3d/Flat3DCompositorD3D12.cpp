@@ -1749,18 +1749,18 @@ void Flat3DCompositorD3D12::read_depth_slot(uint32_t slot, float nearz_uu,
         }
     }
 
-    // Dense aim-point sweep: full-resolution (every texel) scan of the reticle's
-    // rows around the eye-corrected aim column (see aim_x / kAimHalfW). Sampling
-    // every texel guarantees a thin/small target is hit. Kept scene depth only
-    // (far-sentinel / near-plane "glued" texels excluded), same as the ROI loop.
-    {
-        const uint32_t aim_xi = (uint32_t)std::lround(aim_x);
-        const uint32_t ax0 = aim_xi > kAimHalfW ? aim_xi - kAimHalfW : 0u;
-        const uint32_t ax1 = std::min(aim_xi + kAimHalfW, m_depth_roi_w - 1);
+    // Dense sweep: full-resolution (every texel) scan of the reticle's rows
+    // around a given column. Sampling every texel guarantees a thin/small
+    // target is hit. Kept scene depth only (far-sentinel / near-plane "glued"
+    // texels excluded), same as the ROI loop.
+    const auto sweep_window = [&](float cx, std::vector<float>& out) {
+        const uint32_t xi = (uint32_t)std::lround(std::clamp(cx, 0.0f, (float)(m_depth_roi_w - 1)));
+        const uint32_t x0 = xi > kAimHalfW ? xi - kAimHalfW : 0u;
+        const uint32_t x1 = std::min(xi + kAimHalfW, m_depth_roi_w - 1);
         for (uint32_t r = 0; r < kStripeRows; ++r) {
             const uint32_t row = center_stripe * kStripeRows + r;
             const uint8_t* row_data = (const uint8_t*)data + (size_t)row * m_depth_row_pitch;
-            for (uint32_t x = ax0; x <= ax1; ++x) {
+            for (uint32_t x = x0; x <= x1; ++x) {
                 const uint8_t* texel = row_data + (size_t)x * 4u;
                 float d;
                 if (is_r32) {
@@ -1771,11 +1771,38 @@ void Flat3DCompositorD3D12::read_depth_slot(uint32_t slot, float nearz_uu,
                 }
                 const float z = device_to_z(d);
                 if (z < 1e9f && z >= z_glue_uu) {
-                    center_samples.push_back(z);
+                    out.push_back(z);
                 }
             }
         }
-    }
+    };
+
+    // 3rd-nearest of a dense window: rejects a lone 1-2px speck / edge texel
+    // but lets a genuine small target win (a percentile that scales with the
+    // sample count would need MORE coverage as density rises, defeating the
+    // point - a small object covers only a few dense texels).
+    const auto third_nearest = [](std::vector<float>& v) {
+        if (v.empty()) {
+            return -1.0f;
+        }
+        const size_t i = std::min<size_t>(2, v.size() - 1);
+        std::nth_element(v.begin(), v.begin() + i, v.end());
+        return v[i];
+    };
+
+    // The aim window is what the crosshair uses. The other two feed ONLY the
+    // diagnostic trace: they make the sampled-eye identity OBSERVABLE from a
+    // log instead of inferred. With the reticle on a near target exactly one of
+    // aim/mirror reads it - if it is consistently the mirror, the eye the
+    // snapshot assumed is the wrong one (see sampled_eye_dir); if only the
+    // uncorrected window reads it, the buffer is not a per-eye render at all.
+    sweep_window(aim_x, center_samples);
+    std::vector<float> mirror_samples; // same |dx|, opposite side
+    std::vector<float> uncorr_samples; // dx = 0
+    sweep_window(2.0f * (float)center_x - aim_x, mirror_samples);
+    sweep_window((float)center_x, uncorr_samples);
+    const float mirror_z_raw = third_nearest(mirror_samples);
+    const float uncorr_z_raw = third_nearest(uncorr_samples);
 
     const D3D12_RANGE no_write{0, 0};
     buffer->Unmap(0, &no_write);
@@ -1857,11 +1884,12 @@ void Flat3DCompositorD3D12::read_depth_slot(uint32_t slot, float nearz_uu,
         }
 
         spdlog::info("[Flat3D][depth-sample] nearz={:.3f}uu center(znear={:.1f} ema={:.1f}) nearest(p2)={:.1f} "
-                     "aim(x={:.1f} center={} dx={:+.1f} eye={} halfw={}) "
+                     "aim(x={:.1f} center={} dx={:+.1f} eye={} halfw={}) probe(uncorr={:.1f} aim={:.1f} mirror={:.1f}) "
                      "ROI z(p2/p50/p98)={:.1f}/{:.1f}/{:.1f}uu samples={} far={} glued(z<{:.3f})={} kept={} "
                      "d=[{:.6f}..{:.6f}]",
                      nearz_uu, center_z_raw, m_center_ema_uu, nearest_raw,
                      aim_x, center_x, aim_x - (float)center_x, aim.dir > 0.0f ? 'L' : 'R', kAimHalfW,
+                     uncorr_z_raw, center_z_raw, mirror_z_raw,
                      p2, p50, p98,
                      total, far_rejected, z_glue_uu, glued, z_samples.size(), d_min, d_max);
     }
