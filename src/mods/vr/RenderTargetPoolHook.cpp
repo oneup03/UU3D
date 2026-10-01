@@ -95,6 +95,49 @@ bool RenderTargetPoolHook::hook() {
     return true;
 }
 
+// IPooledRenderTarget is refcounted (IRefCountedObject: AddRef / Release /
+// GetRefCount). The pool deletes an element once only the pool itself holds a
+// reference, and that happens on every resolution change: the scene targets
+// reallocate, FreeUnusedResources runs, and a raw pointer cached here dangles
+// while its memory still reads as a perfectly sane texture. RAIN CODE: the
+// depth readback created a view over the freed SceneDepthZ and the NVIDIA
+// driver's worker thread died 6 ms later on a nulled internal field. Holding
+// our own reference keeps the element alive until the next allocation of that
+// name replaces it, so the worst case is a few frames of stale depth.
+//
+// SEH-guarded with plain arguments only: this hook can be reached with shifted
+// arguments (Jedi Survivor), and a virtual call through a sentinel must bail
+// where a readability check would, not take the game down.
+__declspec(noinline) static bool rtpool_addref_guarded(IPooledRenderTarget* rt) {
+    __try {
+        if (rt == nullptr || IsBadReadPtr(rt, sizeof(void*)) ||
+            IsBadReadPtr(*reinterpret_cast<void**>(rt), 3 * sizeof(void*))) {
+            return false;
+        }
+        rt->AddRef();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+__declspec(noinline) static void rtpool_release_guarded(IPooledRenderTarget* rt) {
+    __try {
+        if (rt != nullptr && !IsBadReadPtr(rt, sizeof(void*)) &&
+            !IsBadReadPtr(*reinterpret_cast<void**>(rt), 3 * sizeof(void*))) {
+            rt->Release();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void RenderTargetPoolHook::release_all_locked() {
+    for (auto& [name, rt] : m_render_targets) {
+        rtpool_release_guarded(rt);
+    }
+    m_render_targets.clear();
+}
+
 void RenderTargetPoolHook::on_post_find_free_element(
     sdk::FRenderTargetPool* pool, 
     sdk::FPooledRenderTargetDesc* desc, 
@@ -106,7 +149,7 @@ void RenderTargetPoolHook::on_post_find_free_element(
     // so, TODO: fix the games that crash with depth enabled
     if (!m_wants_activate) {
         std::scoped_lock _{g_hook->m_mutex};
-        m_render_targets.clear();
+        release_all_locked();
         return;
     }
 
@@ -132,9 +175,24 @@ void RenderTargetPoolHook::on_post_find_free_element(
         std::scoped_lock _{g_hook->m_mutex};
 
         if (out != nullptr) {
-            g_hook->m_render_targets[name] = out->reference;
-        } else {
-            g_hook->m_render_targets.erase(name);
+            // Take our reference on the NEW element first, then drop the one
+            // on whatever this name held before. The pool handing the same
+            // element back (reuse) is the common case and changes nothing.
+            IPooledRenderTarget* fresh = out->reference;
+            auto& slot = g_hook->m_render_targets[name];
+            if (slot != fresh) {
+                if (fresh != nullptr && !rtpool_addref_guarded(fresh)) {
+                    fresh = nullptr; // unreadable / sentinel: never cache it
+                }
+                rtpool_release_guarded(slot);
+                slot = fresh;
+            }
+            if (slot == nullptr) {
+                g_hook->m_render_targets.erase(name);
+            }
+        } else if (auto it = g_hook->m_render_targets.find(name); it != g_hook->m_render_targets.end()) {
+            rtpool_release_guarded(it->second);
+            g_hook->m_render_targets.erase(it);
         }
 
         if (!g_hook->m_seen_names.contains(name)) {

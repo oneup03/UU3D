@@ -101,6 +101,10 @@ private:
 
     std::recursive_mutex m_mutex{};
     SafetyHookInline m_find_free_element_hook{};
+    // Each cached element carries OUR reference (AddRef in the hook, Release
+    // when replaced or cleared), so the engine's pool cleanup cannot free a
+    // texture a consumer is about to view. See rtpool_addref_guarded.
     std::unordered_map<std::wstring, IPooledRenderTarget*> m_render_targets{};
+    void release_all_locked(); // caller holds m_mutex
     std::unordered_set<std::wstring> m_seen_names{};
 };
