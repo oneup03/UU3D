@@ -49,7 +49,11 @@ bases depending on which branch produced them.
   once the ordinary resize requests are ignored UU3D switches the engine to
   Windowed at native, which UE applies literally; native output keeps the
   window borderless, so it looks the same, and the game's own saved settings
-  are untouched. (*RAIN CODE*, UE 4.27.)
+  are untouched. (*RAIN CODE*, UE 4.27.) The recovery path has not yet been
+  seen running: every launch since it landed has won the race and come up at
+  native on its own, and an in-game resolution change cannot reproduce the
+  lost case because by then the spoof is in effect. Treat it as unverified
+  until a launch logs "applying ... as Windowed".
 
 ### Changed
 - **Auto-convergence snaps on camera cuts** instead of easing over a second
