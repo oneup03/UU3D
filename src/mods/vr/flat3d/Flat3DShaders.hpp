@@ -332,17 +332,39 @@ struct Flat3DDepthAim {
 };
 
 // Which eye a bound scene-depth buffer belongs to, in the COMPOSITOR's per-eye
-// convention (+1 = left). Double-wide depth: we read the LEFT half, so eye 0.
-// Single-width under AFR/AFW: the engine renders ONE view per frame and
-// afr_left_eye names it (AFW rides AFR, so it carries the fresh eye there too).
-// Anything else defaults to left.
+// convention (+1 = left).
 //
 // params.eye_swap must NOT enter this - it is an output-LAYOUT swap applied in
 // the repack shader and says nothing about which eye the engine drew.
 inline float sampled_eye_dir(const Flat3DFrameParams& params, bool depth_is_double_wide) {
+    if (depth_is_double_wide) {
+        return 1.0f; // we copy / sample the LEFT half
+    }
+
+    // Native Stereo Fix: the engine's own stereo pair, produced as TWO full
+    // scene passes - the primary (left) view first, then the capture pass
+    // re-enters BeginRenderingViewFamilies for the secondary (right) eye. The
+    // colour output of that second pass is redirected to the capture target,
+    // but nothing redirects its DEPTH: a second scene render in the same frame
+    // takes the pooled SceneDepthZ the first one just released. So a
+    // single-width depth under NSF holds whichever view rendered LAST - the
+    // RIGHT eye. (Returnal: one 1920x1080 depth entry takes every draw while
+    // the colour target is 3840 wide.) Reading it as the left eye put the aim
+    // correction on the wrong side, which presented as the depth buffer being
+    // "shifted left" - and the old +-6% window had been wide enough to hide it.
+    //
+    // Not covered: an NSF title whose capture pass owns a SEPARATE depth, where
+    // GameDepthCapture's draw-count winner is a per-frame coin flip. The
+    // depth-sample trace's uncorr/aim/mirror probe is what exposes that case.
+    if (params.native_stereo_layout) {
+        return -1.0f;
+    }
+
+    // AFR / AFW: the engine renders ONE view per frame and afr_left_eye names
+    // it (AFW rides AFR, so it carries the fresh eye there too). Anything else
+    // defaults to left.
     const bool one_view = params.afr_frame || params.warp_frame;
-    const bool left = depth_is_double_wide || !one_view || params.afr_left_eye;
-    return left ? 1.0f : -1.0f;
+    return (!one_view || params.afr_left_eye) ? 1.0f : -1.0f;
 }
 
 // Matches the cbuffer in the repack shader below. 12 dwords (3x float4):
