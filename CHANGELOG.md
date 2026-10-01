@@ -11,6 +11,31 @@ bases depending on which branch produced them.
 
 ## Unreleased
 
+### Added
+- **Convergence presets on a key.** Under the Convergence slider: a *Cycle
+  Key* (default **F2**, click to rebind to any keyboard key or gamepad button)
+  and a *Cycle Values* box holding comma-separated convergence distances
+  (default `0.5, 1, 2, 4`). Each press steps Convergence to the next entry,
+  wrapping at the end. Handy for games that alternate between a close
+  dialogue camera and open play.
+- **VSync Override: Force 1/2, for frame-sequential 3D.** If you watch
+  through Katanga (3D Vision via vrscreencap / geo-11, NV3D-Glass) or
+  WibbleWobble, those consumers cover the game window with their own
+  fullscreen output, which stops DXGI from throttling the game. Under No-Tear
+  Fast the only pacer left is then the `t.MaxFPS` timer, and a timer is not
+  the display: the two clocks beat against each other and every few minutes a
+  world update is dropped or doubled, which comes through as a periodic
+  hitch in the glasses. Force 1/2 hands the clock back to the display: the
+  stereo pair rate becomes exactly half the panel refresh, timed on its
+  vblank even while the window is covered, with `t.MaxFPS` left uncapped so
+  there is no second clock. Native Stereo presents every second refresh;
+  AFR / Synced Sequential / AFW present every refresh, one eye each. A
+  `[Flat3D][pace]` log line reports how often the guard had to wait. Along
+  the way, the frame cap under No-Tear Fast no longer engages at random:
+  two code paths were both writing `t.MaxFPS` every frame and disagreeing.
+  (**Legacy** also had to start honouring the requested present interval in
+  its D3D12 present hook, which it had silently ignored.)
+
 ### Fixed
 - **The adaptive crosshair reads the depth under the reticle, not beside it.**
   The depth buffer is a per-eye image, so whatever is under your reticle sits
@@ -66,6 +91,46 @@ bases depending on which branch produced them.
   described Depth / Reference FoV), and now documents Hold Window Size, Keep
   Game's Saved Video Settings, 3D Render Resolution, Applied To, Camera FoV
   Axis, 3D FoV Multiplier, Marker Region Radius and Stem Reach.
+
+### Upstream (Modern only)
+The Modern backend merged Joey Hodge's `ue57performance` branch three times
+since 00046 (149 upstream commits, 2026-08-13 to 2026-09-29). Those commits
+target the VR path, but the parts UU3D shares with it (Native Stereo Fix
+renderer discovery, UObject / CVar startup hardening, dedicated UI routing,
+UE 5.7 / 5.8 support) may improve these titles under Flat3D as well. None of
+them have been verified in UU3D; the list is what upstream's commits name:
+- *Kingdom Hearts III* - UObject tracking, Ghost Fix, Native Fix capture.
+- *Dune: Awakening* - Native Fix render-frame handoff, D3D12 residency,
+  view-extension callbacks, the WinGDK build and the public-test ABI.
+- *S.T.A.L.K.E.R. 2* - CVar startup stall, Synced scene publication,
+  dedicated UI target, attachment lifetimes, DeepDVC disabled in VR.
+- *Star Wars: Zero Company* - DX12 scene and Slate output, hologram passes,
+  viewport conversion, the post-update stereo hooks.
+- *Days Gone* - native stereo, right-eye snapshots, AHUD flicker and Slate
+  composition, weapon aim / reticle projection, UI alpha.
+- *Suicide Squad: Kill the Justice League* - Native Fix renderer entry,
+  stereo views, per-eye resources, paired render resources.
+- *NASCAR 25* and *NASCAR 26* - stereo and UI compatibility, Native Fix
+  capture gamma, per-eye copy states.
+- *Borderlands 4* - UE 5.5.4 dedicated UI routing, Slate guards.
+- *Hi-Fi RUSH* - Native Fix renderer discovery, protected Tick hook.
+- *Stellar Blade* - Native Fix renderer entry selection.
+- *Bodycam* - UE 5.5 rendering, owned UI, Native Fix eye exposure, OpenXR
+  mode transitions.
+- *Mafia: The Old Country* - UE 5.4.4 discovery, Native Fix command ownership.
+- *Hellblade: Senua's Sacrifice* - UE 4.25 Native stereo rendering.
+- *Sifu* - DX11 Native mesh bindings and renderer discovery.
+- *Halloween* - validated Native Fix family copies, scene allocation, Slate
+  UI ABI.
+- *Breathedge 2* - inventory world rendering.
+- *The Sinking City 2* - Slate UI routing after the game's update.
+- *Deadzone 2*, *The Medium*, *Observer*, *Townfall*, *Far Far West*,
+  *StormEscape*, *Captain Tsubasa*, *Pokemon Emerald (UE 5.6)* - one or two
+  renderer-hook, capture or projection fixes each.
+- Engine-wide: UE 5.7 and 5.8 (up to 5.8.3) stereo, CVar and UI discovery,
+  Bink overlay compatibility, Nanite hologram pass guards, praydog's D3D12
+  destination-barrier fix, the FRenderTarget gamma hook landing on a garbage
+  vtable slot, an on-demand anisotropic filtering CVar.
 
 ## Nightly 00040
 
