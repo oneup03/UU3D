@@ -2640,7 +2640,31 @@ void VR::update_flat3d_params() {
                         // falls back to the other after enough attempts. We
                         // deliberately never call ApplySettings: its
                         // SaveSettings() would persist native.
-                        GameThreadWorker::get().enqueue([swap_w, swap_h, attempt = nudge_attempts]() {
+                        // UE4's Windowed-Fullscreen sizing on a scaled display: the
+                        // engine takes desktop / DPI scale as its resolution and
+                        // SUBSTITUTES it for any larger request (RAIN CODE, UE 4.27
+                        // on a 4K panel at 150%: believes 2560x1440 and ignores every
+                        // nudge, r.SetRes and the WindowedFullscreen apply alike).
+                        // The DPI spoof is meant to make that division a no-op, but
+                        // it only takes if the engine re-reads the scale before it
+                        // first sizes its viewport - a startup race that is lost on
+                        // some launches and won on others with identical settings.
+                        // When it is lost the signature is exact: the believed size
+                        // equals native / scale while the spoof is active.
+                        const bool dpi_divided = [&]() {
+                            const auto wnd = g_framework->get_window();
+                            if (wnd == nullptr || !g_flat3d_dpi_spoof_active.load(std::memory_order_acquire)) {
+                                return false;
+                            }
+                            const float scale = (float)flat3d_real_dpi_for_window(wnd) / 96.0f;
+                            if (scale <= 1.01f) {
+                                return false;
+                            }
+                            const auto near_eq = [](uint32_t a, uint32_t b) { return (a > b ? a - b : b - a) <= 2; };
+                            return near_eq(cur_w, (uint32_t)std::lround(swap_w / scale)) &&
+                                   near_eq(cur_h, (uint32_t)std::lround(swap_h / scale));
+                        }();
+                        GameThreadWorker::get().enqueue([swap_w, swap_h, attempt = nudge_attempts, dpi_divided]() {
                             sdk::UObject* settings = nullptr;
                             sdk::UClass* settings_class = nullptr;
                             const bool have_settings = flat3d_find_gameusersettings(settings, settings_class);
@@ -2648,6 +2672,24 @@ void VR::update_flat3d_params() {
                                 ? flat3d_gus_get_mode(settings, settings_class->find_function(L"GetFullscreenMode"))
                                 : (uint8_t)0xff;
                             const bool windowed = mode == 2;
+                            // Windowed Fullscreen holding desktop / scale: nothing
+                            // asked for under that mode gets past the substitution,
+                            // so after the ordinary levers have had their two tries
+                            // switch the engine to WINDOWED at native, which UE applies
+                            // literally. apply_gameusersettings_resolution puts the
+                            // stored resolution and mode straight back, so the game's
+                            // own saved settings are untouched; only the live window
+                            // changes, and native output keeps it borderless at
+                            // native, so the result looks the same as before.
+                            if (dpi_divided && mode == 1 && attempt >= 3) {
+                                spdlog::info("[Flat3D] Native output: engine holds desktop / DPI scale under "
+                                             "WindowedFullscreen - applying {}x{} as Windowed (attempt {})",
+                                             swap_w, swap_h, attempt);
+                                if (apply_gameusersettings_resolution(swap_w, swap_h, /*full_apply=*/false,
+                                                                      /*window_mode=*/2)) {
+                                    return;
+                                }
+                            }
                             const bool settings_first = windowed ? attempt <= 3 : attempt > 4;
 
                             spdlog::info("[Flat3D] Native output: game window mode is {} - trying {} first",
