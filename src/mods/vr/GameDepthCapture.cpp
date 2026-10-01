@@ -853,8 +853,8 @@ void GameDepthCapture::end_frame_d3d11(uint32_t render_w, uint32_t render_h) {
 
     if (win_res != m_d11_last_logged) {
         m_d11_last_logged = win_res;
-        SPDLOG_INFO("[GameDepthCapture] D3D11 scene-depth published: {}x{} fmt={} draws={}",
-                    win_w, win_h, (int)win_fmt, winner_draws);
+        SPDLOG_INFO("[GameDepthCapture] D3D11 scene-depth published: {} {}x{} fmt={} draws={}",
+                    (const void*)win_res, win_w, win_h, (int)win_fmt, winner_draws);
     }
 }
 

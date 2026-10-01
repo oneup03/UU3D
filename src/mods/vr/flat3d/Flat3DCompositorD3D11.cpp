@@ -1549,9 +1549,9 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
     // multisampled one could never have been read by the old boxed copy.
     if (scene_depth != m_depth_logged_src) {
         m_depth_logged_src = scene_depth;
-        spdlog::info("[Flat3D][depth-src] SceneDepthZ {}x{} fmt={} samples={} bind=0x{:x} usage={} -> srv_fmt={}",
-                     sd_desc.Width, sd_desc.Height, (uint32_t)sd_desc.Format, sd_desc.SampleDesc.Count,
-                     sd_desc.BindFlags, (uint32_t)sd_desc.Usage, (uint32_t)srv_fmt);
+        spdlog::info("[Flat3D][depth-src] SceneDepthZ {} {}x{} fmt={} samples={} bind=0x{:x} usage={} -> srv_fmt={}",
+                     (const void*)scene_depth, sd_desc.Width, sd_desc.Height, (uint32_t)sd_desc.Format,
+                     sd_desc.SampleDesc.Count, sd_desc.BindFlags, (uint32_t)sd_desc.Usage, (uint32_t)srv_fmt);
     }
 
     if (srv_fmt == DXGI_FORMAT_UNKNOWN || (sd_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
@@ -1713,6 +1713,12 @@ void Flat3DCompositorD3D11::sample_depth(ID3D11DeviceContext* context, ID3D11Tex
         // DSV back afterwards.
         ID3D11RenderTargetView* rtvs[] = {m_depthx_rtv.Get()};
         context->OMSetRenderTargets(1, rtvs, nullptr);
+        // Sentinel: the full-coverage draw overwrites every texel, so -1 can
+        // only survive if the draw never wrote. A readback of d=[-1..-1] then
+        // says "the pass did not execute"; d=[0..0] says "the source is zero".
+        // Those two were indistinguishable before and cost a wrong diagnosis.
+        const float sentinel[4]{-1.0f, -1.0f, -1.0f, -1.0f};
+        context->ClearRenderTargetView(m_depthx_rtv.Get(), sentinel);
         ID3D11ShaderResourceView* srvs[2] = {src_msaa ? nullptr : m_depthx_src_srv.Get(),
                                              src_msaa ? m_depthx_src_srv.Get() : nullptr};
         context->PSSetShaderResources(0, 2, srvs);
