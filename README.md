@@ -491,10 +491,14 @@ output only (ignored under HDR), and 3D screenshots are captured without them.
   to the desktop *divided by the scale factor* (2560×1440 on a 4K panel at
   150%) and substitutes that for any larger request, and **Keep Game's Saved
   Video Settings** can then write it back into the game's saved settings as if
-  you had chosen it, so every launch starts there. Workaround: in the game's
-  own video settings pick **Windowed** at the display's native resolution (UE
-  applies a windowed size literally, and native output keeps it borderless),
-  then let the game save. Seen on *RAIN CODE* (UE 4.27).
+  you had chosen it. UU3D detects this (the engine's size equals the desktop
+  divided by the scale while its DPI spoof is active) and, once its first two
+  resize requests are ignored, switches the engine to **Windowed** at native,
+  which UE applies literally; native output keeps the window borderless, so
+  the result looks the same, and the game's own saved settings are left as
+  they were. If a title still comes up short, the manual form of the same fix
+  is to pick Windowed at native in the game's video settings. Seen on *RAIN
+  CODE* (UE 4.27).
 - Both UE4 (float) and UE5 (double-precision) projection paths are supported.
 - Quick sanity check: Side by Side with Separation 0 gives two identical
   halves; raise Separation and nearer-than-convergence objects show crossed
