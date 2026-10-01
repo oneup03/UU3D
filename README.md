@@ -254,6 +254,12 @@ stereo shear is injected into its own projection.
 Profiles saved before this scheme (Depth / Convergence / Reference FoV) convert
 automatically the first time they load, and the picture is unchanged.
 
+**Cycle Key** / **Cycle Values** — convergence presets. Type a comma-separated
+list of convergence distances in metres (default `0.5, 1, 2, 4`) and each press
+of the key (default **F2**) steps Convergence to the next entry, wrapping at the
+end. Click the key button to rebind it to any keyboard key or gamepad button;
+Esc or Backspace while binding clears it.
+
 Hotkeys (hold to repeat): **Ctrl+F3 / F4** separation −/+, **Ctrl+F5 / F6**
 convergence −/+ (proportional, so the whole 0.001–25 m range is reachable). **Ctrl+F12** (or the **Take 3D Screenshot** button at the
 top of the menu) saves the composited stereo pair — the game, its own HUD, the

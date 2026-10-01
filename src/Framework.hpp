@@ -23,6 +23,7 @@ class VR;
 #include "hooks/D3D12Hook.hpp"
 #include "hooks/WindowsMessageHook.hpp"
 #include "hooks/XInputHook.hpp"
+#include <chrono>
 #include "hooks/DInputHook.hpp"
 
 class UEVRSharedMemory {
@@ -95,6 +96,18 @@ public:
 
     const auto& get_mouse_delta() const { return m_mouse_delta; }
     const auto& get_keyboard_state() const { return m_last_keys; }
+    // Gamepad buttons as Windows' VK_GAMEPAD_* codes (0xC3..0xD2), fed by VR's
+    // XInput hook, so a ModKey can bind a controller button exactly like a key.
+    // The keyboard array never carries these: XInput buttons are not keyboard
+    // messages, so they would never be seen there.
+    const auto& get_gamepad_state() const { return m_last_gamepad_keys; }
+    void set_gamepad_key(uint8_t vk, bool down) { m_last_gamepad_keys[vk] = down ? 1 : 0; }
+    void mark_gamepad_updated() { m_last_gamepad_update = std::chrono::steady_clock::now(); }
+    // False once the pad has stopped reporting (unplugged, or the game stopped
+    // polling): a stale "down" must not hold a bind pressed forever.
+    bool gamepad_state_fresh() const {
+        return std::chrono::steady_clock::now() - m_last_gamepad_update < std::chrono::milliseconds(500);
+    }
 
     Address get_module() const { return m_game_module; }
 
@@ -327,6 +340,8 @@ private:
     float m_accumulated_mouse_delta[2]{};
     float m_mouse_delta[2]{};
     std::array<uint8_t, 256> m_last_keys{0};
+    std::array<uint8_t, 256> m_last_gamepad_keys{0};
+    std::chrono::steady_clock::time_point m_last_gamepad_update{};
     std::unique_ptr<D3D11Hook> m_d3d11_hook{};
     std::unique_ptr<D3D12Hook> m_d3d12_hook{};
     std::unique_ptr<WindowsMessageHook> m_windows_message_hook{};

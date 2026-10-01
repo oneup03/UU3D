@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <optional>
+#include <sstream>
 #include <thread>
 
 #include <intrin.h> // _ReturnAddress (window-hold diagnostics)
@@ -3641,6 +3642,11 @@ void VR::handle_flat3d_keybinds() {
         }
         s_ss_was_down = ss_down;
     }
+
+    // Convergence presets: one step per press (rising edge; ModKey debounces).
+    if (m_flat3d_conv_cycle_key->is_key_down_once()) {
+        cycle_flat3d_convergence();
+    }
 }
 
 // Queues a 3D screenshot of the next composited stereo frame (Ctrl+F12 / the
@@ -3649,6 +3655,46 @@ void VR::request_flat3d_screenshot() {
     if (auto* f = get_flat3d_runtime()) {
         f->screenshot_requested.store(true);
     }
+}
+
+// Steps Convergence through the user's comma-separated list. Parsed on every
+// press (it is a dozen floats at most) so edits in the text box take effect
+// immediately. Starts from the entry equal to the current value, so the cycle
+// is stable against the slider; from any other value it starts at the first
+// entry. Each value is clamped to the slider's own range. Bad tokens are
+// skipped: std::stof throws on garbage, and an uncaught throw here would take
+// the game down (the ModValue::set std::stod crash was exactly that).
+void VR::cycle_flat3d_convergence() {
+    std::vector<float> values{};
+    std::istringstream in{m_flat3d_conv_cycle_values->value()};
+    std::string tok{};
+    while (std::getline(in, tok, ',')) {
+        try {
+            size_t used = 0;
+            const float v = std::stof(tok, &used);
+            if (used > 0 && std::isfinite(v)) {
+                values.push_back(std::clamp(v, 0.001f, 25.0f));
+            }
+        } catch (const std::exception&) {
+            // not a number - skip it
+        }
+    }
+
+    if (values.empty()) {
+        return;
+    }
+
+    auto& conv = m_flat3d_convergence->value();
+    size_t next = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (std::fabs(values[i] - conv) <= std::max(1e-4f, conv * 1e-3f)) {
+            next = (i + 1) % values.size();
+            break;
+        }
+    }
+
+    conv = values[next];
+    spdlog::info("[Flat3D] Convergence cycle: {:.3f}m (entry {} of {})", conv, next + 1, values.size());
 }
 
 namespace {
@@ -3836,6 +3882,18 @@ void VR::on_draw_sidebar_flat3d() {
                               "be fused. Lower it if an autostereo panel shows ghosting.");
         }
         m_flat3d_convergence->draw("Convergence");
+
+        // Convergence presets: the key steps the slider through the list.
+        m_flat3d_conv_cycle_key->draw("Cycle Key");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11.0f);
+        m_flat3d_conv_cycle_values->draw("Cycle Values");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Comma-separated convergence values in metres, e.g. 0.5, 1, 2, 4.\n"
+                              "Pressing the Cycle Key (keyboard or gamepad button; click it to\n"
+                              "rebind) steps Convergence to the next entry, wrapping at the end,\n"
+                              "starting from the entry that matches the current value.");
+        }
 
         if (flat3d != nullptr) {
             // Only convergence is worth reporting: auto-convergence moves it out

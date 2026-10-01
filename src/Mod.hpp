@@ -489,6 +489,18 @@ public:
                 }
             }
 
+            // A controller button counts too (see GAMEPAD_* above).
+            if (m_waiting_for_new_key && g_framework->gamepad_state_fresh()) {
+                const auto& pad = g_framework->get_gamepad_state();
+                for (int32_t k{ GAMEPAD_A }; k <= GAMEPAD_RIGHT_THUMB; ++k) {
+                    if (pad[k]) {
+                        m_value = k;
+                        m_waiting_for_new_key = false;
+                        break;
+                    }
+                }
+            }
+
             ImGui::SameLine();
             ImGui::Text("Press any key...");
         }
@@ -522,6 +534,10 @@ public:
             return false;
         }
 
+        if (is_gamepad_key(m_value)) {
+            return g_framework->gamepad_state_fresh() && g_framework->get_gamepad_state()[(uint8_t)m_value] != 0;
+        }
+
         return g_framework->get_keyboard_state()[(uint8_t)m_value] != 0;
     }
 
@@ -552,6 +568,17 @@ public:
     }
 
     static constexpr int32_t UNBOUND_KEY{ -1 };
+    // Windows' VK_GAMEPAD_* codes (WinUser.h, Win10 SDK), spelled out so this
+    // does not depend on which _WIN32_WINNT the SDK headers were included
+    // with. They sit inside the 0..255 range a bind already stores, so a
+    // controller button persists and displays like any key; they are read from
+    // the Framework's gamepad snapshot instead of its keyboard one.
+    static constexpr int32_t GAMEPAD_A{ 0xC3 }, GAMEPAD_B{ 0xC4 }, GAMEPAD_X{ 0xC5 }, GAMEPAD_Y{ 0xC6 },
+        GAMEPAD_RIGHT_SHOULDER{ 0xC7 }, GAMEPAD_LEFT_SHOULDER{ 0xC8 },
+        GAMEPAD_LEFT_TRIGGER{ 0xC9 }, GAMEPAD_RIGHT_TRIGGER{ 0xCA },
+        GAMEPAD_DPAD_UP{ 0xCB }, GAMEPAD_DPAD_DOWN{ 0xCC }, GAMEPAD_DPAD_LEFT{ 0xCD }, GAMEPAD_DPAD_RIGHT{ 0xCE },
+        GAMEPAD_MENU{ 0xCF }, GAMEPAD_VIEW{ 0xD0 }, GAMEPAD_LEFT_THUMB{ 0xD1 }, GAMEPAD_RIGHT_THUMB{ 0xD2 };
+    static constexpr bool is_gamepad_key(int32_t k) { return k >= GAMEPAD_A && k <= GAMEPAD_RIGHT_THUMB; }
     static std::unordered_map<int, std::string> keycodes;
 
 protected:
@@ -572,15 +599,23 @@ public:
     {
     }
 
-    // No use for actually displaying this yet, so leaving them out for now
+    // Single-line text box. ImGui wants a char buffer; copy in, copy back on
+    // edit. 256 is plenty for the comma-separated lists this exists for.
     bool draw(std::string_view name) override {
         if (!should_draw_option()) {
             return false;
         }
 
-        // TODO
-
-        return false;
+        ImGui::PushID(this);
+        char buf[256]{};
+        strncpy_s(buf, m_value.c_str(), sizeof(buf) - 1);
+        const bool changed = ImGui::InputText(name.data(), buf, sizeof(buf));
+        context_menu_logic();
+        if (changed) {
+            m_value = buf;
+        }
+        ImGui::PopID();
+        return changed;
     }
 
     void draw_value(std::string_view name) override {
