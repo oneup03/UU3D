@@ -50,15 +50,6 @@ bases depending on which branch produced them.
   Windowed at native, which UE applies literally; native output keeps the
   window borderless, so it looks the same, and the game's own saved settings
   are untouched. (*RAIN CODE*, UE 4.27.)
-- **Engine Pool no longer crashes on a resolution change.** It cached a bare
-  pointer to the engine's pooled SceneDepthZ, and a resolution change frees
-  that element while its memory still reads as a sane texture; the first
-  depth readback afterwards created a view over the freed buffer and the
-  graphics driver died moments later. The pool cache now holds its own
-  reference on each element, so the engine can't free one out from under a
-  readback; at worst depth is a few frames stale until the new buffer is
-  allocated. This was always possible on any mid-session resolution change
-  with Engine Pool selected; the high-DPI fix above made one happen.
 
 ### Changed
 - **Auto-convergence snaps on camera cuts** instead of easing over a second
