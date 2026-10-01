@@ -9,6 +9,53 @@ root, Modern under `modern\`), so entries apply to both unless a heading says
 otherwise. Earlier nightlies were a single build, alternating between the two
 bases depending on which branch produced them.
 
+## Unreleased
+
+### Fixed
+- **The adaptive crosshair reads the depth under the reticle, not beside it.**
+  The depth buffer is a per-eye image, so whatever is under your reticle sits
+  a little to one side in it, by an amount that depends on its distance. The
+  sampler used to cover that by reading a wide band around the centre and
+  taking the nearest surface — which also grabbed any near object merely
+  *beside* the reticle. It now shifts the sample to where the target actually
+  is and reads a narrow window there. Under Native Stereo Fix that image is
+  the right eye's, not the left's as assumed, which had put the correction on
+  the wrong side and read as the crosshair taking its depth from the wrong
+  place (*Returnal*). The geometry cursor and the depth-adaptive HUD carried
+  the same bias and share the fix.
+- **The DirectX 11 depth readback no longer copies straight out of the depth
+  buffer.** D3D11 silently refuses that for depth-stencil and multisampled
+  targets, so every sample read as zero and the adaptive crosshair,
+  auto-convergence and HUD depth stayed flat on D3D11 titles. Depth is now
+  read through a shader pass, and Per-Draw Capture also hooks the
+  render-target bind UE4's D3D11 path uses whenever compute resources are
+  bound, which it had been missing. The log now records each depth resource
+  it reads (`[depth-src]`) and a per-draw summary. Still being verified on a
+  D3D11 title (*RAIN CODE*): the Engine Pool source there returns a buffer
+  that reads as cleared through either path.
+
+### Changed
+- **Auto-convergence snaps on camera cuts** instead of easing over a second
+  at the wrong depth: a cut to a close framing is detected within a couple of
+  frames and convergence jumps to it. Only cuts toward the camera snap; cuts
+  away still ease, which keeps anything moving close to the camera from
+  making convergence thrash. Easing back out is also slower than pulling in
+  now, so a receding object no longer reads as the image drifting.
+- **README caught up with the Separation scheme** from 00040 (it still
+  described Depth / Reference FoV), and now documents Hold Window Size, Keep
+  Game's Saved Video Settings, 3D Render Resolution, Applied To, Camera FoV
+  Axis, 3D FoV Multiplier, Marker Region Radius and Stem Reach.
+
+### Known issues
+- **High-DPI displays and Keep Game's Saved Video Settings.** On a display
+  scaled above 100%, a UE4 game in Windowed Fullscreen sizes itself to the
+  desktop divided by the scale (2560×1440 on a 4K panel at 150%) and ignores
+  requests to go larger; the settings guard can adopt that value as the
+  user's and write it back on every save, so the game keeps a 2560×1440
+  swapchain inside the native window and shows the image top-left with black
+  bars (*RAIN CODE*, UE 4.27). Workaround: set the game's own video settings
+  to Windowed at native resolution and let it save.
+
 ## Nightly 00040
 
 ### Changed
