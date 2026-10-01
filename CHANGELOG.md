@@ -38,6 +38,19 @@ bases depending on which branch produced them.
   D3D11 still does not publish** (it sees the depth targets but attributes no
   draws to them) - use Engine Pool on D3D11 for now.
 
+- **High-DPI displays: the image no longer sits top-left with black bars.**
+  On a display scaled above 100%, a UE4 game in Windowed Fullscreen sizes
+  itself to the desktop divided by the scale (2560×1440 on a 4K panel at
+  150%) and substitutes that for any larger request, so it kept a 2560×1440
+  swapchain inside the native window. Whether UU3D's DPI spoof headed that
+  off was a startup race, won on some launches and lost on others with
+  identical settings. The lost case now has an exact signature (the engine's
+  size equals native divided by the scale while the spoof is active), and
+  once the ordinary resize requests are ignored UU3D switches the engine to
+  Windowed at native, which UE applies literally; native output keeps the
+  window borderless, so it looks the same, and the game's own saved settings
+  are untouched. (*RAIN CODE*, UE 4.27.)
+
 ### Changed
 - **Auto-convergence snaps on camera cuts** instead of easing over a second
   at the wrong depth: a cut to a close framing is detected within a couple of
@@ -49,16 +62,6 @@ bases depending on which branch produced them.
   described Depth / Reference FoV), and now documents Hold Window Size, Keep
   Game's Saved Video Settings, 3D Render Resolution, Applied To, Camera FoV
   Axis, 3D FoV Multiplier, Marker Region Radius and Stem Reach.
-
-### Known issues
-- **High-DPI displays and Keep Game's Saved Video Settings.** On a display
-  scaled above 100%, a UE4 game in Windowed Fullscreen sizes itself to the
-  desktop divided by the scale (2560×1440 on a 4K panel at 150%) and ignores
-  requests to go larger; the settings guard can adopt that value as the
-  user's and write it back on every save, so the game keeps a 2560×1440
-  swapchain inside the native window and shows the image top-left with black
-  bars (*RAIN CODE*, UE 4.27). Workaround: set the game's own video settings
-  to Windowed at native resolution and let it save.
 
 ## Nightly 00040
 
