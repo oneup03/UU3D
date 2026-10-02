@@ -15,6 +15,9 @@
 
 #include "../D3D12Component.hpp"
 
+#include <d3dcompiler.h>
+#pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
+
 namespace vrmod {
 // AFW (Asynchronous Frame Warp) for Flat3D. Mirrors the OpenXR warp block in
 // D3D12Component::on_frame, but sized to the Flat3D display eye extent and feeding
@@ -23,6 +26,270 @@ namespace vrmod {
 // vr->depthDesc/motionVectorsDesc regardless of runtime. The PDAFWPlugin and the
 // Flat3D compositor both run on the game's main command queue, so the warp (below)
 // is serialized before the compositor's read of the warped eye — no extra fence.
+namespace {
+// UE velocity decode -> per-object pixel motion vectors for the AFW plugin.
+// UE EncodeVelocityToTexture(): xy = V * (0.499 * 0.5) + 32767/65535, where V is
+// the NDC delta (this - prev, y up) of a moving pixel; untouched (static) pixels
+// stay 0, so x > 0 means "velocity written". Jitter is already removed by UE.
+// Output convention: previous minus current, y-down pixels (DLSS / plugin).
+// AddCameraMotion: a moving pixel also gets the camera-induced motion between
+// the current eye camera and the "previous" camera the plugin will use for
+// this vector type (same eye's last frame for Normal, the other eye's last
+// render for FromOtherEye), from this frame's reverse-Z depth; static pixels
+// stay zero either way.
+const char* const g_afw_velocity_decode_hlsl = R"(
+Texture2D<float4> VelocityTex : register(t0);
+Texture2D<float> DepthTex : register(t1);
+RWTexture2D<float2> MotionOut : register(u0);
+cbuffer Constants : register(b0) {
+    float4x4 ClipToView;
+    float4x4 ViewToWorld;
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToClip;
+    uint Width; uint Height; float ScaleX; float ScaleY;
+    uint AddCameraMotion; uint Pad0; uint Pad1; uint Pad2;
+};
+[numthreads(8, 8, 1)]
+void cs_main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= Width || id.y >= Height) { return; }
+    const float4 enc = VelocityTex.Load(int3(id.xy, 0));
+    float2 mv = float2(0.0, 0.0);
+    if (enc.x > 0.0) {
+        const float inv = 1.0 / (0.499 * 0.5);
+        const float2 v = enc.xy * inv - (32767.0 / 65535.0) * inv; // NDC delta this - prev, y up
+        mv = float2(-v.x * 0.5 * (float)Width, v.y * 0.5 * (float)Height); // prev - this, y down
+        if (AddCameraMotion != 0) {
+            const float d = DepthTex.Load(int3(id.xy, 0)).r;
+            if (d > 0.0) {
+                const float2 pix = float2(id.xy) + 0.5;
+                const float2 ndc = float2(pix.x / (float)Width * 2.0 - 1.0, 1.0 - pix.y / (float)Height * 2.0);
+                float4 view = mul(ClipToView, float4(ndc, d, 1.0));
+                view /= view.w;
+                const float4 world = mul(ViewToWorld, view);
+                const float4 pclip = mul(PrevViewToClip, mul(PrevWorldToView, world));
+                if (pclip.w > 0.0) {
+                    const float2 pndc = pclip.xy / pclip.w;
+                    const float2 ppix = float2((pndc.x + 1.0) * 0.5 * (float)Width, (1.0 - pndc.y) * 0.5 * (float)Height);
+                    mv += ppix - pix;
+                }
+            }
+        }
+        mv *= float2(ScaleX, ScaleY);
+    }
+    MotionOut[id.xy] = mv;
+}
+)";
+
+struct AfwVelocityDecodeConstants {
+    glm::mat4 clip_to_view;
+    glm::mat4 view_to_world;
+    glm::mat4 prev_world_to_view;
+    glm::mat4 prev_view_to_clip;
+    uint32_t width, height;
+    float scale_x, scale_y;
+    uint32_t add_camera_motion, pad0, pad1, pad2;
+};
+} // namespace
+
+bool D3D12Component::ensure_afw_velocity_decode(ID3D12Device* device) {
+    auto& d = m_afw_velocity_decode;
+    if (d.ready) {
+        return true;
+    }
+    if (d.attempted || device == nullptr) {
+        return false;
+    }
+    d.attempted = true;
+
+    D3D12_DESCRIPTOR_RANGE vel_range{};
+    vel_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    vel_range.NumDescriptors = 1;
+    vel_range.BaseShaderRegister = 0;
+    D3D12_DESCRIPTOR_RANGE depth_range{};
+    depth_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    depth_range.NumDescriptors = 1;
+    depth_range.BaseShaderRegister = 1;
+    D3D12_DESCRIPTOR_RANGE uav_range{};
+    uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav_range.NumDescriptors = 1;
+    uav_range.BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER params[4]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &vel_range;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &depth_range;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 1;
+    params[3].DescriptorTable.pDescriptorRanges = &uav_range;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+    rs_desc.NumParameters = 4;
+    rs_desc.pParameters = params;
+
+    ComPtr<ID3DBlob> rs_blob{}, rs_err{};
+    if (FAILED(D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err))) {
+        spdlog::error("[Flat3D][AFW] velocity decode: root signature serialize failed: {}",
+            rs_err != nullptr ? (const char*)rs_err->GetBufferPointer() : "?");
+        return false;
+    }
+    if (FAILED(device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&d.root_sig)))) {
+        spdlog::error("[Flat3D][AFW] velocity decode: CreateRootSignature failed");
+        return false;
+    }
+
+    ComPtr<ID3DBlob> cs{}, err{};
+    if (FAILED(D3DCompile(g_afw_velocity_decode_hlsl, strlen(g_afw_velocity_decode_hlsl), "afw_velocity_decode",
+            nullptr, nullptr, "cs_main", "cs_5_0", 0, 0, &cs, &err))) {
+        spdlog::error("[Flat3D][AFW] velocity decode: shader compile failed: {}",
+            err != nullptr ? (const char*)err->GetBufferPointer() : "?");
+        return false;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = d.root_sig.Get();
+    pso.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+    if (FAILED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&d.pso)))) {
+        spdlog::error("[Flat3D][AFW] velocity decode: CreateComputePipelineState failed");
+        return false;
+    }
+
+    for (uint32_t i = 0; i < AfwVelocityDecode::kRing; ++i) {
+        if (!d.cmds[i].setup(L"Flat3D AFW velocity decode")) {
+            spdlog::error("[Flat3D][AFW] velocity decode: command context {} setup failed", i);
+            return false;
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 512; // sizeof(AfwVelocityDecodeConstants) rounded up to the 256-byte CBV granularity
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(&d.cb[i])))) {
+            spdlog::error("[Flat3D][AFW] velocity decode: constant buffer {} creation failed", i);
+            return false;
+        }
+        const D3D12_RANGE no_read{0, 0};
+        if (FAILED(d.cb[i]->Map(0, &no_read, &d.cb_mapped[i])) || d.cb_mapped[i] == nullptr) {
+            spdlog::error("[Flat3D][AFW] velocity decode: constant buffer {} map failed", i);
+            return false;
+        }
+    }
+
+    d.ready = true;
+    SPDLOG_INFO("[Flat3D][AFW] velocity decode pass ready (UE velocity -> per-object pixel motion vectors)");
+    return true;
+}
+
+bool D3D12Component::run_afw_velocity_decode(VR* vr, const AfwVelocityDecodeParams& p) {
+    auto* device = g_framework->get_d3d12_hook()->get_device();
+    if (!ensure_afw_velocity_decode(device)) {
+        return false;
+    }
+    if (p.velocity == nullptr || p.out_mv == nullptr || p.depth == nullptr ||
+        p.velocity->pTexture == nullptr || p.out_mv->pTexture == nullptr ||
+        p.velocity->shaderResourceViewHandle.ptr == 0 || p.out_mv->unorderedAccessViewHandle.ptr == 0) {
+        return false;
+    }
+    // Camera motion needs this frame's depth through the plugin's SRV. Without one
+    // (or without a depth copy source when the plugin depth is only filled later on
+    // the plugin's own list) fall back to object-only vectors.
+    const bool depth_usable = p.depth->pTexture != nullptr && p.depth->shaderResourceViewHandle.ptr != 0;
+    const bool add_camera = p.add_camera_motion && depth_usable;
+    auto* heap = vr->d3d12Renderer->GetViewHeap();
+    if (heap == nullptr) {
+        return false;
+    }
+
+    auto& d = m_afw_velocity_decode;
+    const uint32_t slot = d.frame++ % AfwVelocityDecode::kRing;
+    auto& ctx = d.cmds[slot];
+    ctx.wait(INFINITE); // legacy CommandContext: void wait, no poison/recovery machinery
+    if (!ctx.ready()) {
+        return false;
+    }
+    auto* cmd = ctx.cmd_list.Get();
+
+    const auto od = p.out_mv->pTexture->GetDesc();
+    AfwVelocityDecodeConstants constants{};
+    constants.clip_to_view = p.clip_to_view;
+    constants.view_to_world = p.view_to_world;
+    constants.prev_world_to_view = p.prev_world_to_view;
+    constants.prev_view_to_clip = p.prev_view_to_clip;
+    constants.width = (uint32_t)od.Width;
+    constants.height = od.Height;
+    constants.scale_x = p.scale_x;
+    constants.scale_y = p.scale_y;
+    constants.add_camera_motion = add_camera ? 1u : 0u;
+    memcpy(d.cb_mapped[slot], &constants, sizeof(constants));
+
+    // Flat3D depth-source fallback: the plugin's per-eye depth is normally filled
+    // on the plugin's list, which executes after us. Copy this frame's depth in
+    // here first so the camera reprojection and the warp both see it.
+    if (add_camera && p.depth_copy_src != nullptr && p.depth_copy_src != p.depth->pTexture) {
+        D3D12_RESOURCE_BARRIER pre[2]{};
+        pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pre[0].Transition.pResource = p.depth_copy_src;
+        pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        pre[0].Transition.StateBefore = p.depth_copy_src_state;
+        pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        pre[1] = pre[0];
+        pre[1].Transition.pResource = p.depth->pTexture;
+        pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd->ResourceBarrier(2, pre);
+        cmd->CopyResource(p.depth->pTexture, p.depth_copy_src);
+        D3D12_RESOURCE_BARRIER post[2]{pre[0], pre[1]};
+        std::swap(post[0].Transition.StateBefore, post[0].Transition.StateAfter);
+        std::swap(post[1].Transition.StateBefore, post[1].Transition.StateAfter);
+        cmd->ResourceBarrier(2, post);
+    }
+
+    // The plugin keeps its MV buffer in ALL_SHADER_RESOURCE at rest (its own
+    // CreateTexture initial state); the velocity and depth copies rest there too,
+    // which includes the NON_PIXEL_SHADER_RESOURCE bit a compute SRV read needs.
+    D3D12_RESOURCE_BARRIER to_uav{};
+    to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_uav.Transition.pResource = p.out_mv->pTexture;
+    to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cmd->ResourceBarrier(1, &to_uav);
+
+    ID3D12DescriptorHeap* heaps[] = { heap };
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetComputeRootSignature(d.root_sig.Get());
+    cmd->SetPipelineState(d.pso.Get());
+    cmd->SetComputeRootConstantBufferView(0, d.cb[slot]->GetGPUVirtualAddress());
+    cmd->SetComputeRootDescriptorTable(1, p.velocity->shaderResourceViewHandle);
+    // The depth table must be bound even when unused; the velocity SRV is a valid stand-in.
+    cmd->SetComputeRootDescriptorTable(2, depth_usable ? p.depth->shaderResourceViewHandle : p.velocity->shaderResourceViewHandle);
+    cmd->SetComputeRootDescriptorTable(3, p.out_mv->unorderedAccessViewHandle);
+    cmd->Dispatch((constants.width + 7) / 8, (constants.height + 7) / 8, 1);
+
+    D3D12_RESOURCE_BARRIER back = to_uav;
+    back.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    back.Transition.StateAfter = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    cmd->ResourceBarrier(1, &back);
+
+    ctx.has_commands = true;
+    ctx.execute();
+    return !ctx.last_close_failed;
+}
+
 ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     VR* vr,
     ID3D12Resource* double_wide,
@@ -30,7 +297,9 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     DXGI_FORMAT eye_format,
     DXGI_FORMAT backbuffer_format,
     bool extreme,
-    uint32_t backbuffer_index)
+    uint32_t backbuffer_index,
+    ID3D12Resource* fallback_depth,
+    D3D12_RESOURCE_STATES fallback_depth_state)
 {
     // State trace: log only on transitions so the log shows when the warp
     // actually engages vs falls back to plain AFR (and why).
@@ -50,7 +319,7 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
         return nullptr;
     }
     if (vr->d3d12Renderer == nullptr) {
-        trace(2, "warp unavailable: real PDAFWPlugin.dll not loaded — plain AFR fallback");
+        trace(2, "warp unavailable: real PDAFWPlugin.dll not loaded - plain AFR fallback");
         return nullptr;
     }
 
@@ -92,7 +361,7 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     auto& eyeFB = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
     auto& otherFB = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
     if (eyeFB.color.pTexture == nullptr || otherFB.color.pTexture == nullptr) {
-        trace(3, "warp unavailable: plugin eye framebuffers not allocated — plain AFR fallback");
+        trace(3, "warp unavailable: plugin eye framebuffers not allocated - plain AFR fallback");
         return nullptr; // plugin didn't allocate (dummy / init failed)
     }
 
@@ -142,10 +411,47 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
         }
     }
 
-    // Don't warp against garbage: require harvested depth for this eye. Until DLSS
-    // (or the NeverDLSS raw path) produces depth, fall back to plain AFR.
-    if (vr->depthDesc[nEye].pTexture == nullptr) {
-        trace(4, "warp waiting for depth + motion-vector harvest (DLSS active?) — plain AFR fallback");
+    // AFW without DLSS. Neither harvest path (NGX hook, NeverDLSS stencil-clear
+    // heuristic) copied depth for this eye this frame, but the compositor resolved
+    // this frame's scene depth from the Flat3D depth source (DSV Observer / Engine
+    // Pool / Per-Draw). That is the same reverse-Z scene depth DLSS would be fed,
+    // so size the plugin's per-eye depth buffer to it and copy it in below, on the
+    // plugin's command list. The zeroed motion-vector placeholder stays: Alternate
+    // Eye Warping reprojects the same frame's other eye from depth alone.
+    const bool depth_fed_this_frame = vr->afw_depth_fed_frame[nEye] == (uint32_t)vr->m_render_frame_count;
+    bool use_fallback_depth = false;
+    if (!depth_fed_this_frame && fallback_depth != nullptr) {
+        const auto fd = fallback_depth->GetDesc();
+        if (fd.Width > 0 && fd.Height > 0) {
+            if (vr->depthDesc[nEye].pTexture == nullptr ||
+                vr->depthDesc[nEye].pTexture->GetDesc().Width != fd.Width ||
+                vr->depthDesc[nEye].pTexture->GetDesc().Height != fd.Height ||
+                vr->depthDesc[nEye].pTexture->GetDesc().Format != fd.Format) {
+                vr->d3d12Renderer->CreateTexture((int)fd.Width, (int)fd.Height, fd.Format,
+                    D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->depthDesc[nEye], true);
+                SPDLOG_INFO("[Flat3D][AFW] depth buffer for eye {} sized to the Flat3D depth source: {}x{} fmt={}",
+                    (int)nEye, (uint32_t)fd.Width, fd.Height, (uint32_t)fd.Format);
+            }
+            if (!vr->rawMotionVectorsTex) {
+                if (vr->motionVectorsDesc[nEye].pTexture == nullptr ||
+                    vr->motionVectorsDesc[nEye].pTexture->GetDesc().Width != fd.Width ||
+                    vr->motionVectorsDesc[nEye].pTexture->GetDesc().Height != fd.Height) {
+                    vr->d3d12Renderer->CreateTexture((int)fd.Width, (int)fd.Height, DXGI_FORMAT_R16G16_FLOAT,
+                        D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->motionVectorsDesc[nEye], true);
+                }
+            }
+            if (vr->renderSize[0] != fd.Width || vr->renderSize[1] != fd.Height) {
+                vr->renderSize[0] = (UINT)fd.Width;
+                vr->renderSize[1] = fd.Height;
+            }
+            use_fallback_depth = vr->depthDesc[nEye].pTexture != nullptr;
+        }
+    }
+
+    // Don't warp against garbage: require depth for this eye. Until a harvest
+    // path or the Flat3D depth source produces it, fall back to plain AFR.
+    if (vr->depthDesc[nEye].pTexture == nullptr || (!depth_fed_this_frame && !use_fallback_depth)) {
+        trace(4, "warp waiting for depth: no DLSS/raw harvest this frame and no Flat3D depth-source snapshot - plain AFR fallback");
         return nullptr;
     }
 
@@ -166,6 +472,114 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
 
     auto* cmdList = vr->d3d12Renderer->BeginCommandList((int)backbuffer_index);
 
+    // Per-object vectors with camera motion need this frame's depth BEFORE the
+    // plugin's list runs, so in that case the decode pass copies the fallback depth
+    // itself (same copy, earlier on the queue) and the plugin copy below is skipped.
+    bool depth_copied_by_decode = false;
+
+    // AFW without DLSS, motion vectors. Neither the NGX hook nor the raw R16G16F
+    // harvest copied motion vectors for this eye this frame. If the per-object feed
+    // is on and the ResourceBarrier hook harvested UE's velocity buffer for this eye,
+    // decode it into pixel motion for moving objects (static pixels zero) straight
+    // into motionVectorsDesc[nEye] with our own compute pass, executed on the game
+    // queue ahead of the plugin's list, and tell the plugin the vectors are
+    // ObjectOnly (it supplies the camera motion itself from depth + camera data).
+    // Otherwise the zeroed placeholder stays and the warp is depth-only.
+    {
+        const uint32_t frame = (uint32_t)vr->m_render_frame_count;
+        const bool mv_fed_this_frame = vr->afw_mv_fed_frame[nEye] == frame;
+        auto& mvDesc = vr->motionVectorsDesc[nEye];
+        if (!mv_fed_this_frame && mvDesc.pTexture != nullptr) {
+            const bool velocity_this_frame = vr->afw_velocity_fed_frame[nEye] == frame && vr->rawVelocityDesc[nEye].pTexture != nullptr;
+            static bool s_pool_census_done = false;
+            if (vr->is_afw_velocity_feed_enabled() && velocity_this_frame) {
+                static bool s_logged[2]{false, false};
+                // Vector type the plugin will be told (mirrors the selection below):
+                // ObjectOnly only when the user picks it; otherwise Normal (same eye's
+                // last frame) while the ghosting fix is active, else FromOtherEye
+                // (the other eye's last render), with camera motion baked in.
+                const int type_override = vr->m_afw_mv_type->value();
+                const bool object_only = type_override == 3;
+                const bool normal_type = type_override == 1 || (type_override == 0 && vr->is_ghosting_fix_active());
+                AfwVelocityDecodeParams dp{};
+                dp.velocity = &vr->rawVelocityDesc[nEye];
+                dp.out_mv = &mvDesc;
+                dp.depth = &vr->depthDesc[nEye];
+                if (use_fallback_depth) {
+                    dp.depth_copy_src = fallback_depth;
+                    dp.depth_copy_src_state = fallback_depth_state;
+                }
+                dp.clip_to_view = vr->cameraData[nEye].srcClipToViewMatrix;
+                dp.view_to_world = vr->cameraData[nEye].srcViewToWorldMatrix;
+                if (normal_type) {
+                    dp.prev_world_to_view = vr->cameraDataForMV[nEye].srcWorldToViewMatrixPrev;
+                    dp.prev_view_to_clip = vr->cameraDataForMV[nEye].srcViewToClipMatrixPrev;
+                } else {
+                    dp.prev_world_to_view = vr->cameraDataForMV[nEye].destWorldToViewMatrix;
+                    dp.prev_view_to_clip = vr->cameraDataForMV[nEye].destViewToClipMatrix;
+                }
+                dp.add_camera_motion = !object_only;
+                dp.scale_x = vr->m_afw_velocity_mv_scale_x->value();
+                dp.scale_y = vr->m_afw_velocity_mv_scale_y->value();
+                if (run_afw_velocity_decode(vr, dp)) {
+                    vr->mvScale[0] = 1.0f; // the decode writes pixels at the MV buffer's resolution
+                    vr->mvScale[1] = 1.0f;
+                    vr->afw_mv_fed_frame[nEye] = frame;
+                    vr->afw_mv_feed.store(VR::AFW_MV_FEED_UE_VELOCITY, std::memory_order_relaxed);
+                    if (dp.add_camera_motion && use_fallback_depth) {
+                        depth_copied_by_decode = true;
+                        vr->afw_depth_fed_frame[nEye] = frame;
+                        vr->afw_depth_feed.store(VR::AFW_DEPTH_FEED_FLAT3D, std::memory_order_relaxed);
+                    }
+                    if (!s_logged[nEye]) {
+                        s_logged[nEye] = true;
+                        const auto vd = vr->rawVelocityDesc[nEye].pTexture->GetDesc();
+                        const auto md = mvDesc.pTexture->GetDesc();
+                        SPDLOG_INFO("[Flat3D][AFW] per-object motion vectors for eye {}: UE velocity {}x{} fmt={} decoded into {}x{} fmt={} ({})",
+                            (int)nEye, (uint32_t)vd.Width, vd.Height, (uint32_t)vd.Format, (uint32_t)md.Width, md.Height, (uint32_t)md.Format,
+                            object_only ? "ObjectOnly" : normal_type ? "Normal + camera motion" : "FromOtherEye + camera motion");
+                    }
+                }
+            } else {
+                // Nothing fed within the last pair of frames: report the zero placeholder.
+                if (frame - vr->afw_mv_fed_frame[nEyeOther] > 2) {
+                    vr->afw_mv_feed.store(VR::AFW_MV_FEED_NONE, std::memory_order_relaxed);
+                }
+                // One-time census of the engine's pooled render-target names that look
+                // like velocity / motion buffers, to pick a by-name source if the barrier
+                // heuristic never finds UE's velocity buffer in this title.
+                if (!s_pool_census_done && frame > 300 && vr->is_afw_velocity_feed_enabled() && !velocity_this_frame) {
+                    s_pool_census_done = true;
+                    if (auto& rt_pool = vr->get_render_target_pool_hook(); rt_pool != nullptr) {
+                        std::string hits{};
+                        for (const auto& n : rt_pool->snapshot_render_target_names()) {
+                            std::wstring lower = n;
+                            for (auto& c : lower) c = (wchar_t)towlower(c);
+                            if (lower.find(L"velocity") != std::wstring::npos || lower.find(L"motion") != std::wstring::npos) {
+                                hits += utility::narrow(n) + ", ";
+                            }
+                        }
+                        SPDLOG_INFO("[Flat3D][AFW] no UE velocity harvested yet; pooled render targets named like velocity/motion: {}",
+                            hits.empty() ? std::string{"(none)"} : hits);
+                    }
+                }
+            }
+        }
+    }
+
+    if (use_fallback_depth && !depth_copied_by_decode) {
+        // The source rests in fallback_depth_state (observer snapshot: PSR|NPSR;
+        // engine pool: DEPTH_READ|PSR|NPSR); the plugin's Copy transitions it to
+        // COPY_SOURCE and back around the copy, exactly as the NGX path does for
+        // the DLSS input depth.
+        TextureDesc src{};
+        src.pTexture = fallback_depth;
+        src.initialState = fallback_depth_state;
+        vr->d3d12Renderer->Copy(cmdList, vr->depthDesc[nEye], src);
+        vr->afw_depth_fed_frame[nEye] = (uint32_t)vr->m_render_frame_count;
+        vr->afw_depth_feed.store(VR::AFW_DEPTH_FEED_FLAT3D, std::memory_order_relaxed);
+    }
+
     // Crop the freshly-rendered eye (left half of the double-wide) into the plugin's
     // current-eye color buffer.
     D3D12_BOX src_box{ 0, 0, 0, eye_w, eye_h, 1 };
@@ -181,7 +595,18 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     p.InEyeFrameBuffer = &s_in;
     p.InUIColorAlpha = nullptr;
     p.IsHudlessColor = true;
-    p.MotionVectorsType = vr->is_ghosting_fix_enabled() ? Normal : FromOtherEye;
+    // Normal only when each eye really owns a scene history (ghosting fix ACTIVE);
+    // in remap-only mode the previous frame still belongs to the other eye. The
+    // per-object decode bakes the matching camera motion into its vectors, so the
+    // same selection applies whether or not vectors were fed this frame.
+    MVType mv_type = vr->is_ghosting_fix_active() ? Normal : FromOtherEye;
+    switch (vr->m_afw_mv_type->value()) {
+    case 1: mv_type = Normal; break;
+    case 2: mv_type = FromOtherEye; break;
+    case 3: mv_type = ObjectOnly; break;
+    default: break;
+    }
+    p.MotionVectorsType = mv_type;
     p.InMotionScale[0] = vr->mvScale[0];
     p.InMotionScale[1] = vr->mvScale[1];
     p.Mode = (FrameWarpMode)vr->m_framewarp_mode->value();
@@ -190,7 +615,9 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     p.CameraData = &vr->cameraData[nEye];
     p.IgnoreMotionThreshold = vr->m_ignore_motion_threshold->value();
     p.Debug = vr->m_framewarp_debug->value();
-    if (vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() && vr->is_fix_moving_object_brightness_flickering()) {
+    if (vr->is_fix_object_motion_vector() && vr->is_fix_moving_object_brightness_flickering() &&
+        (vr->is_ghosting_fix_enabled() || vr->afw_velocity_fed_frame[nEye] == (uint32_t)vr->m_render_frame_count) &&
+        vr->rawVelocityDesc[nEye].pTexture != nullptr) {
         p.InUEVelocityBuffer = &vr->rawVelocityDesc[nEye];
     }
     p.UseUINT64 = vr->is_use_uint64();
@@ -198,7 +625,7 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
 
     vr->d3d12Renderer->EndCommandList((int)backbuffer_index);
 
-    trace(0, "warp ENGAGED — reprojecting the second eye from depth + motion vectors");
+    trace(0, "warp ENGAGED - reprojecting the second eye from depth + motion vectors");
 
     // The plugin reprojected into the OTHER eye's buffer, left in ALL_SHADER_RESOURCE.
     return otherFB.color.pTexture;
@@ -215,6 +642,8 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     // DSV-observer depth: snapshot the live scene depth at the API level (no
     // engine hook, sees depth allocated at any time). Only the flat3d on_frame
     // path registers this observer, so there is no contention over the slot.
+    // AFW without DLSS feeds the warp from the same source, so keep the observer
+    // armed whenever AFW is the rendering method and the source is the observer.
     const bool wants_dsv_depth = vr->flat3d_wants_dsv_depth();
     m_flat3d_depth_observer.set_ue5_rdg_depth_capture_enabled(wants_dsv_depth);
     hook->set_depth_stencil_observer(wants_dsv_depth ? &m_flat3d_depth_observer : nullptr);
@@ -429,7 +858,9 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     auto scene_depth_state = kPoolDepthState;
 
-    if (params.want_depth || params.hud_depth_mode == 1) {
+    // AFW without DLSS: the warp needs this frame's scene depth too, so resolve
+    // the Flat3D depth source on warp frames even when no depth feature wants it.
+    if (params.want_depth || params.hud_depth_mode == 1 || params.warp_frame) {
         switch (vr->flat3d_depth_source()) {
         case VR::FLAT3D_DEPTH_DLSS: {
             // Our own plugin-free snapshot of the DLSS input depth (captured in the
@@ -521,7 +952,8 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     ID3D12Resource* warped_eye = nullptr; // plugin-owned; borrowed for this frame
     if (params.warp_frame) {
         warped_eye = run_flat3d_framewarp(vr, double_wide.Get(), eye_w, eye_h,
-            dw_desc.Format, bb_desc.Format, extreme, swapchain->GetCurrentBackBufferIndex());
+            dw_desc.Format, bb_desc.Format, extreme, swapchain->GetCurrentBackBufferIndex(),
+            scene_depth.Get(), scene_depth_state);
         if (warped_eye == nullptr) {
             // Warp unavailable this frame (plugin absent / depth not live yet). The
             // engine still rendered only ONE eye (AFW rides AFR), so fall back to

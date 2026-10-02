@@ -57,6 +57,26 @@ public:
     TextureDesc depthDesc[2]{{}, {}};
     TextureDesc motionVectorsDesc[2]{{}, {}};
 
+    // AFW depth feed bookkeeping. The two harvest paths (NGX EvaluateFeature hook,
+    // NeverDLSS stencil-clear hook) stamp the render frame they last copied depth
+    // into depthDesc[eye]; the Flat3D warp driver uses it to know whether this
+    // frame's depth arrived, and otherwise feeds the warp from the Flat3D depth
+    // source (DSV Observer / Engine Pool / Per-Draw) so AFW engages without DLSS.
+    enum AfwDepthFeed : int32_t { AFW_DEPTH_FEED_NONE = 0, AFW_DEPTH_FEED_DLSS = 1, AFW_DEPTH_FEED_RAW = 2, AFW_DEPTH_FEED_FLAT3D = 3 };
+    uint32_t afw_depth_fed_frame[2]{0, 0};
+    std::atomic<int32_t> afw_depth_feed{AFW_DEPTH_FEED_NONE};
+
+    // AFW motion-vector feed bookkeeping, same scheme. NONE = the plugin samples
+    // the zeroed placeholder (depth-only reprojection). UE_VELOCITY = no DLSS /
+    // raw MV harvest landed, so the Flat3D warp driver decoded UE's velocity
+    // buffer (harvested per eye by the ResourceBarrier hook) into per-object
+    // pixel motion vectors in motionVectorsDesc[eye] (D3D12Component's
+    // run_afw_velocity_decode) and told the plugin they are ObjectOnly.
+    enum AfwMvFeed : int32_t { AFW_MV_FEED_NONE = 0, AFW_MV_FEED_DLSS = 1, AFW_MV_FEED_RAW = 2, AFW_MV_FEED_UE_VELOCITY = 3 };
+    uint32_t afw_mv_fed_frame[2]{0, 0};
+    uint32_t afw_velocity_fed_frame[2]{0, 0};
+    std::atomic<int32_t> afw_mv_feed{AFW_MV_FEED_NONE};
+
     UINT renderSize[2] = {0, 0};
     UINT finalSize[2] = {1, 1};
     float mvScale[2] = {1.0, 1.0};
@@ -101,6 +121,7 @@ public:
 
     bool is_use_uint64() { return m_use_uint64->value(); };
     bool is_fix_object_motion_vector() { return m_fix_object_motion_vector->value(); };
+    bool is_afw_velocity_feed_enabled() { return m_afw_velocity_feed->value(); };
     float get_fix_object_motion_range() { return m_fix_object_motion_range->value(); };
 
     ShadingRate get_framewarp_shading_rate() { 
@@ -878,6 +899,10 @@ public:
         return m_ghosting_fix->value();
     }
 
+    // True only when the stereo hook owns a separate scene state for the second
+    // eye (ghosting fix ACTIVE), not merely enabled.
+    bool is_ghosting_fix_active() const;
+
     auto& get_fake_stereo_hook() {
         return m_fake_stereo_hook;
     }
@@ -1328,6 +1353,23 @@ private:
     const ModToggle::Ptr m_clear_before_framewarp{ModToggle::create(generate_name("AFW_ClearBeforeFramewarp"), false)};
     const ModToggle::Ptr m_fix_object_motion_vector{ModToggle::create(generate_name("AFW_FixObjectMotionVector"), true)};
     const ModSlider::Ptr m_fix_object_motion_range{ModSlider::create(generate_name("AFW_FixObjectMotionRange"), 0.0f, 10.0f, 3.0f)};
+    // No-DLSS per-object motion vectors (Flat3D): harvest UE's velocity buffer per
+    // eye and decode it into pixel motion for moving objects only (static pixels
+    // stay zero), handed to the warp as ObjectOnly. Off by default: a title
+    // without a usable velocity buffer is better served by depth-only warping.
+    // The decode writes vectors in the DLSS/plugin convention (previous minus
+    // current, y-down pixels). With MV Type Normal / FromOtherEye (Auto) a moving
+    // pixel gets camera motion (from depth + the camera matrices) plus its UE
+    // object motion, and static pixels stay zero, so the plugin's Ignore Motion
+    // Threshold keeps acting on static pixels exactly as with no vectors fed.
+    // With ObjectOnly a moving pixel gets object motion only and the plugin adds
+    // the camera part itself (static pixels then carry no residual to threshold).
+    // The scales multiply the final vector: flip a sign if moving objects shift
+    // the wrong way, halve/double if the trailing copy lands short or long.
+    const ModToggle::Ptr m_afw_velocity_feed{ModToggle::create(generate_name("AFW_VelocityFeed"), false)};
+    const ModCombo::Ptr m_afw_mv_type{ModCombo::create(generate_name("AFW_MotionVectorsType"), {"Auto", "Normal", "FromOtherEye", "ObjectOnly"}, 0)};
+    const ModSlider::Ptr m_afw_velocity_mv_scale_x{ModSlider::create(generate_name("AFW_VelocityMVScaleX"), -4.0f, 4.0f, 1.0f)};
+    const ModSlider::Ptr m_afw_velocity_mv_scale_y{ModSlider::create(generate_name("AFW_VelocityMVScaleY"), -4.0f, 4.0f, 1.0f)};
     const ModToggle::Ptr m_ultra_responsive{ModToggle::create(generate_name("AFW_UltraResponsive"), false)};
     const ModToggle::Ptr m_fix_moving_object_brightness_flickering{ModToggle::create(generate_name("AFW_FixMovingObjectBrightnessFlickering"), false)};
     const ModToggle::Ptr m_enable_sharpening{ModToggle::create(generate_name("AFW_EnableSharpening"), false)};
@@ -1937,11 +1979,17 @@ public:
             *m_framewarp_mode,
             *m_fix_object_motion_vector,
             *m_fix_object_motion_range,
+            *m_afw_velocity_feed,
+            *m_afw_mv_type,
+            *m_afw_velocity_mv_scale_x,
+            *m_afw_velocity_mv_scale_y,
             *m_ultra_responsive,
             *m_fix_moving_object_brightness_flickering,
             *m_enable_sharpening,
             *m_sharpness,
-            *m_framewarp_shading_rate
+            *m_framewarp_shading_rate,
+            *m_ignore_motion_threshold,
+            *m_clear_before_framewarp
         };
 
         add_components_vr();

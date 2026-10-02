@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <unordered_set>
 
 #include <windows.h>
 #include <dbt.h>
@@ -132,6 +133,8 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
             src.pTexture = depth;
             src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             vr->d3d12Renderer->Copy(InCmdList, vr->depthDesc[nEye], src);
+            vr->afw_depth_fed_frame[nEye] = (uint32_t)render_frame_count;
+            vr->afw_depth_feed.store(VR::AFW_DEPTH_FEED_DLSS, std::memory_order_relaxed);
             if (motionVectors && vr->rawMVDesc[nEye].pTexture != motionVectors) {
                 vr->rawMVDesc[nEye].pTexture = motionVectors;
                 vr->rawMVDesc[nEye].initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -163,6 +166,8 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
                 src.initialState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 vr->d3d12Renderer->Copy(InCmdList, vr->motionVectorsDesc[nEye], src);
             }
+            vr->afw_mv_fed_frame[nEye] = (uint32_t)render_frame_count;
+            vr->afw_mv_feed.store(VR::AFW_MV_FEED_DLSS, std::memory_order_relaxed);
         }
         if (vr->is_renderdoc && vr->d3d12Renderer != nullptr) {
             static TextureDesc colorDesc[2];
@@ -220,6 +225,23 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
             vr->rawMVDesc[nEye].pTexture == barrier.Transition.pResource)
             continue;
         auto desc = barrier.Transition.pResource->GetDesc();
+        // No-DLSS census (Flat3D only): log each distinct velocity / motion-vector
+        // shaped resource once so the log shows what this game actually transitions
+        // and in which states, when the heuristics below fail to harvest anything.
+        if (isNeverDLSS && vr->is_using_flat3d() &&
+            (desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM || desc.Format == DXGI_FORMAT_R16G16_FLOAT ||
+             desc.Format == DXGI_FORMAT_R16G16_UNORM || desc.Format == DXGI_FORMAT_R32G32_FLOAT)) {
+            static std::mutex s_census_mtx{};
+            static std::unordered_set<ID3D12Resource*> s_census_seen{};
+            std::scoped_lock _{s_census_mtx};
+            if (s_census_seen.size() < 48 && !s_census_seen.contains(barrier.Transition.pResource)) {
+                s_census_seen.insert(barrier.Transition.pResource);
+                spdlog::info("[Flat3D][AFW][barrier census] res={:p} fmt={} {}x{} before=0x{:x} after=0x{:x} renderSize={}x{} rhiThread={}",
+                    (void*)barrier.Transition.pResource, (uint32_t)desc.Format, (uint32_t)desc.Width, desc.Height,
+                    (uint32_t)barrier.Transition.StateBefore, (uint32_t)barrier.Transition.StateAfter,
+                    vr->renderSize[0], vr->renderSize[1], isRHIThread);
+            }
+        }
         if (desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM) {
             if ((barrier.Transition.StateAfter & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
                 (barrier.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET || barrier.Transition.StateBefore == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE)) {
@@ -251,8 +273,14 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
         bool RHIThreadPass = isRHIThread && !isRHISubmissionThreadFoundRecently;
         bool RHISubmissionThreadPass = !isRHIThread;
         if (RHIThreadPass || RHISubmissionThreadPass) {
-            if (velocityCandidate && vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
-                (render_frame_count - vr->last_dlss_frame_count) <= 1) {
+            // Upstream harvests UE's velocity buffer only while DLSS is live and the
+            // ghosting fix owns per-eye histories (for the plugin's object-motion
+            // fix). Under Flat3D without DLSS the warp driver decodes it into
+            // per-object motion vectors itself, so harvest whenever that feed is on.
+            const bool upstream_velocity = vr->is_ghosting_fix_enabled() && vr->is_fix_object_motion_vector() &&
+                (render_frame_count - vr->last_dlss_frame_count) <= 1;
+            const bool flat3d_no_dlss_velocity = isNeverDLSS && vr->is_using_flat3d() && vr->is_afw_velocity_feed_enabled();
+            if (velocityCandidate && (upstream_velocity || flat3d_no_dlss_velocity)) {
                 auto desc = velocityCandidate->GetDesc();
                 if (vr->rawVelocityDesc[nEye].pTexture == NULL || vr->rawVelocityDesc[nEye].pTexture->GetDesc().Width != desc.Width ||
                     vr->rawVelocityDesc[nEye].pTexture->GetDesc().Height != desc.Height) {
@@ -269,6 +297,7 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
                 skip = true;
                 vr->d3d12Renderer->Copy(This, vr->rawVelocityDesc[nEye], rawVelocityDescMap[velocityCandidate]);
                 skip = false;
+                vr->afw_velocity_fed_frame[nEye] = (uint32_t)render_frame_count;
             }
             if (motionVectorsCandidate) {
                 auto desc = motionVectorsCandidate->GetDesc();
@@ -284,6 +313,8 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
                     skip = true;
                     vr->d3d12Renderer->Copy(This, vr->motionVectorsDesc[nEye], src);
                     skip = false;
+                    vr->afw_mv_fed_frame[nEye] = (uint32_t)render_frame_count;
+                    vr->afw_mv_feed.store(VR::AFW_MV_FEED_RAW, std::memory_order_relaxed);
                 }
             }
         }
@@ -335,6 +366,8 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
                 src.pTexture = depth;
                 src.initialState = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
                 vr->d3d12Renderer->Copy(This, vr->depthDesc[nEye], src);
+                vr->afw_depth_fed_frame[nEye] = (uint32_t)render_frame_count;
+                vr->afw_depth_feed.store(VR::AFW_DEPTH_FEED_RAW, std::memory_order_relaxed);
             }
         }
     }
@@ -3116,6 +3149,13 @@ glm::mat4 to_reverseZ(const glm::mat4& proj) {
     return transformMat * proj;
 }
 
+bool VR::is_ghosting_fix_active() const {
+    if (!is_ghosting_fix_enabled() || m_fake_stereo_hook == nullptr) {
+        return false;
+    }
+    return m_fake_stereo_hook->is_ghosting_fix_pair_separated();
+}
+
 void VR::update_camera_data(int frame_count) {
 
     if (last_update_camera_data_frame_count < frame_count || last_update_camera_data_frame_count > (frame_count + 100)) {
@@ -3672,8 +3712,41 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
                 if (ImGui::TreeNode("Alternate Frame Warping")) {
                     m_framewarp_mode->draw("Framewarp Mode");
-                    if (is_no_dlss()) {
-                        ImGui::TextWrapped("No DLSS instance detected, are you sure you have turned on DLSS in-game?");
+                    {
+                        const char* feed = "none yet";
+                        switch (afw_depth_feed.load(std::memory_order_relaxed)) {
+                        case AFW_DEPTH_FEED_DLSS: feed = "DLSS input depth (NGX hook)"; break;
+                        case AFW_DEPTH_FEED_RAW: feed = "raw depth harvest (no DLSS)"; break;
+                        case AFW_DEPTH_FEED_FLAT3D: feed = "Flat3D depth source (no DLSS)"; break;
+                        default: break;
+                        }
+                        ImGui::Text("Warp depth feed: %s", feed);
+                    }
+                    {
+                        const char* feed = "none (zero motion vectors, depth-only reprojection)";
+                        switch (afw_mv_feed.load(std::memory_order_relaxed)) {
+                        case AFW_MV_FEED_DLSS: feed = "DLSS input motion vectors (NGX hook)"; break;
+                        case AFW_MV_FEED_RAW: feed = "raw motion-vector harvest (no DLSS)"; break;
+                        case AFW_MV_FEED_UE_VELOCITY: feed = "UE velocity buffer via the object-motion fix (no DLSS)"; break;
+                        default: break;
+                        }
+                        ImGui::Text("Warp MV feed: %s", feed);
+                    }
+                    if (is_no_dlss() && is_using_flat3d()) {
+                        m_afw_velocity_feed->draw("Per-Object Motion Vectors (UE velocity)");
+                        if (is_afw_velocity_feed_enabled()) {
+                            m_afw_mv_type->draw("Warp MV Type");
+                            m_afw_velocity_mv_scale_x->draw("Velocity MV Scale X");
+                            m_afw_velocity_mv_scale_y->draw("Velocity MV Scale Y");
+                            if (!rawVelocityDesc[0].pTexture) {
+                                ImGui::TextWrapped("No UE velocity buffer harvested yet. The game may not write one, or not at the render resolution.");
+                            }
+                            ImGui::TextWrapped("Decodes UE's velocity buffer into motion vectors for moving pixels (camera motion from depth plus the object's own motion); static pixels stay zero, so Ignore Motion Threshold works as before. Auto = Normal while the ghosting fix is active, else FromOtherEye. ObjectOnly feeds object motion alone and lets the plugin add the camera part. Flip a scale's sign if moving objects shift the wrong way in the warped eye; halve or double it if the trailing copy lands short or long.");
+                            ImGui::Text("Ghosting fix active: %s", is_ghosting_fix_active() ? "yes" : "no");
+                        }
+                    }
+                    if (is_no_dlss() && afw_depth_feed.load(std::memory_order_relaxed) == AFW_DEPTH_FEED_NONE) {
+                        ImGui::TextWrapped("No DLSS instance detected. Without DLSS the warp takes its depth from the Flat3D depth source (3D Display page); on D3D12 the DSV Observer source is the usual choice.");
                     }
                     if (m_framewarp_mode->value() == CombinedWarping) {
                         m_framewarp_shading_rate->draw("Framewarp Shading Rate");
@@ -3688,7 +3761,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                     ImGui::Spacing();
                     if (is_ghosting_fix_enabled()) {
                         m_fix_object_motion_vector->draw("Fix Object Motion Vector");
-                        m_fix_object_motion_range->draw("Fix Object Motion Rnage");
+                        m_fix_object_motion_range->draw("Fix Object Motion Range");
                         if (is_fix_object_motion_vector() && !rawVelocityDesc[0].pTexture) {
                             ImGui::TextWrapped("No UE Velocity Buffer found, can't use the object motion vector fix.");
                         } else {

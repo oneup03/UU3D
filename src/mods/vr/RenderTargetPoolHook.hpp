@@ -32,6 +32,16 @@ public:
         return nullptr;
     }
 
+    std::vector<std::wstring> snapshot_render_target_names() {
+        std::scoped_lock _{m_mutex};
+        std::vector<std::wstring> names{};
+        names.reserve(m_render_targets.size());
+        for (const auto& [name, _unused] : m_render_targets) {
+            names.emplace_back(name);
+        }
+        return names;
+    }
+
     template<typename T>
     Microsoft::WRL::ComPtr<T> get_texture(const std::wstring& name) {
         std::scoped_lock _{m_mutex};

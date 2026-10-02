@@ -517,6 +517,16 @@ private:
         uint32_t last_seen_frame{};
     };
 
+public:
+    // Ghosting fix ACTIVE: a second, distinct scene state has been assigned to
+    // the other eye (eye_state[1] is only filled once one is found or created).
+    bool is_ghosting_fix_pair_separated() {
+        std::scoped_lock _{m_sceneview_data.mtx};
+        const auto& pair = m_sceneview_data.m_ghosting_fix_pair;
+        return pair.eye_state[0] != nullptr && pair.eye_state[1] != nullptr && pair.eye_state[0] != pair.eye_state[1];
+    }
+private:
+
     struct {
         std::recursive_mutex mtx{};
         safetyhook::InlineHook constructor_hook{};
