@@ -12,6 +12,23 @@ bases depending on which branch produced them.
 ## Unreleased
 
 ### Added
+- **Alternate Frame Warping without DLSS.** AFW used to engage only when the
+  game ran DLSS (or the raw harvest found a DLSS-shaped depth buffer); any
+  other title silently fell back to plain AFR. The warp now takes its depth
+  from the Flat3D depth source (3D Display page; DSV Observer is the usual
+  choice on D3D12) whenever no DLSS depth arrived, so AFW works in titles
+  that never load DLSS. The AFW settings show what feeds the warp (*Warp
+  depth feed* / *Warp MV feed*).
+- **Per-Object Motion Vectors (UE velocity)** under Alternate Frame Warping,
+  for titles without DLSS: harvests Unreal's velocity buffer per eye and
+  decodes it into motion vectors for moving objects (camera motion from
+  depth plus the object's own motion; static pixels stay zero, so *Ignore
+  Motion Threshold* keeps working), which tightens fast-moving characters in
+  the warped eye. Off by default; with *Warp MV Type* and two scale sliders
+  for the sign/magnitude conventions.
+- AFW *Warp MV Type* Auto now tells the warp that the previous frame belongs
+  to the other eye unless the Ghosting Fix is actually active (per-eye scene
+  histories), not merely enabled; the AFW page shows *Ghosting fix active*.
 - **Convergence presets on a key.** Under the Convergence slider: a *Cycle
   Key* (default **F2**, click to rebind to any keyboard key or gamepad button)
   and a *Cycle Values* box holding comma-separated convergence distances
@@ -37,6 +54,8 @@ bases depending on which branch produced them.
   its D3D12 present hook, which it had silently ignored.)
 
 ### Fixed
+- AFW *Ignore Motion Threshold* and *Clear Before Framewarp* were never saved
+  to the profile and reset on every launch.
 - **The adaptive crosshair reads the depth under the reticle, not beside it.**
   The depth buffer is a per-eye image, so whatever is under your reticle sits
   a little to one side in it, by an amount that depends on its distance. The

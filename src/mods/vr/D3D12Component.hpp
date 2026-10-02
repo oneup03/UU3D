@@ -172,7 +172,9 @@ private:
         DXGI_FORMAT eye_format,
         DXGI_FORMAT backbuffer_format,
         bool extreme,
-        uint32_t backbuffer_index);
+        uint32_t backbuffer_index,
+        ID3D12Resource* fallback_depth,                 // Flat3D depth-source scene depth for this frame (may be null)
+        D3D12_RESOURCE_STATES fallback_depth_state);   // the state that resource rests in
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -458,6 +460,40 @@ private:
 
     flat3d::Flat3DCompositorD3D12 m_flat3d_compositor{};
     flat3d::Flat3DKatangaD3D12 m_flat3d_katanga12{};
+
+    // Flat3D AFW per-object motion vectors (no DLSS): a compute pass that decodes
+    // UE's velocity buffer (RGBA16_UNORM, moving objects only) into pixel-space
+    // motion vectors in the plugin's R16G16_FLOAT MV buffer. Records on its own
+    // command ring and executes on the game queue ahead of the plugin's warp
+    // list. Defined in D3D12Component_Flat3D.cpp.
+    struct AfwVelocityDecode {
+        static constexpr uint32_t kRing = 3;
+        ComPtr<ID3D12RootSignature> root_sig{};
+        ComPtr<ID3D12PipelineState> pso{};
+        d3d12::CommandContext cmds[kRing]{};
+        ComPtr<ID3D12Resource> cb[kRing]{}; // upload-heap constant buffers, persistently mapped
+        void* cb_mapped[kRing]{};
+        uint32_t frame{0};
+        bool attempted{false};
+        bool ready{false};
+    };
+    struct AfwVelocityDecodeParams {
+        const TextureDesc* velocity{};          // UE velocity copy (plugin TextureDesc, SRV in the plugin heap)
+        TextureDesc* out_mv{};                  // plugin MV buffer (R16G16_FLOAT, UAV in the plugin heap)
+        const TextureDesc* depth{};             // plugin per-eye depth (SRV); read when add_camera_motion
+        ID3D12Resource* depth_copy_src{};       // optional: copied into *depth first (Flat3D depth-source fallback)
+        D3D12_RESOURCE_STATES depth_copy_src_state{D3D12_RESOURCE_STATE_COMMON};
+        glm::mat4 clip_to_view{1.0f};           // current eye
+        glm::mat4 view_to_world{1.0f};
+        glm::mat4 prev_world_to_view{1.0f};     // the frame the vectors must point at
+        glm::mat4 prev_view_to_clip{1.0f};
+        bool add_camera_motion{false};
+        float scale_x{1.0f};
+        float scale_y{1.0f};
+    };
+    AfwVelocityDecode m_afw_velocity_decode{};
+    bool ensure_afw_velocity_decode(ID3D12Device* device);
+    bool run_afw_velocity_decode(VR* vr, const AfwVelocityDecodeParams& p);
 
     // Flat3D "DSV Observer" depth source: API-level scene-depth capture via the
     // D3D12Hook depth-stencil observer (no engine hook). See DepthStencilObserver.
