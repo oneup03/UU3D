@@ -3574,6 +3574,8 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     // Ghost reduction (SDR only; the shader gates on colorspace).
     p.ghost_contrast = m_flat3d_ghost_contrast->value();
     p.ghost_lift = m_flat3d_ghost_lift->value();
+    p.ghost_shoulder = m_flat3d_ghost_shoulder->value();
+    p.ghost_cancel = m_flat3d_ghost_cancel->value();
 
     return p;
 }
@@ -4283,6 +4285,21 @@ void VR::on_draw_sidebar_flat3d() {
     }
 
     if (ImGui::TreeNode("Ghost Reduction (Crosstalk)")) {
+        m_flat3d_ghost_shoulder->draw("Highlights");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Rolls off the highlights with a soft shoulder and leaves the midtones alone.\n\n"
+                "A visible ghost is a bright leak on a dark background, so its strength is set\n"
+                "by the highlights; the midtones barely contribute. Contrast squeezes everything\n"
+                "toward grey and spends most of its cost there. This removes the same leak\n"
+                "energy for far less visible contrast loss, and leaves headroom at the top of\n"
+                "the range for cancellation to land in.\n\n"
+                "The value is how much of the top of the range is given up: white ends at\n"
+                "1 - value in linear light, and the roll-off starts at 0.5 linear (about 73%%\n"
+                "in sRGB). The slope is continuous at the knee, so there is no visible band.\n\n"
+                "0.00 = off. Try 0.10 first. Applied before Contrast.");
+        }
+
         m_flat3d_ghost_contrast->draw("Contrast");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
@@ -4319,16 +4336,38 @@ void VR::on_draw_sidebar_flat3d() {
                 "Applied after Contrast, so the two stack. Test one at a time.");
         }
 
-        text_disabled_wrapped("Two levers for the same problem. Contrast shrinks the difference "
-                              "between the eyes; Black Lift gives a display's own crosstalk "
-                              "cancellation room to land. SDR only, and 3D screenshots are "
-                              "captured without either.");
+        m_flat3d_ghost_cancel->draw("Cancellation");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Pre-subtracts part of the opposite eye from each eye, so what the display\n"
+                "leaks back in cancels out. Each eye is pushed away from the other at the same\n"
+                "screen position: A' = A + k/(1-k) * (A - B). Where the eyes agree nothing\n"
+                "changes, so the slider reads as a pure ghost strength.\n\n"
+                "Set it to the display's crosstalk fraction: raise it until a bright edge in\n"
+                "one eye stops showing as a faint copy in the other, and no further - too much\n"
+                "produces fringes of the opposite sign. Shutter glasses usually land around\n"
+                "0.02 to 0.08; passive and autostereo panels lower.\n\n"
+                "The push overshoots past black and white on high-contrast edges and gets\n"
+                "clipped there; the clipped part survives as residual ghost. Black Lift,\n"
+                "Highlights and Contrast make room for it, so pair it with one of them.\n\n"
+                "Works in every output mode. On LeiaSR it stacks on the panel's own\n"
+                "cancellation, so start lower there.\n\n"
+                "0.00 = off. Applied last, in linear light.");
+        }
+
+        text_disabled_wrapped("Four levers for the same problem. Highlights and Contrast shrink "
+                              "the difference between the eyes; Black Lift gives crosstalk "
+                              "cancellation (the display's or ours) room to land; Cancellation "
+                              "subtracts the leak itself. 3D screenshots are captured without "
+                              "any of them.");
         text_disabled_wrapped("SDR only - no effect while the game is outputting HDR. "
                               "3D screenshots are captured without it.");
 
         if (ImGui::Button("Reset to Defaults##flat3d_act")) {
             m_flat3d_ghost_contrast->value() = 1.0f;
             m_flat3d_ghost_lift->value() = 0.0f;
+            m_flat3d_ghost_shoulder->value() = 0.0f;
+            m_flat3d_ghost_cancel->value() = 0.0f;
         }
 
         ImGui::TreePop();

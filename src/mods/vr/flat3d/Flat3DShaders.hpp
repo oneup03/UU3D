@@ -243,7 +243,7 @@ struct Flat3DFrameParams {
     //
     // Applied in LINEAR light with a 0.5 pivot via pow(2.2). Displays that
     // cancel generally do so in linear light, so matching that keeps the two
-    // consistent; see ApplyGhostReduction.
+    // consistent; see GhostCurve in the repack shader.
     //
     // SDR only (the shader gates on colorspace), and deliberately not applied
     // to 3D screenshots - a capture should not bake in a fix for one display.
@@ -258,6 +258,26 @@ struct Flat3DFrameParams {
     // Only meaningful on displays that actually cancel; where nothing subtracts
     // there is no clipping to relieve and only ghost_contrast helps.
     float ghost_lift{0.0f};
+
+    // Highlight roll-off: a soft shoulder above 0.5 linear (about 0.73 encoded)
+    // that gives up this much of the top of the range, with white landing at
+    // 1 - ghost_shoulder. A visible ghost is a bright leak on a dark
+    // background, so its amplitude is set by the highlights and the midtones
+    // barely contribute; the linear contrast squeeze spends most of its cost on
+    // them. The shoulder removes the same leak energy for far less perceived
+    // contrast loss, and opens headroom at the top for cancellation. Unit slope
+    // at the knee (C1), so there is no visible band. 0.0 == off.
+    float ghost_shoulder{0.0f};
+
+    // Subtractive crosstalk cancellation, our own: each eye is pushed away from
+    // the other at the same screen position, A' = A + g*(A - B) with
+    // g = k/(1 - k), the first-order inverse of a display that shows A + k*B.
+    // Identical eyes are untouched, so k reads as a pure ghost strength and
+    // should be set to the display's crosstalk fraction. The overshoot past
+    // [0,1] is what the three levers above make room for, so they run first.
+    // Available in every output mode, LeiaSR included (there it stacks on the
+    // panel's own ACT). 0.0 == off.
+    float ghost_cancel{0.0f};
 
     // Symmetric-projection mode: per-eye matrices identical (no shear);
     // convergence applied as a compositor image shift instead.
@@ -382,13 +402,18 @@ struct RepackConstants {
     float scene_shift_uv{0.0f};
     float scene_scale{1.0f};
     // Ghost reduction; the defaults are exact no-ops, so any pass that wants the
-    // image untouched (3D screenshots) simply leaves them alone. ghost_lift takes
-    // one of the old padding slots, so the struct stays 48 bytes / 12 dwords and
-    // the D3D12 root-constant count is unchanged.
+    // image untouched (3D screenshots) simply leaves them alone. Four levers
+    // bring the payload to 13 dwords; padded to 64 bytes / 16 dwords (a D3D11
+    // constant buffer must be a multiple of 16 bytes), and the D3D12 repack
+    // pushes 16 root constants (the root signature is sized for the larger
+    // overlay structs).
     float ghost_contrast{1.0f};
     float ghost_lift{0.0f};
-    float pad[1]{};
+    float ghost_shoulder{0.0f};
+    float ghost_cancel{0.0f};
+    float pad[3]{};
 };
+static_assert(sizeof(RepackConstants) == 16 * sizeof(uint32_t), "repack constant size");
 
 // Matches the cbuffer in the overlay shader below (16-byte aligned).
 // One draw per (eye, layer). uv_scale/uv_offset map output-pixel UV ->
@@ -541,32 +566,52 @@ cbuffer RepackParams : register(b0) {
     float  scene_scale;    // mild zoom so the shifted image still fills the eye
     float  ghost_contrast;   // ghost reduction, contrast squeeze (1.0 = no-op)
     float  ghost_lift;       // ghost reduction, black lift    (0.0 = no-op)
+    float  ghost_shoulder;   // ghost reduction, highlight roll-off (0.0 = no-op)
+    float  ghost_cancel;     // crosstalk cancellation strength k (0.0 = no-op)
 };
 
-// Ghost reduction: standard range compression for stereo crosstalk. Linear
-// light, 0.5 pivot, pow(2.2) rather than the piecewise sRGB curve. Full
-// rationale is on Flat3DFrameParams::ghost_contrast (kept out of this string:
-// MSVC caps a literal at 16 KB and this one is already split).
+// Ghost reduction: range compression for stereo crosstalk plus our own
+// subtractive cancellation. Linear light, pow(2.2) rather than the piecewise
+// sRGB curve (displays that cancel do so in linear light, and the LeiaSR weaver
+// uses the same 2.2). Full rationale is on Flat3DFrameParams::ghost_* (kept out
+// of this string: MSVC caps a literal at 16 KB and this one is already split).
 //
-// Two levers, both no-ops at their defaults, applied in that order:
+// Four levers, all no-ops at their defaults, applied in this order PER EYE in
+// SampleEye - so the anaglyph matrices see corrected eyes, and so cancellation
+// can read the opposite eye at the same screen position:
 //
+//   ghost_shoulder - roll off highlights above 0.5 linear; white lands at
+//                    1 - ghost_shoulder. Unit slope at the knee. Targets the
+//                    bright leak directly and leaves midtone contrast alone.
 //   ghost_contrast - squeeze toward mid-grey. Shrinks |L - R| AND opens headroom
-//                  at both ends of the range. Costs contrast across the image.
-//   ghost_lift     - raise the black floor, leaving white alone. Crosstalk
-//                  cancellation clips at the BOTTOM (it subtracts the opposite
-//                  eye and drives values below 0), so lift is the targeted fix
-//                  for that; the stereo literature calls the margin "foot-room".
-//                  Squeezing the highlights, as contrast does, is mostly wasted
-//                  on it. Costs black level rather than contrast.
+//                    at both ends of the range. Costs contrast across the image.
+//   ghost_lift     - raise the black floor, leaving white alone. Cancellation
+//                    clips at the BOTTOM, so this is the targeted fix for that;
+//                    the stereo literature calls the margin "foot-room".
+//   ghost_cancel   - push each eye away from the other: A' = A + g*(A - B),
+//                    g = k/(1 - k). The overshoot past [0,1] is clamped, which
+//                    is exactly what the three levers above make room for.
 //
-// Lift only helps on displays that actually cancel. Where nothing subtracts
-// there is no clipping to give foot-room to, and only ghost_contrast (shrinking
-// |L - R|) reduces visible ghosting.
-float3 ApplyGhostReduction(float3 c) {
-    float3 lin = pow(saturate(c), 2.2);
+// Shoulder and contrast reduce the visible leak on any display; lift and the
+// headroom only pay off where something (ours or the panel's) subtracts.
+bool GhostActive() {
+    return colorspace == 0 &&
+        (ghost_contrast != 1.0 || ghost_lift != 0.0 || ghost_shoulder != 0.0 || ghost_cancel != 0.0);
+}
+
+// Linear-light range compression (everything but cancellation).
+float3 GhostCurve(float3 lin) {
+    // Shoulder: rational roll-off above the knee, f(t) = t / (1 + b t) on the
+    // normalized headroom t in [0,1]. f'(0) = 1 (continuous slope at the knee)
+    // and f(1) = 1 - a with a = ghost_shoulder / (1 - knee); a = 0 is exact.
+    float knee = 0.5;
+    float a = saturate(ghost_shoulder / (1.0 - knee));
+    float b = a / max(1.0 - a, 1e-4);
+    float3 t = max(lin - knee, 0.0) / (1.0 - knee);
+    lin = min(lin, knee) + (1.0 - knee) * t / (1.0 + b * t);
     lin = (lin - 0.5) * ghost_contrast + 0.5;
     lin = lin * (1.0 - ghost_lift) + ghost_lift;
-    return pow(saturate(lin), 1.0 / 2.2);
+    return lin;
 }
 
 float3 srgb_to_linear(float3 c) {
@@ -681,7 +726,25 @@ float4 SampleEye(int half_idx, float u, float v) {
     float2 uv = float2((u - 0.5 - dir * scene_shift_uv) / scene_scale + 0.5,
                        (v - 0.5) / scene_scale + 0.5);
 
-    return (eye == 0) ? eye_left.Sample(samp, uv) : eye_right.Sample(samp, uv);
+    float4 c = (eye == 0) ? eye_left.Sample(samp, uv) : eye_right.Sample(samp, uv);
+
+    // Ghost reduction, per eye and SDR only (the levers are defined on
+    // sRGB-encoded [0,1]; the defaults make the branch free).
+    if (GhostActive()) {
+        float3 a = GhostCurve(pow(saturate(c.rgb), 2.2));
+        if (ghost_cancel > 0.0) {
+            // The opposite eye at the same OUTPUT position. Its convergence
+            // shift runs the other way, so rebuild the source uv with the
+            // direction flipped rather than reusing this eye's.
+            float2 uv_o = float2((u - 0.5 + dir * scene_shift_uv) / scene_scale + 0.5, uv.y);
+            float3 o = (eye == 0) ? eye_right.Sample(samp, uv_o).rgb : eye_left.Sample(samp, uv_o).rgb;
+            float3 b = GhostCurve(pow(saturate(o), 2.2));
+            float g = ghost_cancel / (1.0 - ghost_cancel);
+            a += g * (a - b);
+        }
+        c.rgb = pow(saturate(a), 1.0 / 2.2);
+    }
+    return c;
 }
 )" /* split: MSVC caps a single string literal at 16 KB; adjacent literals concatenate */ R"(
 float4 Repack(float2 uv, float2 pixel) {
@@ -870,14 +933,8 @@ float4 Repack(float2 uv, float2 pixel) {
 }
 
 float4 ps_main(VSOut input) : SV_Target {
+    // Ghost reduction runs per eye inside SampleEye.
     float4 c = Repack(input.uv, input.pos.xy);
-
-    // Ghost reduction. SDR only: the remap is defined on sRGB-encoded [0,1],
-    // which is what every mode returns here when colorspace == 0. 1.0 is the
-    // default everywhere, which makes the branch free.
-    if ((ghost_contrast != 1.0 || ghost_lift != 0.0) && colorspace == 0) {
-        c.rgb = ApplyGhostReduction(c.rgb);
-    }
 
     // Pass-through / resampling modes with an sRGB source and an HDR output
     // still need the space conversion (anaglyph modes already returned

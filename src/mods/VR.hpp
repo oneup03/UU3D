@@ -1793,6 +1793,15 @@ private:
     // room to work. Cancellation clips at the bottom, so lifting the floor
     // targets that directly and costs black level instead of contrast. 0.0 == off.
     const ModSlider::Ptr m_flat3d_ghost_lift{ ModSlider::create(generate_name("Flat3D_GhostLift"), 0.0f, 0.25f, 0.0f) };
+    // Highlight roll-off: a soft shoulder above 0.5 linear. A visible ghost is a
+    // bright leak on a dark background, so the highlights set its amplitude and
+    // the midtones barely matter; this removes the leak energy Contrast does at
+    // a fraction of the perceived contrast loss. White lands at 1 - value. 0.0 == off.
+    const ModSlider::Ptr m_flat3d_ghost_shoulder{ ModSlider::create(generate_name("Flat3D_GhostShoulder"), 0.0f, 0.4f, 0.0f) };
+    // Our own subtractive crosstalk cancellation, A' = A + k/(1-k) * (A - B) at
+    // the same screen position, in every output mode (stacks on a LeiaSR
+    // panel's own ACT). Set to the display's crosstalk fraction. 0.0 == off.
+    const ModSlider::Ptr m_flat3d_ghost_cancel{ ModSlider::create(generate_name("Flat3D_GhostCancel"), 0.0f, 0.25f, 0.0f) };
 
     // OpenTrack head tracking (v2). UDP receiver feeds a small head-coupled
     // perspective offset; separate look (yaw/pitch coupling) + parallax gains.
@@ -1902,6 +1911,8 @@ public:
             *m_flat3d_d3d12_debug_layer,
             *m_flat3d_ghost_contrast,
             *m_flat3d_ghost_lift,
+            *m_flat3d_ghost_shoulder,
+            *m_flat3d_ghost_cancel,
             *m_flat3d_opentrack_enabled,
             *m_flat3d_opentrack_port,
             *m_flat3d_opentrack_pos_scale,
