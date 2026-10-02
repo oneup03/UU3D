@@ -12,16 +12,6 @@ bases depending on which branch produced them.
 ## Unreleased
 
 ### Added
-- **Ghost Reduction: Highlights and Cancellation.** Two more levers beside
-  Contrast and Black Lift. *Highlights* rolls off the top of the range with a
-  soft shoulder (white lands at `1 - value` in linear light, midtones
-  untouched), removing the bright leak that reads as a ghost at a fraction of
-  Contrast's visible cost. *Cancellation* pre-subtracts part of the opposite
-  eye at the same screen position (`A + k/(1-k) * (A - B)`) so what the
-  display leaks back cancels; set it to the display's crosstalk fraction.
-  Both work in every output mode, LeiaSR included (where Cancellation stacks
-  on the panel's own). All four levers now run per eye before the anaglyph
-  matrices rather than on the finished output.
 - **Alternate Frame Warping without DLSS.** AFW used to engage only when the
   game ran DLSS (or the raw harvest found a DLSS-shaped depth buffer); any
   other title silently fell back to plain AFR. The warp now takes its depth
