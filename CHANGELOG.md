@@ -1,15 +1,16 @@
 # Changelog
 
-Notable changes to UU3D, newest first. Nightly builds are tagged by run number
+Notable changes to UU3D, newest first. Nightly builds are numbered one per release
 (`00024`, `00025`, …) — see the
-[releases page](https://github.com/oneup03/UU3D/releases).
+[releases page](https://github.com/oneup03/UU3D/releases). Up to `00046` the
+number was the workflow run counter, so those skip values.
 
 From **00037** a release ships **both backends** in one package (Legacy at the
 root, Modern under `modern\`), so entries apply to both unless a heading says
 otherwise. Earlier nightlies were a single build, alternating between the two
 bases depending on which branch produced them.
 
-## Unreleased
+## Nightly 00047
 
 ### Added
 - **Alternate Frame Warping without DLSS.** AFW used to engage only when the
@@ -106,7 +107,7 @@ bases depending on which branch produced them.
   away still ease, which keeps anything moving close to the camera from
   making convergence thrash. Easing back out is also slower than pulling in
   now, so a receding object no longer reads as the image drifting.
-- **README caught up with the Separation scheme** from 00040 (it still
+- **README caught up with the Separation scheme** from 00046 (it still
   described Depth / Reference FoV), and now documents Hold Window Size, Keep
   Game's Saved Video Settings, 3D Render Resolution, Applied To, Camera FoV
   Axis, 3D FoV Multiplier, Marker Region Radius and Stem Reach.
@@ -151,7 +152,7 @@ them have been verified in UU3D; the list is what upstream's commits name:
   destination-barrier fix, the FRenderTarget gamma hook landing on a garbage
   vtable slot, an on-demand anisotropic filtering CVar.
 
-## Nightly 00040
+## Nightly 00046
 
 ### Changed
 - **Depth is now Separation, and it means something you can see.** The old
