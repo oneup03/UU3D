@@ -421,9 +421,10 @@ default and a pure no-op when disabled.
 
 ## Ghost Reduction (Crosstalk)
 
-Two sliders that reduce ghosting by compressing the signal range before it
-reaches the display — the standard range-compression approach from the stereo
-crosstalk literature. Both are off by default and both run in linear light.
+Four sliders that reduce ghosting: three compress the signal range before it
+reaches the display (the standard range-compression approach from the stereo
+crosstalk literature) and one cancels the leak itself. All are off by default
+and all run in linear light, per eye.
 
 Every stereo display leaks some of each eye's image into the other, and how
 visible that leak is depends on the brightness difference between the eyes.
@@ -431,17 +432,38 @@ Some displays also cancel crosstalk themselves, pre-subtracting part of the
 opposite eye; that pushes values past the ends of the range, where they get
 clipped, and the clipped part is what survives as a ghost.
 
+- **Highlights** (`0.00` = off) — rolls off the top of the range with a soft
+  shoulder and leaves the midtones alone. A visible ghost is a bright leak on a
+  dark background, so the highlights set its strength and the midtones barely
+  matter; this removes the same leak energy as Contrast for far less visible
+  contrast loss. White lands at `1 - value` in linear light; the roll-off
+  starts at 0.5 linear (about 73% in sRGB) with a continuous slope, so there is
+  no band. Try `0.10`.
 - **Contrast** (`1.00` = off) — squeezes both eyes toward mid-grey. Shrinks the
   inter-eye difference directly, and leaves headroom at both ends of the range.
   Try `0.90` first and go lower only if edges still ghost.
 - **Black Lift** (`0.00` = off) — raises the black floor and leaves white alone.
   Cancellation clips at the *bottom*, so this targets that specifically and pays
   in black level rather than contrast; the literature calls the resulting margin
-  "foot-room". Only helps on displays that actually cancel. Try `0.02`–`0.05`.
+  "foot-room". Only helps where something cancels — the display, or our own
+  Cancellation below. Try `0.02`–`0.05`.
+- **Cancellation** (`0.00` = off) — pre-subtracts part of the opposite eye from
+  each eye at the same screen position, `A' = A + k/(1-k) * (A - B)`, so what
+  the display leaks back in cancels out. Where the eyes agree nothing changes,
+  so the value reads as a pure ghost strength: set it to the display's
+  crosstalk fraction, raising it until a bright edge in one eye stops showing
+  as a faint copy in the other and no further (too much gives fringes of the
+  opposite sign). Shutter glasses usually land around `0.02`–`0.08`; passive
+  and autostereo panels lower. The push overshoots past black and white on
+  high-contrast edges and is clipped there, which is the residual ghost the
+  three compression sliders make room for — pair it with at least one of them.
+  Works in every output mode; on LeiaSR it stacks on the panel's own
+  cancellation, so start lower there.
 
-Black Lift is applied after Contrast, so the two stack — test one at a time. The
-cost is real either way, so turn them only as far as the ghosting requires. SDR
-output only (ignored under HDR), and 3D screenshots are captured without them.
+They apply in the order Highlights, Contrast, Black Lift, Cancellation, so they
+stack — test one at a time. The cost is real either way, so turn them only as
+far as the ghosting requires. SDR output only (ignored under HDR), and 3D
+screenshots are captured without them.
 
 > Replaces the old **Color Correction (SDR)** section (lift / gamma / gain plus
 > an S-curve). That existed to fight ghosting, which this does with one slider
