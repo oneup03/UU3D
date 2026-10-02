@@ -1241,8 +1241,6 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
     // build_sbs.
     constants.ghost_contrast = params.ghost_contrast;
     constants.ghost_lift = params.ghost_lift;
-    constants.ghost_shoulder = params.ghost_shoulder;
-    constants.ghost_cancel = params.ghost_cancel;
     constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
     constants.scene_scale = params.scene_scale;
     context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
@@ -2076,8 +2074,6 @@ bool Flat3DCompositorD3D11::build_sbs(ID3D11DeviceContext* context, const Flat3D
     constants.src_srgb = 0;
     constants.ghost_contrast = params.ghost_contrast;
     constants.ghost_lift = params.ghost_lift;
-    constants.ghost_shoulder = params.ghost_shoulder;
-    constants.ghost_cancel = params.ghost_cancel;
     constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
     constants.scene_scale = params.scene_scale;
     context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);

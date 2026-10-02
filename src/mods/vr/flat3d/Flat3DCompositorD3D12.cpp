@@ -294,7 +294,7 @@ bool Flat3DCompositorD3D12::create_pipelines(ID3D12Device* device) {
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 34; // max(RepackConstants=16, OverlayConstants=28, HudClassifyConstants=34)
+    params[0].Constants.Num32BitValues = 34; // max(RepackConstants=12, OverlayConstants=28, HudClassifyConstants=34)
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -1471,13 +1471,11 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         // build_sbs.
         constants.ghost_contrast = params.ghost_contrast;
         constants.ghost_lift = params.ghost_lift;
-        constants.ghost_shoulder = params.ghost_shoulder;
-        constants.ghost_cancel = params.ghost_cancel;
         constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
         constants.scene_scale = params.scene_scale;
 
-        static_assert(sizeof(RepackConstants) == 16 * sizeof(uint32_t), "repack root constant size");
-        cmd->SetGraphicsRoot32BitConstants(0, 16, &constants, 0);
+        static_assert(sizeof(RepackConstants) == 12 * sizeof(uint32_t), "repack root constant size");
+        cmd->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
 
         auto eye_table = m_srv_heap->GetGPUDescriptorHandleForHeapStart(); // t0 = eye0, t1 = eye1
         cmd->SetGraphicsRootDescriptorTable(1, eye_table);
@@ -1983,17 +1981,14 @@ void Flat3DCompositorD3D12::build_sbs(ID3D12GraphicsCommandList* cmd, const Flat
     constants.colorspace = 0; // the weaver consumes SDR sRGB
     constants.paper_white = params.paper_white_nits;
     constants.src_srgb = 0;
-    // Ghost reduction: headroom for the weaver's ACT pass, plus our own
-    // cancellation stacked on it. This is the one repack that feeds the LeiaSR
-    // weaver, so it is the only place it applies.
+    // Anti-crosstalk headroom for the weaver's ACT pass — this is the one
+    // repack that feeds the LeiaSR weaver, so it is the only place it applies.
     constants.ghost_contrast = params.ghost_contrast;
     constants.ghost_lift = params.ghost_lift;
-    constants.ghost_shoulder = params.ghost_shoulder;
-    constants.ghost_cancel = params.ghost_cancel;
     constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
     constants.scene_scale = params.scene_scale;
 
-    cmd->SetGraphicsRoot32BitConstants(0, 16, &constants, 0);
+    cmd->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
     cmd->SetGraphicsRootDescriptorTable(1, m_srv_heap->GetGPUDescriptorHandleForHeapStart()); // t0/t1 = eyes
 
     cmd->DrawInstanced(3, 1, 0, 0);
@@ -2110,7 +2105,7 @@ bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Fla
         constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
         constants.scene_scale = params.scene_scale;
 
-        cmd->SetGraphicsRoot32BitConstants(0, 16, &constants, 0);
+        cmd->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
         cmd->SetGraphicsRootDescriptorTable(1, m_srv_heap->GetGPUDescriptorHandleForHeapStart()); // t0/t1 = eyes
 
         cmd->DrawInstanced(3, 1, 0, 0);
