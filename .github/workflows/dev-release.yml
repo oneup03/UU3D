@@ -121,10 +121,15 @@ jobs:
       - name: Configure CMake
         run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DUEVR_BUILD_COMPATIBILITY_TESTS=ON
 
+      # The offline test suite comes from joeyhodge/ue57performance, which only
+      # the modern branch merges. The legacy branch (praydog/master) has none of
+      # these targets, so building them there fails with MSB1009.
       - name: Build offline tests
+        if: matrix.variant == 'modern'
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target compatibility-policy-tests diagnostic-safety-tests hifi-hook-memory-tests nascar-hook-compatibility-tests input-hook-installation-tests
 
       - name: Run offline tests
+        if: matrix.variant == 'modern'
         run: ctest --test-dir ${{github.workspace}}/build -C ${{env.BUILD_TYPE}} --output-on-failure --no-tests=error
 
       - name: Build backend
