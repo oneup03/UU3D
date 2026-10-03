@@ -183,6 +183,7 @@ jobs:
       # branch, and keeping one copy avoids the drift a second would bring.
       # nightly-body.md and the license files exist on both refs, so nothing
       # else changes by sourcing them here.
+      # It also supplies dependencies/PDAFWPlugin.dll for the AFW bundle step.
       #
       # This job builds nothing from the backend repo, so no submodules and no
       # UESDK_PULLER token are needed.
@@ -241,7 +242,7 @@ jobs:
       # verbatim, so it can be restored as-is when we go back to tracking releases.
       - name: Bundle PDAFWPlugin from the repository
         run: |
-          $src = "${{github.workspace}}/dependencies/PDAFWPlugin.dll"
+          $src = "${{github.workspace}}/notes/dependencies/PDAFWPlugin.dll"
           if (-not (Test-Path $src)) { throw "dependencies/PDAFWPlugin.dll is missing from the checkout" }
           Write-Host "PDAFWPlugin.dll SHA256: $((Get-FileHash -Algorithm SHA256 $src).Hash)"
           Copy-Item -Force $src ${{github.workspace}}/UU3D/
