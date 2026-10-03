@@ -106,13 +106,26 @@ three options there matter most:
   - *Alternate Frame Warping* — the only method that actually cuts GPU cost:
     one eye is rendered per frame and the other is reprojected by PureDark's
     AFW plugin using depth and motion vectors. DX12 only (DX11 falls back to
-    AFR) and wants in-game DLSS enabled so depth and motion vectors are
-    available; the first moments after injection run Synced Sequential while
-    AFW warms up.
+    AFR). With in-game DLSS enabled it uses DLSS's depth and motion vectors;
+    without DLSS it takes depth from the 3D Display tab's **Depth Source**
+    (see below). The first moments after injection run Synced Sequential
+    while AFW warms up. The AFW panel shows what is feeding the warp
+    (*Warp depth feed* / *Warp MV feed*). Its settings:
+    - *Ignore Motion Threshold* — how much motion the warp ignores as noise.
+      Raising it settles shimmer on things the depth buffer can't place
+      exactly, such as objects seen through water. It is saved per game.
+    - *Per-Object Motion Vectors (UE velocity)* — only shown when the game
+      isn't running DLSS. It reads Unreal's velocity buffer so fast-moving
+      objects land in the right place in the warped eye. Off by default;
+      leave it off if moving characters look worse with it. *Warp MV Type*
+      stays on Auto, and the two scale sliders fix the direction or distance
+      of a moving object's trailing copy if it lands wrong.
 - **Ghosting Fix** — gives each eye its own temporal-history (TAA) view state
   so the alternating-eye methods don't smear one eye's history into the
   other. Watch its status badge; leave *Bootstrap Separate View States* off
-  unless the badge never reaches "active".
+  unless the badge never reaches "active". Under AFW an *active* Ghosting Fix
+  also improves the warp, which then knows each eye's previous frame is its
+  own.
 - **Native Stereo Fix** — for titles whose engine won't produce a correct
   second eye under *Native Stereo*: runs an extra capture pass each frame to
   obtain the other eye. Only applies to the Native Stereo method (the
@@ -294,6 +307,9 @@ The scene-depth source for **Adaptive Crosshair**, **HUD Depth**, and
   data while DLSS is enabled in the game's graphics settings; works in any
   rendering method and is the natural choice when playing with AFW.
 
+The depth source also feeds **Alternate Frame Warping** when the game isn't
+running DLSS: on D3D12 pick **DSV Observer** there and AFW reprojects from it.
+
 On DirectX 11 only the first two sources exist; selecting a D3D12-only source
 there runs Per-Draw Capture.
 
@@ -468,10 +484,11 @@ output only (ignored under HDR), and 3D screenshots are captured without them.
   and the other is one frame old. Fast motion shows the usual AFR shimmer.
 - **Alternate Frame Warping (AFW)** renders one eye and reprojects the other
   from color + depth + motion vectors — near-2x scene performance with
-  same-state eyes. D3D12 only, needs DLSS enabled in-game (raw-buffer
-  fallback exists) and the real `PDAFWPlugin.dll` beside `UEVRBackend.dll`;
-  without it, AFW falls back to plain AFR. Pair it with the **DLSS Depth**
-  source so the depth features read the same depth the warp uses.
+  same-state eyes. D3D12 only, needs the real `PDAFWPlugin.dll` beside
+  `UEVRBackend.dll` (without it, AFW falls back to plain AFR). With DLSS
+  enabled in-game, pair it with the **DLSS Depth** source so the depth
+  features read the same depth the warp uses. Without DLSS, the warp takes
+  its depth from the **Depth Source** (DSV Observer on D3D12).
 - **Native Stereo Fix** titles are handled (eye layout follows the headset
   logic), including modular DLL builds and engines with customized
   scene-view-family layouts (Returnal, Hellblade 2).
