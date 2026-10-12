@@ -1075,6 +1075,10 @@ private:
     // Installs the ProjectWorldLocationToScreen / ProjectWorldToScreen
     // UFunction hooks that feed the world-marker HUD mode. Idempotent.
     void setup_flat3d_marker_hooks();
+    // Crosshair depth or Laser Sight toggle state.
+    bool m_flat3d_crosshair_activated{false};
+    bool m_flat3d_crosshair_key_down{false};
+    bool m_flat3d_crosshair_mouse_button_down{false};
     // Per-frame parameter block for the D3D compositors (UI/crosshair shifts,
     // HDR colorspace comes from the component side).
     vrmod::flat3d::Flat3DFrameParams build_flat3d_frame_params(uint32_t eye_w, uint32_t eye_h);
@@ -1521,6 +1525,16 @@ private:
         "Game Crosshair",
         "Laser Sight",
     };
+    static const inline std::vector<std::string> s_flat3d_crosshair_activated_mode_names{
+        "Off",
+        "Hold",
+        "Toggle",
+    };
+    static const inline std::vector<std::string> s_flat3d_crosshair_mouse_button_names{
+        "Right Button",
+        "Middle Button",
+        "Left Button",
+    };
     static const inline std::vector<std::string> s_flat3d_vsync_names{
         "Use In-Game Setting",
         "Force On",
@@ -1671,6 +1685,11 @@ private:
     const ModInt32::Ptr m_flat3d_crosshair_size{ ModSliderInt32::create(generate_name("Flat3D_CrosshairSize"), 4, 64, 8) };
     const ModInt32::Ptr m_flat3d_crosshair_color{ ModInt32::create(generate_name("Flat3D_CrosshairColorARGB"), (int32_t)0xFFFFFFFF, true) };
     const ModSlider::Ptr m_flat3d_crosshair_static_depth{ ModSlider::create(generate_name("Flat3D_CrosshairStaticDepth"), 0.1f, 100.0f, 2.0f) };
+    // Dynamic game-crosshair activation.
+    const ModCombo::Ptr m_flat3d_crosshair_key_activated{ ModCombo::create(generate_name("Flat3D_CrosshairKeyActivated"), s_flat3d_crosshair_activated_mode_names, 0) };
+    const ModKey::Ptr m_flat3d_crosshair_key{ ModKey::create(generate_name("Flat3D_CrosshairKey"), ModKey::GAMEPAD_LEFT_TRIGGER) };
+    const ModCombo::Ptr m_flat3d_crosshair_mouse_activated{ ModCombo::create(generate_name("Flat3D_CrosshairMouseActivated"), s_flat3d_crosshair_activated_mode_names, 0) };
+    const ModCombo::Ptr m_flat3d_crosshair_mouse_button{ ModCombo::create(generate_name("Flat3D_CrosshairMouseButton"), s_flat3d_crosshair_mouse_button_names, 0) };
     // Replaces the system cursor with a per-eye cursor at GUI depth while
     // the game shows a mouse cursor (the hardware cursor is composited flat
     // by the OS — one copy at screen depth — which breaks in stereo).
@@ -1871,6 +1890,10 @@ public:
             *m_flat3d_crosshair_size,
             *m_flat3d_crosshair_color,
             *m_flat3d_crosshair_static_depth,
+            *m_flat3d_crosshair_key_activated,
+            *m_flat3d_crosshair_key,
+            *m_flat3d_crosshair_mouse_activated,
+            *m_flat3d_crosshair_mouse_button,
             *m_flat3d_hud_depth_mode,
             *m_flat3d_hud_marker_radius,
             *m_flat3d_hud_icon_radius,

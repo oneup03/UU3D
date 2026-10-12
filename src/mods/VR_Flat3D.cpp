@@ -3543,10 +3543,67 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
         }
     }
 
+    // Crosshair is activated by default unless key/mouse-activated is enabled.
+    if (m_flat3d_crosshair_key_activated->value() == 0 && m_flat3d_crosshair_mouse_activated->value() == 0) {
+        m_flat3d_crosshair_activated = true;
+    } else if (!g_framework->is_drawing_ui()) { // Skip when ui menu is opened.
+        // Check crosshair key.
+        switch (m_flat3d_crosshair_key_activated->value()) {
+        case 1:
+            // Change crosshair depth state when the key is hold down or release.
+            if (m_flat3d_crosshair_key_down != m_flat3d_crosshair_key->is_key_down()) {
+                m_flat3d_crosshair_key_down = m_flat3d_crosshair_key->is_key_down();
+                m_flat3d_crosshair_activated = m_flat3d_crosshair_key_down;
+            }
+            break;
+        case 2:
+            // Toggle crosshair depth state when the key is pressed.
+            if (m_flat3d_crosshair_key->is_key_down_once()) {
+                m_flat3d_crosshair_activated = !m_flat3d_crosshair_activated;
+            }
+            break;
+        }
+
+        // Check crosshair mouse button.
+        if (m_flat3d_crosshair_mouse_activated->value()) {
+            SHORT state = 0;
+            switch (m_flat3d_crosshair_mouse_button->value()) {
+            case 0:
+                state = GetAsyncKeyState(VK_RBUTTON);
+                break;
+            case 1:
+                state = GetAsyncKeyState(VK_MBUTTON);
+                break;
+            case 2:
+                state = GetAsyncKeyState(VK_LBUTTON);
+                break;
+            }
+            const bool mouse_button_down = (state < 0);
+            switch (m_flat3d_crosshair_mouse_activated->value()) {
+            case 1:
+                // Change crosshair depth state when the mouse button is hold down or release.
+                if (m_flat3d_crosshair_mouse_button_down != mouse_button_down) {
+                    m_flat3d_crosshair_mouse_button_down = mouse_button_down;
+                    m_flat3d_crosshair_activated = mouse_button_down;
+                }
+                break;
+            case 2:
+                // Toggle crosshair depth state when the mouse button is pressed.
+                if (m_flat3d_crosshair_mouse_button_down != mouse_button_down) {
+                    m_flat3d_crosshair_mouse_button_down = mouse_button_down;
+                    if (mouse_button_down) {
+                        m_flat3d_crosshair_activated = !m_flat3d_crosshair_activated;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // Crosshair at the aimed depth (adaptive) or the static depth. Suppressed
     // while the game shows a mouse cursor — the region extraction/laser sits
     // in the middle of menu GUIs otherwise.
-    p.crosshair_mode = in_menus ? 0 : (uint32_t)m_flat3d_crosshair_mode->value();
+    p.crosshair_mode = (!m_flat3d_crosshair_activated || in_menus) ? 0 : (uint32_t)m_flat3d_crosshair_mode->value();
 
     if (p.crosshair_mode != 0) {
         float z_uu = -1.0f;
@@ -3567,7 +3624,7 @@ vrmod::flat3d::Flat3DFrameParams VR::build_flat3d_frame_params(uint32_t eye_w, u
     }
 
     // Depth readback wanted while either consumer is active.
-    p.want_depth = (p.crosshair_mode != 0 && m_flat3d_crosshair_adaptive->value())
+    p.want_depth = (m_flat3d_crosshair_mode->value() != 0 && !in_menus && m_flat3d_crosshair_adaptive->value())
                  || m_flat3d_autoconv_enabled->value()
                  || cursor_mode == 2; // geometry cursor needs SceneDepthZ
 
@@ -4028,6 +4085,23 @@ void VR::on_draw_sidebar_flat3d() {
         }
         if (ch_mode != 0) {
             m_flat3d_crosshair_static_depth->draw("Static Depth");
+
+            m_flat3d_crosshair_key_activated->draw("Key Activated");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Hold down or press the Crosshair Key (keyboard or gamepad button;\n"
+                                  "click it to rebind) to activate Game Crosshair depth or Laser Sight.");
+            }
+            if (m_flat3d_crosshair_key_activated->value()) {
+                m_flat3d_crosshair_key->draw("Crosshair Key");
+            }
+            m_flat3d_crosshair_mouse_activated->draw("Mouse Activated");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Hold down or press the Mouse Button to activate Game Crosshair depth\n"
+                                  "or Laser Sight.");
+            }
+            if (m_flat3d_crosshair_mouse_activated->value()) {
+                m_flat3d_crosshair_mouse_button->draw("Mouse Button");
+            }
         }
 
         if (ImGui::Button("Reset to Defaults##flat3d_crosshair")) {
@@ -4038,6 +4112,10 @@ void VR::on_draw_sidebar_flat3d() {
             m_flat3d_crosshair_size->value() = 8;
             m_flat3d_crosshair_color->value() = (int32_t)0xFFFFFFFF;
             m_flat3d_crosshair_static_depth->value() = 2.0f;
+            m_flat3d_crosshair_key_activated->value() = 0;
+            m_flat3d_crosshair_key->value() = ModKey::GAMEPAD_LEFT_TRIGGER;
+            m_flat3d_crosshair_mouse_activated->value() = 0;
+            m_flat3d_crosshair_mouse_button->value() = 0;
         }
 
         ImGui::TreePop();
