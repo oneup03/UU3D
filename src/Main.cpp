@@ -7,6 +7,7 @@
 
 #include <utility/Thread.hpp>
 
+#include "ExceptionHandler.hpp"
 #include "Framework.hpp"
 #include "render/RenderDocCaptureService.hpp"
 #include "render/RenderDocDxgiProofHooks.hpp"
@@ -85,6 +86,10 @@ BOOL APIENTRY DllMain(HANDLE handle, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         try_set_per_monitor_dpi_awareness();
         CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)startup_thread, handle, 0, nullptr);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // The C runtime destroys this module's static objects after DllMain
+        // returns; the exception handlers stop using them from here on.
+        framework::on_module_detach();
     }
 
     return TRUE;

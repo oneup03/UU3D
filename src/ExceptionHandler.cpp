@@ -2,6 +2,7 @@
 #include <DbgHelp.h>
 #include <ShlObj.h>
 #include <TlHelp32.h>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -20,7 +21,25 @@
 
 #include "ExceptionHandler.hpp"
 
+namespace {
+// Constant-initialized and trivially destructible, so it stays valid while the
+// C runtime destroys the module's other static objects.
+std::atomic_bool g_module_detaching{false};
+}
+
+void framework::on_module_detach() {
+    g_module_detaching.store(true, std::memory_order_release);
+}
+
+bool framework::is_module_detaching() {
+    return g_module_detaching.load(std::memory_order_acquire);
+}
+
 LONG WINAPI framework::global_exception_handler(struct _EXCEPTION_POINTERS* ei) {
+    if (is_module_detaching()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     spdlog::flush_on(spdlog::level::err);
 
     spdlog::error("Exception occurred: {:x}", ei->ExceptionRecord->ExceptionCode);
@@ -118,6 +137,13 @@ LONG WINAPI framework::global_exception_handler(struct _EXCEPTION_POINTERS* ei) 
 // Deduped by (RIP,code) so IsBadReadPtr-style probe storms can't flood the log;
 // the LAST [FirstChance] entry before the log dies is the fatal one.
 static LONG WINAPI first_chance_exception_logger(struct _EXCEPTION_POINTERS* ei) {
+    // While the module unloads, the statics below and the logger may already be
+    // destroyed; touching them would fault inside this handler, and that fault
+    // would come straight back here.
+    if (framework::is_module_detaching()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     const auto code = ei->ExceptionRecord->ExceptionCode;
 
     switch (code) {

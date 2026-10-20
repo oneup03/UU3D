@@ -44,6 +44,7 @@
 #include <sdk/FTextureRenderTargetResource.hpp>
 
 #include "Framework.hpp"
+#include "ExceptionHandler.hpp"
 #include "Mods.hpp"
 #include "DumperMode.hpp"
 #include "mods/GameSpecific.hpp" // uevr::games exe-path predicates
@@ -11086,6 +11087,8 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
     // Add a vectored exception handler that catches attempted dereferences of a null XRSystem or HMDDevice
     // The exception handler will then patch out the instructions causing the crash and continue execution
     AddVectoredExceptionHandler(1, [](PEXCEPTION_POINTERS exception) -> LONG {
+        // The statics below are destroyed while the module unloads.
+        if (framework::is_module_detaching()) { return EXCEPTION_CONTINUE_SEARCH; }
         static std::vector<Patch::Ptr> xrsystem_patches{};
         static std::unordered_set<uintptr_t> ignored_addresses{};
 
