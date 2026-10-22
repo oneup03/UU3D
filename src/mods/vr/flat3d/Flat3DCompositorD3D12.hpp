@@ -41,10 +41,14 @@ class Flat3DCompositorD3D12 {
 public:
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
-    // backbuffer_pq: the game explicitly set a PQ color space on the
-    // swapchain (10-bit formats are otherwise treated as SDR/G22).
+    // backbuffer_pq: the swapchain is in a PQ color space, set by the game
+    // (SetColorSpace1) or, under the StereoShutter output, reported by the engine;
+    // 10-bit formats are otherwise treated as SDR/G22.
+    // eyes_in_output_encoding: the eyes already carry the engine's HDR encoding
+    // (PQ or scRGB), so 8-bit eyes under an HDR swapchain are not re-encoded
+    // from sRGB.
     bool setup(ID3D12Device* device, uint32_t eye_w, uint32_t eye_h, DXGI_FORMAT eye_format,
-               DXGI_FORMAT backbuffer_format, bool backbuffer_pq);
+               DXGI_FORMAT backbuffer_format, bool backbuffer_pq, bool eyes_in_output_encoding = false);
 
     // Records + executes one frame: eye-cache refresh, overlays, repack into
     // the current backbuffer. Also performs the (optional) SceneDepthZ
@@ -89,6 +93,20 @@ public:
     uint32_t eye_height() const { return m_eye_h; }
     DXGI_FORMAT eye_format() const { return m_eye_format; }
 
+    // The stereo pair for the plugin callback (output mode StereoShutter): both
+    // eyes side by side, each at the output's size, in the backbuffer's format
+    // and color space, drawn by composite() while params.stereo_pair_wanted.
+    // Left in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; valid after
+    // composite(), on the queue that executed it; nullptr when that composite()
+    // did not draw it or its list did not reach the queue.
+    ID3D12Resource* stereo_pair_texture() const { return m_stereo_pair_drawn ? m_stereo_pair_tex.Get() : nullptr; }
+    uint32_t stereo_pair_width() const { return m_stereo_pair_w * 2; }
+    uint32_t stereo_pair_height() const { return m_stereo_pair_h; }
+    DXGI_FORMAT stereo_pair_format() const { return m_stereo_pair_fmt; }
+    // Which eyes the last composite() refreshed (bit N = eye N): 0b11 for a
+    // full pair, one bit under plain AFR, 0 while Synced Sequential holds a pair.
+    uint32_t eye_refresh_mask() const { return m_eye_refresh_mask; }
+
     // Saves a 3D screenshot of the last composited frame: renders the two
     // composited eye textures into an SbS image via the repack shader (so the
     // configured SDR color correction is applied and HDR eye formats are
@@ -125,6 +143,13 @@ private:
     // correction); records into cmd, leaving m_sbs_tex in PSR state.
     void build_sbs(ID3D12GraphicsCommandList* cmd, const Flat3DFrameParams& params,
                    uint32_t out_w, uint32_t out_h);
+    // Draws the plugin pair (stereo_pair_texture) at the backbuffer's size with
+    // the backbuffer repack PSO: eye swap, convergence shift/scale, ghost
+    // reduction (SDR only) and the output's color space exactly as the
+    // backbuffer gets them. Records into cmd, leaving m_stereo_pair_tex in PSR
+    // state.
+    void build_stereo_pair(ID3D12GraphicsCommandList* cmd, const Flat3DFrameParams& params,
+                           uint32_t out_w, uint32_t out_h);
     bool weave_leiasr(ID3D12GraphicsCommandList* cmd, ID3D12Resource* backbuffer,
                       uint32_t out_w, uint32_t out_h, HWND hwnd, const Flat3DFrameParams& params);
     // Take/release the display's switchable lens. Driven per-frame off whether
@@ -142,6 +167,7 @@ private:
     DXGI_FORMAT m_eye_format{DXGI_FORMAT_UNKNOWN};
     DXGI_FORMAT m_backbuffer_format{DXGI_FORMAT_UNKNOWN};
     bool m_backbuffer_pq{false};
+    bool m_eyes_in_output_encoding{false};
     Flat3DColorSpace m_colorspace{Flat3DColorSpace::SDR};
     bool m_src_srgb{false};
 
@@ -266,6 +292,17 @@ private:
     ComPtr<ID3D12DescriptorHeap> m_sbs_rtv_heap{}; // single RTV for the SbS build
     uint32_t m_sbs_w{0};
     uint32_t m_sbs_h{0};
+
+    // The plugin pair (output mode StereoShutter): backbuffer size and format,
+    // PSR between uses; m_stereo_pair_drawn says the last composite() drew it.
+    ComPtr<ID3D12Resource> m_stereo_pair_tex{};
+    ComPtr<ID3D12DescriptorHeap> m_stereo_pair_rtv_heap{}; // single RTV for the pair build
+    uint32_t m_stereo_pair_w{0}; // per-eye dimensions
+    uint32_t m_stereo_pair_h{0};
+    DXGI_FORMAT m_stereo_pair_fmt{DXGI_FORMAT_UNKNOWN};
+    bool m_stereo_pair_failed{false}; // creation failed for this size/format: not retried until it changes
+    bool m_stereo_pair_drawn{false};
+    uint32_t m_eye_refresh_mask{0b11}; // see eye_refresh_mask()
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
     // SR-lib owns the SRContext and the IDX12Weaver1 behind this handle,

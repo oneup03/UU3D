@@ -717,6 +717,45 @@ public:
         return (int32_t)m_flat3d_output_mode->value();
     }
 
+    // The StereoShutter output hands the game's picture over in the engine's own
+    // encoding, so while the engine outputs HDR (and Force SDR Output is off) its
+    // eyes keep the engine's bit depth. Chosen once, when the stereo hook is
+    // installed: the r.DefaultBackBufferPixelFormat value the hook writes for the
+    // engine's stereo render target (0 = B8G8R8A8, the 8 bits VR headsets take,
+    // also for SDR; 4 = A2B10G10R10 for HDR10; 3 = FloatRGBA for scRGB), and the
+    // matching ETextureRenderTargetFormat of the native-stereo-fix scene capture
+    // that holds the right eye.
+    int32_t choose_flat3d_eye_pixel_format();
+    int32_t flat3d_eye_pixel_format() const {
+        return m_flat3d_eye_pixel_format.load(std::memory_order_acquire);
+    }
+    uint8_t flat3d_capture_target_format() const {
+        return m_flat3d_capture_target_format.load(std::memory_order_acquire);
+    }
+
+    // What the engine itself outputs, from its console variables
+    // (r.HDR.EnableHDROutput, r.HDR.Display.OutputDevice), read about once a
+    // second while the StereoShutter output is on: the swapchain hook never sees
+    // the color space of a game that switched HDR on before UU3D was injected.
+    enum Flat3DEngineHdr : int32_t {
+        FLAT3D_ENGINE_HDR_OFF = 0,   // SDR, unknown, or another output mode
+        FLAT3D_ENGINE_HDR_PQ = 1,    // HDR10: ST 2084, Rec. 2020
+        FLAT3D_ENGINE_HDR_SCRGB = 2, // scRGB: linear, FP16
+    };
+    int32_t flat3d_engine_hdr() const {
+        return m_flat3d_engine_hdr.load(std::memory_order_acquire);
+    }
+
+    // Reported by the Flat3D components every frame: whether the StereoShutter output
+    // is selected, and whether a plugin registered for the stereo pair on the renderer
+    // in use. Selected without such a plugin means StereoShutter is not installed: the
+    // game shows the left eye only, so the user is told once per session with a message
+    // box, and in the 3D Display page for as long as it lasts.
+    void flat3d_note_stereo_pair_consumer(bool output_selected, bool consumer_present);
+    bool flat3d_stereo_pair_consumer_missing() const {
+        return m_flat3d_stereo_pair_consumer_missing.load(std::memory_order_acquire);
+    }
+
     // The 3D output always holds on the PRIMARY display (3D users keep the 3D
     // panel primary); this makes the native-output hold deterministic.
     bool flat3d_output_on_primary() const {
@@ -1519,6 +1558,7 @@ private:
         "Anaglyph Green/Magenta (Dubois)",
         "Anaglyph Green/Magenta (Deghosted)",
         "Anaglyph Blue/Amber",
+        "StereoShutter",
     };
     static const inline std::vector<std::string> s_flat3d_crosshair_mode_names{
         "Off",
@@ -1605,6 +1645,11 @@ private:
     // Native Render + Upscale automatically (spoof the engine to render native
     // per-eye + top-left UI crop); no user toggle. False on 16:9 / half-SbS.
     std::atomic<bool> m_flat3d_full_sbs{ false };
+    std::atomic<int32_t> m_flat3d_eye_pixel_format{0};       // see choose_flat3d_eye_pixel_format()
+    std::atomic<uint8_t> m_flat3d_capture_target_format{2};  // RTF_RGBA8 unless chosen otherwise
+    std::atomic<int32_t> m_flat3d_engine_hdr{FLAT3D_ENGINE_HDR_OFF};
+    std::atomic<bool> m_flat3d_stereo_pair_consumer_missing{false};
+    std::atomic<bool> m_flat3d_stereo_pair_consumer_warned{false};
     const ModToggle::Ptr m_flat3d_eye_swap{ ModToggle::create(generate_name("Flat3D_EyeSwap"), false) };
     // Present-interval override. The 2x mode disables vsync AND caps the game
     // at twice the display refresh so AFR/Synced Sequential update each eye
