@@ -6150,6 +6150,28 @@ constexpr NativeFixTextureLayout BODYCAM_UE554_TEXTURE_LAYOUT{
     uevr::bodycam_texture::render_target_offset,
 };
 
+// The DXGI formats the native stereo fix accepts for the textures it validates (its
+// scene capture, and the UE5.8 dedicated UI target, which shares the check): the
+// 8-bit BGRA they are normally created with, or the bit depth the Flat3D
+// StereoShutter output chose for the eyes while the engine outputs HDR
+// (VR::choose_flat3d_eye_pixel_format), which the scene capture is then created with.
+bool is_native_fix_texture_dxgi_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return true;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return VR::get()->flat3d_eye_pixel_format() == 4; // A2B10G10R10
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return VR::get()->flat3d_eye_pixel_format() == 3; // FloatRGBA
+    default:
+        return false;
+    }
+}
+
 bool native_fix_has_module_owned_vtable(uintptr_t object) {
     if (!is_readable_process_range(object, sizeof(uintptr_t))) {
         return false;
@@ -6228,14 +6250,11 @@ std::optional<ValidatedNativeFixTextureChain> validate_native_fix_texture_chain(
 
         const auto& hook = g_framework->get_d3d12_hook();
         const auto expected_device = hook != nullptr ? hook->get_device() : nullptr;
-        const bool bgra_compatible =
-            desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
-            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool format_compatible = is_native_fix_texture_dxgi_format(desc.Format);
         const bool render_target_capable =
             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != D3D12_RESOURCE_FLAG_NONE;
         if (expected_device == nullptr || resource_device.Get() != expected_device ||
-            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !bgra_compatible ||
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !format_compatible ||
             !render_target_capable || desc.Width != expected_width || desc.Height != expected_height ||
             desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1)
         {
@@ -7590,8 +7609,7 @@ try {
         (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0 ||
         (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 ||
         (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0 ||
-        (desc.Format != DXGI_FORMAT_B8G8R8A8_TYPELESS && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
-         desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+        !is_native_fix_texture_dxgi_format(desc.Format))
     {
         return std::nullopt;
     }
@@ -7766,9 +7784,7 @@ try {
     if (!bodycam_ue554_dx12_validate_texture(
             rhi_texture, &native, &desc, reinterpret_cast<ID3D12Resource*>(native_address)) ||
         reinterpret_cast<uintptr_t>(native) != native_address ||
-        (desc.Format != DXGI_FORMAT_B8G8R8A8_TYPELESS &&
-         desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
-         desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) ||
+        !is_native_fix_texture_dxgi_format(desc.Format) ||
         desc.Width != expected_width || desc.Height != expected_height ||
         desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1)
     {
@@ -7856,8 +7872,7 @@ try {
         reinterpret_cast<uintptr_t>(device.Get()), desc.Width, desc.Height,
         desc.MipLevels, desc.DepthOrArraySize, desc.SampleDesc.Count,
         desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-            desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        is_native_fix_texture_dxgi_format(desc.Format),
         (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0,
         (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0,
         (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0,
@@ -17887,8 +17902,11 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
             // validated DX12 render setup is known to be active.
             sw_zero_company_ue56_install_nanite_hologram_guard();
         } else {
-            cvar_values[0] = 0; // 8bit RGBA, which is what VR headsets support
-            cvar_values[1] = 0;
+            // 8bit RGBA, which is what VR headsets support. The Flat3D StereoShutter output keeps the
+            // bit depth the engine draws with instead (VR::choose_flat3d_eye_pixel_format).
+            const auto pixel_format = VR::get()->choose_flat3d_eye_pixel_format();
+            cvar_values[0] = pixel_format;
+            cvar_values[1] = pixel_format;
         }
     } else {
         SPDLOG_ERROR("Failed to find backbuffer format cvar, continuing anyways...");
@@ -38955,7 +38973,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                 y = (int32_t)requested_height;
 
                 auto* format = copied_desc.data() + i + 15;
-                if (*format == 18) {
+                if (*format == 18 || (*format == 10 && VR::get()->flat3d_eye_pixel_format() != 0)) {
                     *format = 2;
                 }
 
@@ -39382,6 +39400,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
             int32_t old_width{};
             int32_t old_height{};
+            uint8_t old_format{};
             for (auto i = 0; i < 0x100; ++i) {
                 auto& x = *(int32_t*)(ctx.r9 + i);
                 auto& y = *(int32_t*)(ctx.r9 + i + 4);
@@ -39399,9 +39418,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                     y = size.y;
 
                     uint8_t* format = (uint8_t*)(ctx.r9 + width_offset.value() + 15);
+                    old_format = *format;
 
-                    // some games have 10 bit format
-                    if (*format == 18) {
+                    // some games have 10 bit format, and under the Flat3D StereoShutter output with
+                    // scRGB the stereo render target is FloatRGBA: the UI texture made here is 8-bit
+                    if (*format == 18 || (*format == 10 && VR::get()->flat3d_eye_pixel_format() != 0)) {
                         *format = 2; // PF_B8G8R8A8
                     }
 
@@ -39423,6 +39444,13 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                 x = old_width;
                 y = old_height;
+
+                // The Flat3D StereoShutter output keeps the bit depth it chose for the
+                // stereo render target (VR::choose_flat3d_eye_pixel_format): only the
+                // UI texture made above is 8-bit.
+                if (VR::get()->flat3d_eye_pixel_format() != 0) {
+                    *(uint8_t*)(ctx.r9 + *width_offset + 15) = old_format;
+                }
             }
 
             if (rtm->texture_hook_ref == nullptr || rtm->texture_hook_ref->texture == nullptr) {
@@ -39559,6 +39587,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                 int32_t old_width{};
                 int32_t old_height{};
+                uint8_t old_format{};
 
                 for (auto i = 0; i < 0x100; ++i) {
                     auto& x = *(int32_t*)(ctx.rdx + i);
@@ -39575,6 +39604,16 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                         x = size.x;
                         y = size.y;
+
+                        // The Flat3D StereoShutter output keeps the engine's bit depth for the
+                        // stereo render target (VR::choose_flat3d_eye_pixel_format): the UI
+                        // texture made here stays 8-bit.
+                        uint8_t* format = (uint8_t*)(ctx.rdx + i + 15);
+                        old_format = *format;
+
+                        if (VR::get()->flat3d_eye_pixel_format() != 0 && (*format == 18 || *format == 10)) {
+                            *format = 2; // PF_B8G8R8A8
+                        }
                         break;
                     }
                 }
@@ -39587,6 +39626,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                     x = old_width;
                     y = old_height;
+                    *(uint8_t*)(ctx.rdx + *width_offset + 15) = old_format;
                 }
 
                 if (rtm->texture_hook_ref == nullptr || rtm->texture_hook_ref->texture == nullptr) {
@@ -39594,8 +39634,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                     rtm->texture_hook_ref = (FTexture2DRHIRef*)ctx.rcx;
                 }
             } else {
-                // Format
-                ctx.r9 = 2; // PF_B8G8R8A8
+                // Format: 8-bit, unless the Flat3D StereoShutter output keeps the engine's bit
+                // depth for the stereo render target (VR::choose_flat3d_eye_pixel_format).
+                if (VR::get()->flat3d_eye_pixel_format() == 0) {
+                    ctx.r9 = 2; // PF_B8G8R8A8
+                }
 
                 void (*func)(
                     FTexture2DRHIRef* out,
@@ -39618,7 +39661,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                     stack_args[7], stack_args[8], stack_args[9]);
             }
         } else {
-            ctx.r8 = 2; // PF_B8G8R8A8
+            // Format: 8-bit, unless the Flat3D StereoShutter output keeps the engine's bit depth
+            // for the stereo render target (VR::choose_flat3d_eye_pixel_format).
+            if (VR::get()->flat3d_eye_pixel_format() == 0) {
+                ctx.r8 = 2; // PF_B8G8R8A8
+            }
 
             std::optional<int> previous_stack_found_index{};
             std::optional<int> previous_stack_repeating_index{};
@@ -40066,13 +40113,10 @@ bool VRRenderTargetManager_Base::publish_scene_capture_target_snapshot(
             texture->GetDevice(&resource_device);
             const auto& hook = g_framework->get_d3d11_hook();
             const auto expected_device = hook != nullptr ? hook->get_device() : nullptr;
-            const bool bgra_compatible =
-                desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
-                desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            const bool format_compatible = is_native_fix_texture_dxgi_format(desc.Format);
             resource_valid =
                 expected_device != nullptr && resource_device.Get() == expected_device &&
-                bgra_compatible && desc.Width == expected_width && desc.Height == expected_height &&
+                format_compatible && desc.Width == expected_width && desc.Height == expected_height &&
                 desc.MipLevels == 1 && desc.ArraySize == 1 && desc.SampleDesc.Count == 1;
             if (!resource_valid && sdk::kh3::is_process()) {
                 static std::atomic_uint32_t rejected_descriptors{};
@@ -40096,13 +40140,10 @@ bool VRRenderTargetManager_Base::publish_scene_capture_target_snapshot(
             texture->GetDevice(IID_PPV_ARGS(&resource_device));
             const auto& hook = g_framework->get_d3d12_hook();
             const auto expected_device = hook != nullptr ? hook->get_device() : nullptr;
-            const bool bgra_compatible =
-                desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
-                desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            const bool format_compatible = is_native_fix_texture_dxgi_format(desc.Format);
             resource_valid =
                 expected_device != nullptr && resource_device.Get() == expected_device &&
-                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && bgra_compatible &&
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && format_compatible &&
                 desc.Width == expected_width && desc.Height == expected_height &&
                 desc.MipLevels == 1 && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1;
             seen = {static_cast<uint32_t>(desc.Format), desc.Width, desc.Height, desc.MipLevels, desc.DepthOrArraySize,
@@ -40200,13 +40241,10 @@ VRRenderTargetManager_Base::get_preservable_scene_capture_for_same_size_realloca
     const auto& hook = g_framework->get_d3d12_hook();
     const auto expected_device = hook != nullptr ? hook->get_device() : nullptr;
     const auto desc = texture->GetDesc();
-    const bool bgra_compatible =
-        desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
-        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool format_compatible = is_native_fix_texture_dxgi_format(desc.Format);
 
     if (expected_device == nullptr || resource_device.Get() != expected_device ||
-        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !bgra_compatible ||
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !format_compatible ||
         desc.Width != width || desc.Height != height ||
         desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1)
     {
@@ -42456,11 +42494,13 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     if (sdk::kh3::is_process() && g_framework->is_dx11() && VR::get()->is_native_stereo_fix_enabled()) {
         tgt_raw = create_kh3_native_capture_target(ugs, world, target_width, target_height);
     } else if (kismet_rendering != nullptr) {
+        // RTF_RGBA8, or the format matching the stereo render target's bit depth under the Flat3D
+        // StereoShutter output (the compositor copies this eye into the same texture format).
         tgt_raw = kismet_rendering->create_render_target_2d(
             world,
             target_width,
             target_height,
-            2,
+            VR::get()->flat3d_capture_target_format(),
             clear_color,
             false);
     } else {

@@ -91,9 +91,10 @@ DXGI_FORMAT screenshot_8bit_format(DXGI_FORMAT backbuffer_format) {
 } // namespace
 
 bool Flat3DCompositorD3D12::setup(ID3D12Device* device, uint32_t eye_w, uint32_t eye_h, DXGI_FORMAT eye_format,
-                                  DXGI_FORMAT backbuffer_format, bool backbuffer_pq) {
+                                  DXGI_FORMAT backbuffer_format, bool backbuffer_pq, bool eyes_in_output_encoding) {
     if (m_ready && eye_w == m_eye_w && eye_h == m_eye_h && eye_format == m_eye_format &&
-        backbuffer_format == m_backbuffer_format && backbuffer_pq == m_backbuffer_pq && device == m_device) {
+        backbuffer_format == m_backbuffer_format && backbuffer_pq == m_backbuffer_pq &&
+        eyes_in_output_encoding == m_eyes_in_output_encoding && device == m_device) {
         return true;
     }
 
@@ -106,6 +107,7 @@ bool Flat3DCompositorD3D12::setup(ID3D12Device* device, uint32_t eye_w, uint32_t
     m_device = device;
     m_backbuffer_format = backbuffer_format;
     m_backbuffer_pq = backbuffer_pq;
+    m_eyes_in_output_encoding = eyes_in_output_encoding;
 
     switch (backbuffer_format) {
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
@@ -116,8 +118,9 @@ bool Flat3DCompositorD3D12::setup(ID3D12Device* device, uint32_t eye_w, uint32_t
     case DXGI_FORMAT_R10G10B10A2_TYPELESS:
         // 10-bit is NOT inherently HDR: SDR games commonly run R10G10B10A2
         // swapchains with plain G22 gamma. PQ-encoding those washes the
-        // image out — only treat as HDR10 when the game explicitly set a PQ
-        // color space (SetColorSpace1, tracked by the swapchain hook).
+        // image out — only treat as HDR10 when the game set a PQ color space
+        // (SetColorSpace1, tracked by the swapchain hook) or, under the
+        // StereoShutter output, the engine reports PQ output.
         m_colorspace = backbuffer_pq ? Flat3DColorSpace::HDR10_PQ : Flat3DColorSpace::SDR;
         break;
     default:
@@ -129,7 +132,7 @@ bool Flat3DCompositorD3D12::setup(ID3D12Device* device, uint32_t eye_w, uint32_t
         eye_format == DXGI_FORMAT_B8G8R8A8_UNORM || eye_format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
         eye_format == DXGI_FORMAT_R8G8B8A8_UNORM || eye_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
         eye_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || eye_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    m_src_srgb = eye_is_8bit && m_colorspace != Flat3DColorSpace::SDR;
+    m_src_srgb = eye_is_8bit && m_colorspace != Flat3DColorSpace::SDR && !eyes_in_output_encoding;
 
     // Assigned before create_pipelines — the overlay PSO keys on m_eye_format.
     m_eye_w = eye_w;
@@ -624,6 +627,10 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
                                       float* out_ui_coverage,
                                       HWND hwnd,
                                       D3D12_RESOURCE_STATES scene_depth_state) {
+    // Handed to the plugins only when this composite() draws it (step 3c) and
+    // its list reaches the queue.
+    m_stereo_pair_drawn = false;
+
     if (out_center_uu != nullptr) *out_center_uu = m_center_ema_uu;
     if (out_nearest_uu != nullptr) *out_nearest_uu = -1.0f;
     if (out_ui_coverage != nullptr) *out_ui_coverage = m_coverage_ema;
@@ -818,6 +825,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         copy_half(0);
         copy_half(1);
     }
+
+    m_eye_refresh_mask = eye_refresh_mask; // reported with the plugin pair (eye_refresh_mask())
 
     barrier(cmd, double_wide, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
 
@@ -1485,6 +1494,11 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         barrier(cmd, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     }
 
+    // --- 3c. StereoShutter: the pair for the plugin callback ------------------
+    if (params.stereo_pair_wanted) {
+        build_stereo_pair(cmd, params, out_w, out_h);
+    }
+
     // --- 4. Optional SceneDepthZ stripe readback -----------------------------
     if (params.want_depth && !m_depth_disabled && scene_depth != nullptr && nearz_uu > 0.0f) {
         const auto sd_desc = scene_depth->GetDesc();
@@ -1628,6 +1642,12 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         m_coverage_copied[slot] = false;
         spdlog::error("[Flat3D][D3D12] coverage readback invalidated the command list — disabling "
                       "full-screen-GUI coverage detection");
+    }
+
+    // A list that did not reach the queue (its Close failed, or the context is
+    // unusable) drew no pair this present.
+    if (ctx.last_close_failed || !ctx.ready()) {
+        m_stereo_pair_drawn = false;
     }
 
     ++m_frame;
@@ -1996,6 +2016,113 @@ void Flat3DCompositorD3D12::build_sbs(ID3D12GraphicsCommandList* cmd, const Flat
     barrier(cmd, m_sbs_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
+void Flat3DCompositorD3D12::build_stereo_pair(ID3D12GraphicsCommandList* cmd, const Flat3DFrameParams& params,
+                                              uint32_t out_w, uint32_t out_h) {
+    // The pair handed to plugins (output mode StereoShutter): both eyes side by
+    // side, each at the output's size, in the backbuffer's format and color
+    // space, drawn with the backbuffer repack PSO in SbS mode so that each eye
+    // comes out exactly as the backbuffer repack would draw it (eye swap, the
+    // symmetric-projection convergence, ghost reduction, HDR encoding).
+    const DXGI_FORMAT fmt = view_format_for(m_backbuffer_format);
+    if (m_stereo_pair_tex == nullptr && m_stereo_pair_failed && m_stereo_pair_w == out_w &&
+        m_stereo_pair_h == out_h && m_stereo_pair_fmt == fmt) {
+        return; // already failed for this size and format: not retried every frame
+    }
+    if (m_stereo_pair_tex == nullptr || m_stereo_pair_w != out_w || m_stereo_pair_h != out_h ||
+        m_stereo_pair_fmt != fmt) {
+        m_stereo_pair_tex.Reset();
+        m_stereo_pair_w = out_w;
+        m_stereo_pair_h = out_h;
+        m_stereo_pair_fmt = fmt;
+        m_stereo_pair_failed = false;
+
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = (uint64_t)out_w * 2;
+        desc.Height = out_h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = fmt;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                     IID_PPV_ARGS(&m_stereo_pair_tex)))) {
+            spdlog::error("[Flat3D][D3D12] Failed to create the stereo pair texture ({}x{}, format {})", out_w * 2, out_h, (int)fmt);
+            m_stereo_pair_tex.Reset();
+            m_stereo_pair_failed = true;
+            return;
+        }
+
+        if (m_stereo_pair_rtv_heap == nullptr) {
+            D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+            heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            heap_desc.NumDescriptors = 1;
+
+            if (FAILED(m_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&m_stereo_pair_rtv_heap)))) {
+                spdlog::error("[Flat3D][D3D12] Failed to create the stereo pair RTV heap");
+                m_stereo_pair_tex.Reset();
+                m_stereo_pair_failed = true;
+                return;
+            }
+        }
+
+        D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
+        rtv_desc.Format = fmt;
+        rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        m_device->CreateRenderTargetView(m_stereo_pair_tex.Get(), &rtv_desc,
+                                         m_stereo_pair_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+
+        spdlog::info("[Flat3D][D3D12] Stereo pair for plugins: {}x{}, format {}, color space {} (eyes: format {}{})",
+                     out_w * 2, out_h, (int)fmt, dxgi_color_space_of(m_colorspace), (int)m_eye_format,
+                     m_src_srgb ? ", encoded from sRGB" : "");
+    }
+
+    if (m_repack_pso == nullptr) {
+        return;
+    }
+
+    barrier(cmd, m_stereo_pair_tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    cmd->SetPipelineState(m_repack_pso.Get());
+    auto rtv = m_stereo_pair_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    D3D12_VIEWPORT viewport{};
+    viewport.Width = (float)(m_stereo_pair_w * 2);
+    viewport.Height = (float)m_stereo_pair_h;
+    viewport.MaxDepth = 1.0f;
+    cmd->RSSetViewports(1, &viewport);
+
+    D3D12_RECT scissor{0, 0, (LONG)(m_stereo_pair_w * 2), (LONG)m_stereo_pair_h};
+    cmd->RSSetScissorRects(1, &scissor);
+
+    RepackConstants constants{};
+    constants.out_size[0] = (int32_t)(m_stereo_pair_w * 2);
+    constants.out_size[1] = (int32_t)m_stereo_pair_h;
+    constants.mode = (int32_t)Flat3DOutputMode::SBS;
+    constants.eye_swap = params.eye_swap ? 1 : 0;
+    constants.colorspace = (int32_t)m_colorspace;
+    constants.paper_white = params.paper_white_nits;
+    constants.src_srgb = m_src_srgb ? 1 : 0;
+    constants.ghost_contrast = params.ghost_contrast;
+    constants.ghost_lift = params.ghost_lift;
+    constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
+    constants.scene_scale = params.scene_scale;
+
+    cmd->SetGraphicsRoot32BitConstants(0, 12, &constants, 0);
+    cmd->SetGraphicsRootDescriptorTable(1, m_srv_heap->GetGPUDescriptorHandleForHeapStart()); // t0/t1 = eyes
+
+    cmd->DrawInstanced(3, 1, 0, 0);
+
+    barrier(cmd, m_stereo_pair_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_stereo_pair_drawn = true;
+}
+
 bool Flat3DCompositorD3D12::save_screenshot(ID3D12CommandQueue* queue, const Flat3DFrameParams& params,
                                             const std::wstring& parallel_path, const std::wstring& crossview_path) {
     if (!m_ready || queue == nullptr || m_screenshot_pso == nullptr ||
@@ -2357,6 +2484,14 @@ void Flat3DCompositorD3D12::reset() {
     m_screenshot_w = 0;
     m_screenshot_h = 0;
     m_screenshot_fmt = DXGI_FORMAT_UNKNOWN;
+
+    m_stereo_pair_tex.Reset();
+    m_stereo_pair_rtv_heap.Reset();
+    m_stereo_pair_w = 0;
+    m_stereo_pair_h = 0;
+    m_stereo_pair_fmt = DXGI_FORMAT_UNKNOWN;
+    m_stereo_pair_failed = false;
+    m_stereo_pair_drawn = false;
 
     m_srv_heap.Reset();
     m_rtv_heap.Reset();

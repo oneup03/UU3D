@@ -28,7 +28,8 @@ namespace {
 // yields a normal landscape per-eye aspect (~16:9); "splitting" a half-packed
 // frame yields an implausible portrait/ultrawide aspect. Only split when the
 // result stays in a plausible single-eye landscape band. Interlaced /
-// checkerboard / anaglyph / Katanga carry a full-frame eye, so never split.
+// checkerboard / anaglyph / Katanga / StereoShutter carry a full-frame eye, so
+// never split.
 void apply_eye_split(uint32_t& w, uint32_t& h) {
     if (w == 0 || h == 0) {
         return;

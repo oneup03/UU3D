@@ -172,9 +172,11 @@ DXGI_FORMAT screenshot_8bit_format(DXGI_FORMAT backbuffer_format) {
 } // namespace
 
 bool Flat3DCompositorD3D11::setup(ID3D11Device* device, uint32_t eye_w, uint32_t eye_h, DXGI_FORMAT eye_format,
-                                  DXGI_FORMAT backbuffer_format, bool backbuffer_pq, HWND hwnd) {
+                                  DXGI_FORMAT backbuffer_format, bool backbuffer_pq, HWND hwnd,
+                                  bool eyes_in_output_encoding) {
     if (m_ready && eye_w == m_eye_w && eye_h == m_eye_h && eye_format == m_eye_format &&
-        backbuffer_format == m_backbuffer_format && backbuffer_pq == m_backbuffer_pq) {
+        backbuffer_format == m_backbuffer_format && backbuffer_pq == m_backbuffer_pq &&
+        eyes_in_output_encoding == m_eyes_in_output_encoding) {
         m_hwnd = hwnd;
         return true;
     }
@@ -188,11 +190,13 @@ bool Flat3DCompositorD3D11::setup(ID3D11Device* device, uint32_t eye_w, uint32_t
     m_hwnd = hwnd;
     m_backbuffer_format = backbuffer_format;
     m_backbuffer_pq = backbuffer_pq;
+    m_eyes_in_output_encoding = eyes_in_output_encoding;
 
     // HDR colorspace from the swapchain format. R16F is unambiguously scRGB.
     // 10-bit is NOT inherently HDR: SDR games commonly run R10G10B10A2
     // swapchains with plain G22 gamma — PQ-encoding those washes the image
-    // out. Only treat as HDR10 when the game explicitly set a PQ color space.
+    // out. Only treat as HDR10 when backbuffer_pq is set (on D3D11 it comes
+    // from the engine's own HDR report under the StereoShutter output).
     switch (backbuffer_format) {
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
     case DXGI_FORMAT_R16G16B16A16_TYPELESS:
@@ -213,7 +217,7 @@ bool Flat3DCompositorD3D11::setup(ID3D11Device* device, uint32_t eye_w, uint32_t
         eye_format == DXGI_FORMAT_B8G8R8A8_UNORM || eye_format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
         eye_format == DXGI_FORMAT_R8G8B8A8_UNORM || eye_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
         eye_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || eye_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    m_src_srgb = eye_is_8bit && m_colorspace != Flat3DColorSpace::SDR;
+    m_src_srgb = eye_is_8bit && m_colorspace != Flat3DColorSpace::SDR && !eyes_in_output_encoding;
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = eye_w;
@@ -609,6 +613,9 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
                                       uint32_t out_w, uint32_t out_h,
                                       const Flat3DFrameParams& params,
                                       float* out_ui_coverage) {
+    // Handed to the plugins only when this composite() draws it (step 3c).
+    m_stereo_pair_drawn = false;
+
     if (out_ui_coverage != nullptr) {
         *out_ui_coverage = m_coverage_ema;
     }
@@ -814,6 +821,8 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
         copy_half(0);
         copy_half(1);
     }
+
+    m_eye_refresh_mask = eye_refresh_mask; // reported with the plugin pair (eye_refresh_mask())
 
     ScopedD3D11State state_backup{context};
 
@@ -1286,7 +1295,120 @@ bool Flat3DCompositorD3D11::composite(ID3D11DeviceContext* context,
 
     context->Draw(3, 0);
 
+    // --- 3c. StereoShutter: the pair for the plugin callback ------------------
+    if (params.stereo_pair_wanted) {
+        build_stereo_pair(context, params, out_w, out_h);
+    }
+
     return true;
+}
+
+void Flat3DCompositorD3D11::build_stereo_pair(ID3D11DeviceContext* context, const Flat3DFrameParams& params,
+                                              uint32_t out_w, uint32_t out_h) {
+    // The pair handed to plugins (output mode StereoShutter): both eyes side by
+    // side, each at the output's size, in the backbuffer's format and color
+    // space, drawn with the repack shader in SbS mode so that each eye comes out
+    // exactly as the backbuffer repack draws it (eye swap, the symmetric-
+    // projection convergence, ghost reduction, HDR encoding).
+    const DXGI_FORMAT fmt = view_format_for(m_backbuffer_format);
+    if (m_stereo_pair_tex == nullptr && m_stereo_pair_failed && m_stereo_pair_w == out_w &&
+        m_stereo_pair_h == out_h && m_stereo_pair_fmt == fmt) {
+        return; // already failed for this size and format: not retried every frame
+    }
+    if (m_stereo_pair_tex == nullptr || m_stereo_pair_w != out_w || m_stereo_pair_h != out_h ||
+        m_stereo_pair_fmt != fmt) {
+        ComPtr<ID3D11Device> device{};
+        context->GetDevice(&device);
+
+        m_stereo_pair_tex.Reset();
+        m_stereo_pair_rtv.Reset();
+        m_stereo_pair_w = out_w;
+        m_stereo_pair_h = out_h;
+        m_stereo_pair_fmt = fmt;
+        m_stereo_pair_failed = false;
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = out_w * 2;
+        desc.Height = out_h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = fmt;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_stereo_pair_tex))) {
+            spdlog::error("[Flat3D] Failed to create the stereo pair texture ({}x{}, format {})", out_w * 2, out_h, (int)fmt);
+            m_stereo_pair_tex.Reset();
+            m_stereo_pair_failed = true;
+            return;
+        }
+
+        if (FAILED(device->CreateRenderTargetView(m_stereo_pair_tex.Get(), nullptr, &m_stereo_pair_rtv))) {
+            spdlog::error("[Flat3D] Failed to create the stereo pair RTV");
+            m_stereo_pair_tex.Reset();
+            m_stereo_pair_failed = true;
+            return;
+        }
+
+        spdlog::info("[Flat3D] Stereo pair for plugins: {}x{}, format {}, color space {} (eyes: format {}{})",
+                     out_w * 2, out_h, (int)fmt, dxgi_color_space_of(m_colorspace), (int)m_eye_format,
+                     m_src_srgb ? ", encoded from sRGB" : "");
+    }
+
+    RepackConstants constants{};
+    constants.out_size[0] = (int32_t)(m_stereo_pair_w * 2);
+    constants.out_size[1] = (int32_t)m_stereo_pair_h;
+    constants.mode = (int32_t)Flat3DOutputMode::SBS;
+    constants.eye_swap = params.eye_swap ? 1 : 0;
+    constants.colorspace = (int32_t)m_colorspace;
+    constants.paper_white = params.paper_white_nits;
+    constants.src_srgb = m_src_srgb ? 1 : 0;
+    constants.ghost_contrast = params.ghost_contrast;
+    constants.ghost_lift = params.ghost_lift;
+    constants.scene_shift_uv = params.scene_shift_px / (float)m_eye_w;
+    constants.scene_scale = params.scene_scale;
+    context->UpdateSubresource(m_cb.Get(), 0, nullptr, &constants, 0, 0);
+
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(m_vs.Get(), nullptr, 0);
+    context->PSSetShader(m_ps.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->HSSetShader(nullptr, nullptr, 0);
+    context->DSSetShader(nullptr, nullptr, 0);
+
+    ID3D11Buffer* cbs[] = {m_cb.Get()};
+    context->PSSetConstantBuffers(0, 1, cbs);
+
+    ID3D11ShaderResourceView* eye_srvs[] = {m_eye_srv[0].Get(), m_eye_srv[1].Get()};
+    context->PSSetShaderResources(0, 2, eye_srvs);
+
+    ID3D11SamplerState* samplers[] = {m_sampler.Get()};
+    context->PSSetSamplers(0, 1, samplers);
+
+    context->RSSetState(m_rasterizer.Get());
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = (float)(m_stereo_pair_w * 2);
+    viewport.Height = (float)m_stereo_pair_h;
+    viewport.MaxDepth = 1.0f;
+    context->RSSetViewports(1, &viewport);
+
+    D3D11_RECT scissor{0, 0, (LONG)(m_stereo_pair_w * 2), (LONG)m_stereo_pair_h};
+    context->RSSetScissorRects(1, &scissor);
+
+    context->OMSetBlendState(m_blend.Get(), nullptr, 0xFFFFFFFF);
+    context->OMSetDepthStencilState(m_depth.Get(), 0);
+
+    ID3D11RenderTargetView* rtvs[] = {m_stereo_pair_rtv.Get()};
+    context->OMSetRenderTargets(1, rtvs, nullptr);
+
+    context->Draw(3, 0);
+
+    // composite()'s ScopedD3D11State restores the game's bindings, unbinding
+    // this target, before the plugins get the pair.
+    m_stereo_pair_drawn = true;
 }
 
 // Draws the game-UI layer (at GUI depth), the extracted crosshair region (at
@@ -2502,6 +2624,14 @@ void Flat3DCompositorD3D11::reset() {
     m_screenshot_w = 0;
     m_screenshot_h = 0;
     m_screenshot_fmt = DXGI_FORMAT_UNKNOWN;
+
+    m_stereo_pair_tex.Reset();
+    m_stereo_pair_rtv.Reset();
+    m_stereo_pair_w = 0;
+    m_stereo_pair_h = 0;
+    m_stereo_pair_fmt = DXGI_FORMAT_UNKNOWN;
+    m_stereo_pair_failed = false;
+    m_stereo_pair_drawn = false;
 
     m_eye_w = 0;
     m_eye_h = 0;

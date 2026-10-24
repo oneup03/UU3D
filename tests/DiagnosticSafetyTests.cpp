@@ -68,6 +68,16 @@ SDK_PREFIX_SLOT(game_viewport_client, 23);
 SDK_PREFIX_SLOT(owned_fname, 24);
 #undef SDK_PREFIX_SLOT
 static_assert(sizeof(UEVR_FNameFunctions) == 2 * sizeof(void*));
+// The 2.42 stereo pair callbacks are appended to the plugin callback table.
+#define CALLBACK_SLOT(member, index) static_assert(offsetof(UEVR_PluginCallbacks, member) == (index) * sizeof(void*))
+CALLBACK_SLOT(on_custom_event, 7);
+CALLBACK_SLOT(on_stereo_pair_dx11, 8);
+CALLBACK_SLOT(on_stereo_pair_dx12, 9);
+#undef CALLBACK_SLOT
+static_assert(sizeof(UEVR_PluginCallbacks) == 10 * sizeof(void*));
+static_assert(sizeof(UEVR_StereoPairInfo) == 64);
+static_assert(offsetof(UEVR_StereoPairInfo, frame) == 32);
+static_assert(offsetof(UEVR_StereoPairInfo, eyes_fresh) == 40);
 static_assert(UEVR_PLUGIN_VERSION_MAJOR == 2 && UEVR_PLUGIN_VERSION_MINOR >= 40);
 
 int failures{};

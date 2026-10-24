@@ -32,6 +32,8 @@
 #include <utility/String.hpp>
 
 #include <sdk/CVar.hpp>
+#include <sdk/FName.hpp>
+#include <sdk/TArray.hpp>
 #include <sdk/FBoolProperty.hpp>
 #include <sdk/UFunction.hpp>
 #include <sdk/UEngine.hpp>
@@ -1561,6 +1563,135 @@ struct OpenTrackReceiver {
 OpenTrackReceiver g_opentrack{};
 } // namespace
 
+namespace {
+// The value of an ETextureRenderTargetFormat entry, read by name from the engine's
+// own reflection data: the numbering moved when RTF_RGBA8_SRGB was added. UEnum
+// keeps its entries as TArray<TPair<FName, int64>> shortly after its UField
+// part; an array there is accepted only when its first entry reads RTF_R8.
+std::optional<uint8_t> find_render_target_format(std::wstring_view entry) try {
+    const auto e = sdk::find_uobject<sdk::UObject>(L"Enum /Script/Engine.ETextureRenderTargetFormat");
+
+    // Entry assumes the 8-byte FName; case-preserving builds use a larger one.
+    if (e == nullptr || sdk::FName::s_is_case_preserving) {
+        return std::nullopt;
+    }
+
+    struct Entry {
+        sdk::FName name;
+        int64_t value;
+    };
+
+    for (uintptr_t offset = 0x28; offset <= 0x70; offset += sizeof(void*)) {
+        const auto names = (const sdk::TArrayLite<Entry>*)((uintptr_t)e + offset);
+
+        if (IsBadReadPtr(names, sizeof(*names)) || names->data == nullptr || names->count < 8 || names->count > 32 ||
+            IsBadReadPtr(names->data, sizeof(Entry) * names->count)) {
+            continue;
+        }
+
+        if (!names->data[0].name.to_string_no_numbers().ends_with(L"RTF_R8")) {
+            continue;
+        }
+
+        for (int32_t i = 0; i < names->count; ++i) {
+            const auto value = names->data[i].value;
+
+            if (names->data[i].name.to_string_no_numbers().ends_with(entry) && value >= 0 && value < 64) {
+                return (uint8_t)value;
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    return std::nullopt;
+} catch (...) {
+    return std::nullopt;
+}
+
+// What the engine outputs, from its own console variables (VR::Flat3DEngineHdr).
+int32_t read_flat3d_engine_hdr() {
+    const auto enabled = sdk::get_cvar_int(L"Engine", L"r.HDR.EnableHDROutput");
+
+    if (!enabled || *enabled == 0) {
+        return VR::FLAT3D_ENGINE_HDR_OFF;
+    }
+
+    // EDisplayOutputFormat: 3/4 = ACES 1000/2000 nit ST 2084, 5/6 = ACES 1000/2000 nit scRGB.
+    const auto device = sdk::get_cvar_int(L"Engine", L"r.HDR.Display.OutputDevice");
+
+    if (device && (*device == 3 || *device == 4)) {
+        return VR::FLAT3D_ENGINE_HDR_PQ;
+    }
+
+    if (device && (*device == 5 || *device == 6)) {
+        return VR::FLAT3D_ENGINE_HDR_SCRGB;
+    }
+
+    return VR::FLAT3D_ENGINE_HDR_OFF;
+}
+} // namespace
+
+int32_t VR::choose_flat3d_eye_pixel_format() {
+    int32_t format = 0; // B8G8R8A8
+    uint8_t capture = 2; // RTF_RGBA8
+
+    // Only while the engine outputs HDR and Force SDR Output is off: otherwise the
+    // eyes stay at the 8 bits they always had (with the toggle on, the engine's HDR
+    // is switched off). scRGB (r.HDR.Display.OutputDevice 5/6) goes beyond 1.0 and
+    // below 0, so it takes FP16; ST 2084 fits 10 bits. The right eye's scene
+    // capture must match, as the compositor copies it into the same eye texture
+    // format.
+    if (is_using_flat3d() && m_flat3d_output_mode->value() == (int32_t)vrmod::flat3d::Flat3DOutputMode::STEREOSHUTTER &&
+        !m_flat3d_force_sdr->value()) {
+        // The same reading of the engine's cvars that labels the pair.
+        const auto engine_hdr = read_flat3d_engine_hdr();
+
+        if (engine_hdr != FLAT3D_ENGINE_HDR_OFF) {
+            const bool scrgb = engine_hdr == FLAT3D_ENGINE_HDR_SCRGB;
+            const auto capture_format = find_render_target_format(scrgb ? L"RTF_RGBA16f" : L"RTF_RGB10A2");
+
+            if (capture_format) {
+                format = scrgb ? 3 : 4; // FloatRGBA : A2B10G10R10
+                capture = *capture_format;
+                spdlog::info("[Flat3D] StereoShutter output: the stereo render target keeps the engine's bit depth, "
+                             "{} (scene capture format {})",
+                             scrgb ? "FP16 for scRGB" : "10 bits for HDR10", (uint32_t)capture);
+            } else {
+                spdlog::warn("[Flat3D] StereoShutter output: the engine outputs HDR but ETextureRenderTargetFormat "
+                             "could not be read; the stereo render target stays 8-bit");
+            }
+        }
+    }
+
+    m_flat3d_capture_target_format.store(capture, std::memory_order_release);
+    m_flat3d_eye_pixel_format.store(format, std::memory_order_release);
+    return format;
+}
+
+void VR::flat3d_note_stereo_pair_consumer(bool output_selected, bool consumer_present) {
+    const bool missing = output_selected && !consumer_present;
+    m_flat3d_stereo_pair_consumer_missing.store(missing, std::memory_order_release);
+
+    if (!missing || m_flat3d_stereo_pair_consumer_warned.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    spdlog::warn("[Flat3D] StereoShutter output: no plugin takes the stereo pair on this renderer "
+                 "(StereoShutter is not installed); the game shows the left eye only");
+
+    // On its own thread, so the present that noticed it is not held while the box is open.
+    std::thread{[] {
+        MessageBoxW(nullptr,
+                    L"The StereoShutter output is selected, but StereoShutter is not installed: no UU3D "
+                    L"plugin takes the stereo pair, so the game shows the left eye only and there is no "
+                    L"3D picture.\n\n"
+                    L"Install StereoShutter first, or choose another output in the UU3D menu: "
+                    L"3D Display > Output Mode.",
+                    L"UU3D", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    }}.detach();
+}
+
 std::optional<std::string> VR::initialize_flat3d() {
     spdlog::info("[Flat3D] Initializing flat 3D monitor mode");
 
@@ -2935,9 +3066,14 @@ void VR::update_flat3d_params() {
 
         // FP16 is unambiguously HDR (scRGB); 10-bit only counts as HDR when
         // the game explicitly set a PQ color space — SDR titles commonly run
-        // R10G10B10A2 swapchains with plain G22 gamma.
+        // R10G10B10A2 swapchains with plain G22 gamma. Under the StereoShutter
+        // output the engine's own report (flat3d_engine_hdr) counts too: it
+        // also catches a color space the game set before injection.
+        const bool engine_hdr = mode == vrmod::flat3d::Flat3DOutputMode::STEREOSHUTTER &&
+                                flat3d_engine_hdr() != FLAT3D_ENGINE_HDR_OFF;
         const bool is_hdr = bb_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                            (bb_fmt == DXGI_FORMAT_R10G10B10A2_UNORM && bb_pq);
+                            (bb_fmt == DXGI_FORMAT_R10G10B10A2_UNORM && bb_pq) ||
+                            engine_hdr;
 
         if (is_hdr) {
             static std::chrono::steady_clock::time_point last_sdr_nudge{};
@@ -2945,8 +3081,8 @@ void VR::update_flat3d_params() {
 
             if (now - last_sdr_nudge > std::chrono::seconds(10)) {
                 last_sdr_nudge = now;
-                spdlog::info("[Flat3D] Force SDR: swapchain is HDR (format {}) — disabling engine HDR output",
-                             (uint32_t)bb_fmt);
+                spdlog::info("[Flat3D] Force SDR: HDR output (swapchain format {}{}) — disabling engine HDR output",
+                             (uint32_t)bb_fmt, engine_hdr ? ", the engine reports HDR" : "");
 
                 GameThreadWorker::get().enqueue([]() {
                     if (auto* engine = sdk::UEngine::get(); engine != nullptr) {
@@ -2955,6 +3091,37 @@ void VR::update_flat3d_params() {
                 });
             }
         }
+    }
+
+    // --- StereoShutter: the engine's own HDR output --------------------------
+    // The pair is labeled with what the engine outputs (flat3d_engine_hdr), also
+    // when the game switched HDR on before UU3D was injected.
+    if (mode == vrmod::flat3d::Flat3DOutputMode::STEREOSHUTTER) {
+        static std::chrono::steady_clock::time_point last_engine_hdr_read{};
+        const auto engine_hdr_now = std::chrono::steady_clock::now();
+
+        if (engine_hdr_now - last_engine_hdr_read > std::chrono::seconds(1)) {
+            last_engine_hdr_read = engine_hdr_now;
+
+            // The cvar lookups share a cache the game thread writes: read them there.
+            GameThreadWorker::get().enqueue([this]() {
+                static bool engine_hdr_logged = false;
+                const auto engine_hdr = read_flat3d_engine_hdr();
+
+                if (m_flat3d_engine_hdr.exchange(engine_hdr) != engine_hdr || !engine_hdr_logged) {
+                    engine_hdr_logged = true;
+                    const auto enabled = sdk::get_cvar_int(L"Engine", L"r.HDR.EnableHDROutput");
+                    const auto device = sdk::get_cvar_int(L"Engine", L"r.HDR.Display.OutputDevice");
+                    spdlog::info("[Flat3D] StereoShutter output: the engine outputs {} (r.HDR.EnableHDROutput {}, "
+                                 "r.HDR.Display.OutputDevice {})",
+                                 engine_hdr == FLAT3D_ENGINE_HDR_PQ    ? "HDR10 (ST 2084)" :
+                                 engine_hdr == FLAT3D_ENGINE_HDR_SCRGB ? "scRGB" : "SDR",
+                                 enabled ? *enabled : -1, device ? *device : -1);
+                }
+            });
+        }
+    } else {
+        m_flat3d_engine_hdr.store(FLAT3D_ENGINE_HDR_OFF);
     }
 
     // --- VSync override: t.MaxFPS ownership -----------------------------------
@@ -3803,6 +3970,19 @@ void VR::on_draw_sidebar_flat3d() {
             text_disabled_wrapped("Katanga - shares a side-by-side stereo texture with Katanga.exe / "
                                   "VRScreenCap (launch either, any order). Forces the game into a normal "
                                   "window; the local window shows a left-eye preview.");
+        } else if (mode == Flat3DOutputMode::STEREOSHUTTER) {
+            text_disabled_wrapped("StereoShutter - hands the composited stereo pair to a UU3D plugin "
+                                  "(on_stereo_pair_dx11/dx12, e.g. the StereoShutter plugin for NVIDIA 3D "
+                                  "Vision glasses) in the game's own format and color space; turn Force "
+                                  "SDR Output off to keep the game's HDR. The game's own window shows the "
+                                  "left eye only: without such a plugin there is no 3D picture.");
+
+            if (flat3d_stereo_pair_consumer_missing()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.4f, 0.4f, 1.0f});
+                ImGui::TextWrapped("StereoShutter is not installed: no UU3D plugin takes the stereo pair. "
+                                   "Install StereoShutter first, or choose another output.");
+                ImGui::PopStyleColor();
+            }
         } else if (mode >= Flat3DOutputMode::FRAMEPACKED_720P60 && mode <= Flat3DOutputMode::FRAMEPACKED_1080P60) {
             text_disabled_wrapped("Frame-packed HDMI 1.4 - auto-applies a custom display timing via "
                                   "NVIDIA/AMD (or a CRU-preconfigured mode); reverts on mode change/exit.");
@@ -3867,7 +4047,8 @@ void VR::on_draw_sidebar_flat3d() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("HDR output (PQ/scRGB swapchains) washes out the 3D modes and\n"
                           "disables ghost reduction - this switches the game back to SDR.\n"
-                          "Turn off to experiment with HDR passthrough.");
+                          "Turn off to experiment with HDR passthrough. The StereoShutter\n"
+                          "output keeps the game's HDR with this off.");
     }
 
     m_flat3d_window_hold->draw("Hold Window Size");
