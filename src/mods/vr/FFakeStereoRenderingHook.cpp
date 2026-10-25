@@ -1828,6 +1828,17 @@ bool everwind_is_current_game() {
     return result;
 }
 
+// Stupid Never Dies (UE5.5+): DrawWindow_RenderThread receives
+// FSlateDrawWindowPassInputs in R8 and its pass outputs by hidden storage in RDX.
+bool stupid_never_dies_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && exe_path->find(L"StupidNeverDies") != std::wstring::npos;
+    }();
+
+    return result;
+}
+
 bool stalker2_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -6578,6 +6589,7 @@ bool supports_ue55_dedicated_ui_target_for_current_game() {
             pokemon_emerald_is_current_game() ||
             sw_zero_company_ue56_is_current_game() ||
             bodycam_ue554_is_current_game() ||
+            stupid_never_dies_is_current_game() ||
             is_deadzone_ue56_executable()) &&
         g_framework != nullptr &&
         g_framework->is_dx12() &&
@@ -37210,6 +37222,20 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         SPDLOG_INFO_ONCE("[SlateRHIRenderer::DrawWindow_RenderThread] Using UE 5.5 sret FSlateDrawWindowPassInputs layout");
     }
 
+    if (!a4_is_ue_5_5_variant && stupid_never_dies_is_current_game() &&
+        try_read_ue55_slate_draw_inputs(a3, renderer, ue55_inputs))
+    {
+        // Stupid Never Dies passes FSlateDrawWindowPassInputs in R8 (first field
+        // == renderer, second == window) and the pass outputs by hidden storage
+        // in RDX; R9 is a small flag. Observed raw arguments:
+        //   rcx=renderer rdx=<zeroed stack outputs> r8=<inputs: renderer, window, ...> r9=1
+        a4_is_ue_5_5_variant = true;
+        a4_has_ue_5_5_full_inputs = try_read_ue55_slate_draw_inputs_full(a3, renderer, ue55_inputs_full);
+        ue55_draw_window_outputs_ptr = a2;
+        SPDLOG_INFO_ONCE("[StupidNeverDies][UE5.5][SlateUI] Using FSlateDrawWindowPassInputs from R8 (outputs in RDX), full_inputs={}",
+            a4_has_ue_5_5_full_inputs);
+    }
+
     const bool use_ue55_draw_windows_array_layout =
         everwind_is_current_game() || stalker2_uses_ue55_draw_windows_array_layout();
 
@@ -37852,10 +37878,42 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
                 "[UE5.6][RT] Skipping FViewportInfo::GetRenderTargetProvider probing because the known texture cannot expose a stable native resource; deferring to D3D12 hooks");
         }
 
+        // FViewportInfo::get_rt_provider re-runs a full 0x500-byte bruteforce
+        // (emulation + hundreds of log lines) every ~2 seconds while it keeps
+        // failing. On titles where it never resolves (e.g. Stupid Never Dies)
+        // that shows up as a hitch every few seconds. Stop probing after a few
+        // failed attempts; behaviour is otherwise identical to a failed probe.
+        static int rt_provider_failures = 0;
+        static std::chrono::steady_clock::time_point rt_provider_last_attempt{};
+        constexpr int rt_provider_max_failures = 5;
+        const bool should_probe_provider =
+            provider_resource == nullptr && known_texture != nullptr && known_texture_is_safe &&
+            rt_provider_failures < rt_provider_max_failures;
+
         const auto viewport_rt_provider =
-            provider_resource == nullptr && known_texture != nullptr && known_texture_is_safe
+            should_probe_provider
                 ? viewport_info->get_rt_provider(known_texture)
                 : nullptr;
+
+        if (should_probe_provider) {
+            if (viewport_rt_provider != nullptr) {
+                rt_provider_failures = 0;
+            } else {
+                const auto now = std::chrono::steady_clock::now();
+
+                // get_rt_provider returns early (cheaply) inside its own 2s retry
+                // window; only count calls that could have re-scanned.
+                if (now - rt_provider_last_attempt >= std::chrono::seconds(2)) {
+                    rt_provider_last_attempt = now;
+                    ++rt_provider_failures;
+
+                    if (rt_provider_failures >= rt_provider_max_failures) {
+                        SPDLOG_WARN("FViewportInfo::GetRenderTargetProvider failed {} times; disabling further probing to stop periodic hitches",
+                            rt_provider_failures);
+                    }
+                }
+            }
+        }
 
         if (viewport_rt_provider != nullptr) {
             provider_resource = viewport_rt_provider->get_viewport_render_target_texture();
@@ -43777,7 +43835,31 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                         const auto fn = utility::calculate_absolute(ip + 1);
                         SPDLOG_INFO("Analyzing call at {:x} to {:x}", ip, fn);
 
-                        if (is_ue56_stack_scope_constructor_call(ip)) {
+                        // Some UE5.5+ builds (e.g. Stupid Never Dies) construct
+                        // FName(TEXT("BufferedRT")) right after the string reference.
+                        // That call is the FName constructor, not the texture-create
+                        // function; invoking it with the texture-create ABI derefs
+                        // garbage. Skip any call whose target is a resolved FName helper.
+                        auto known_fname_helper = [](const auto& v) -> uintptr_t {
+                            if constexpr (requires { v.has_value(); v.value(); }) {
+                                return v.has_value() ? (uintptr_t)v.value() : 0;
+                            } else {
+                                return (uintptr_t)v;
+                            }
+                        };
+                        uintptr_t fname_ctor = 0;
+                        uintptr_t fname_to_string = 0;
+                        try {
+                            fname_ctor = known_fname_helper(sdk::FName::get_constructor());
+                            fname_to_string = known_fname_helper(sdk::FName::get_to_string());
+                        } catch (...) {
+                        }
+
+                        if (fn != 0 && (fn == fname_ctor || fn == fname_to_string)) {
+                            SPDLOG_INFO("Call target {:x} is the FName {} (not texture create), skipping this call!",
+                                fn, fn == fname_ctor ? "constructor" : "ToString");
+                            next_call_is_not_the_right_one = true;
+                        } else if (is_ue56_stack_scope_constructor_call(ip)) {
                             // This UE5.6 LLM/scope constructor sits immediately
                             // after AllocateRenderTargetTexture. Hooking it with
                             // the texture-create ABI corrupts the render thread.
