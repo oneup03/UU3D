@@ -39309,6 +39309,20 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
                 "[UE5.6][RT] Skipping FViewportInfo::GetRenderTargetProvider probing because the known texture cannot expose a stable native resource; deferring to D3D12 hooks");
         }
 
+        // FViewportInfo::get_rt_provider re-runs a full 0x500-byte bruteforce
+        // (emulation + hundreds of log lines) every ~2 seconds while it keeps
+        // failing. On titles where it never resolves (e.g. Stupid Never Dies)
+        // that shows up as a hitch every few seconds. After a few failed scans,
+        // back off (4s doubling to a 60s cap) rather than giving up: a window may
+        // legitimately have no provider during startup, so a later scan must
+        // still be able to succeed. One non-null result means the offset is
+        // resolved and every later call is a plain field read, so stop counting.
+        static bool rt_provider_resolved = false;
+        static int rt_provider_failures = 0;
+        static std::chrono::steady_clock::time_point rt_provider_last_scan{};
+        static std::chrono::steady_clock::time_point rt_provider_next_attempt{};
+        constexpr int rt_provider_free_failures = 5;
+
         sdk::IViewportRenderTargetProvider* viewport_rt_provider{};
         if (provider_resource == nullptr && known_texture != nullptr && known_texture_is_safe) {
             const auto stellar_blade_offset = g_stellar_blade_slate_provider_offset.load(std::memory_order_acquire);
@@ -39326,8 +39340,25 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
                     utility::get_module_within(getter).value_or(nullptr) == utility::get_executable()) {
                     viewport_rt_provider = candidate;
                 }
-            } else {
+            } else if (const auto now = std::chrono::steady_clock::now();
+                       rt_provider_resolved || now >= rt_provider_next_attempt) {
                 viewport_rt_provider = viewport_info->get_rt_provider(known_texture);
+
+                if (viewport_rt_provider != nullptr) {
+                    rt_provider_resolved = true;
+                } else if (!rt_provider_resolved && now - rt_provider_last_scan >= std::chrono::seconds(2)) {
+                    // get_rt_provider returns early (cheaply) inside its own 2s retry
+                    // window; only count calls that could have re-scanned.
+                    rt_provider_last_scan = now;
+
+                    if (++rt_provider_failures >= rt_provider_free_failures) {
+                        const auto shift = std::min(rt_provider_failures - rt_provider_free_failures + 1, 5);
+                        const auto delay = std::min(std::chrono::seconds(2LL << shift), std::chrono::seconds(60));
+                        rt_provider_next_attempt = now + delay;
+                        SPDLOG_WARN("FViewportInfo::GetRenderTargetProvider failed {} times; next probe in {}s",
+                            rt_provider_failures, delay.count());
+                    }
+                }
             }
         }
 
