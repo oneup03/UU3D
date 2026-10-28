@@ -84,6 +84,7 @@ private:
     // IHeadMountedDisplay
     static bool is_hmd_connected(sdk::IHeadMountedDisplay*);
     static int32_t* get_ideal_debug_canvas_render_target_size(sdk::IHeadMountedDisplay*, int32_t* out);
+    static int32_t* get_gears_debug_canvas_render_target_size(sdk::IHeadMountedDisplay*, int32_t* out);
     static SharedPtr* get_view_extension(sdk::IHeadMountedDisplay*, SharedPtr* out);
 
     // IXRCamera
@@ -190,6 +191,7 @@ private:
     bool m_relative_transform_corrected{false}; // For UpdatePlayerCamera, causes player to become a midget if not corrected
 
     size_t m_offset_in_engine{0};
+    uintptr_t m_gears_debug_canvas_return_address{};
 
     union {
         Rotator<float> m_last_view_rotation;
