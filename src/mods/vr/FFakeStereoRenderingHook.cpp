@@ -6500,8 +6500,25 @@ std::optional<std::pair<uint32_t, uint32_t>> get_dead_island_2_ue425_ui_extent()
     return std::pair{width, height};
 }
 
+bool pbz_is_current_game() {
+    // 影之刃零 (Phantom Blade Zero, PBZ.exe) — UE 5.7+ but Flat3D fails to obtain
+    // a valid UEngine::GetWorld() for the whole session. Exclude it from the generic
+    // UE 5.7 dedicated UI path so it falls through to the legacy stereo emulation.
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && exe_path->find(L"PBZ") != std::wstring::npos;
+    }();
+    return result;
+}
+
 bool supports_ue57_dedicated_ui_target() {
     if (!is_ue_5_7_or_newer() || g_framework == nullptr) {
+        return false;
+    }
+
+    // Phantom Blade Zero: engine never yields a valid UEngine::GetWorld() in
+    // Flat3D mode, so the dedicated UI texture creation loop stalls forever.
+    if (pbz_is_current_game()) {
         return false;
     }
 
