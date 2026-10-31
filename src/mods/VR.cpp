@@ -31,6 +31,7 @@
 #include <sdk/Globals.hpp>
 #include <sdk/GalacticRacerRuntime.hpp>
 #include <sdk/CVar.hpp>
+#include <sdk/GearsEDayDiscovery.hpp>
 #include <sdk/ConsoleManager.hpp>
 #include <sdk/FProperty.hpp> // read_object_property needs the complete type
 #include <sdk/threading/GameThreadWorker.hpp>
@@ -8399,6 +8400,15 @@ float VR::flat3d_effective_nearz() {
     // game's r.SetNearClipPlane cvar if it set one, else UE's own default of 10
     // (a far closer approximation than the SDK's 1.0 dummy). r.SetNearClipPlane
     // is 0 until set, so only adopt a positive value.
+    // Gears E-Day: r.SetNearClipPlane holds a value far larger than the plane the
+    // game actually renders with, so adopting it clips the player character and
+    // nearby walls/floor. Custom Z Near = 10 was confirmed in game; use UE's default.
+    static const bool goweday = sdk::gears_eday::current_game();
+    if (goweday) {
+        SPDLOG_INFO_ONCE("[Flat3D][GoWEDay] near plane fallback: using UE default 10 instead of r.SetNearClipPlane");
+        return 10.0f;
+    }
+
     try {
         if (auto data = sdk::find_cvar_data_cached(L"Engine", L"r.SetNearClipPlane"); data) {
             // Only adopt a PLAUSIBLE near plane (UE units; default is 10).
