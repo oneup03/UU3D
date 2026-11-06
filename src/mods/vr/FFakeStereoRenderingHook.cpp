@@ -15425,7 +15425,28 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                         const auto fn = utility::calculate_absolute(ip + 1);
                         SPDLOG_INFO("Analyzing call at {:x} to {:x}", ip, fn);
 
-                        if (auto result = utility::scan(fn, 10, "41 B8 30 00 00 00"); result.has_value() && *result == fn) {
+                        // Some UE5.5+ builds (e.g. Stupid Never Dies) construct
+                        // FName(TEXT("BufferedRT")) right after the string reference.
+                        // That call is the FName constructor, not the texture-create
+                        // function; invoking it with the texture-create ABI derefs
+                        // garbage. Skip any call whose target is a resolved FName helper.
+                        uintptr_t fname_ctor = 0;
+                        uintptr_t fname_to_string = 0;
+                        try {
+                            if (const auto ctor = sdk::FName::get_constructor(); ctor) {
+                                fname_ctor = (uintptr_t)*ctor;
+                            }
+                            if (const auto to_string = sdk::FName::get_to_string(); to_string) {
+                                fname_to_string = (uintptr_t)*to_string;
+                            }
+                        } catch (...) {
+                        }
+
+                        if (fn != 0 && (fn == fname_ctor || fn == fname_to_string)) {
+                            SPDLOG_INFO("Call target {:x} is the FName {} (not texture create), skipping this call!",
+                                fn, fn == fname_ctor ? "constructor" : "ToString");
+                            next_call_is_not_the_right_one = true;
+                        } else if (auto result = utility::scan(fn, 10, "41 B8 30 00 00 00"); result.has_value() && *result == fn) {
                             SPDLOG_INFO("First instruction is a mov r8d, 30h, skipping this call!");
                             next_call_is_not_the_right_one = true;
                         } else if (auto result = utility::scan(fn, 50, "B8 00 08 00 00 C3"); result.has_value()) {
