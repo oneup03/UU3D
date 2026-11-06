@@ -10,6 +10,74 @@ root, Modern under `modern\`), so entries apply to both unless a heading says
 otherwise. Earlier nightlies were a single build, alternating between the two
 bases depending on which branch produced them.
 
+## Nightly 00053
+
+Also covers **00051** and **00052**, which shipped without a changelog entry.
+
+### Fixed
+- **Games no longer hang on exit** (from 00051, contributed by murdavs). When a
+  game closed, UU3D's crash handlers could keep running on objects that had
+  already been torn down. The process then stayed alive for seconds after the
+  window disappeared, or until it was ended by hand. The handlers now stand
+  aside while UU3D unloads.
+- **Native Stereo Fix stops hammering a scene capture the game refuses**
+  (Modern, from 00051, contributed by murdavs). A failed capture is now retried
+  after 0.5, 1, 2 and then 4 seconds instead of in a fixed loop. The log says
+  what was wrong with the refused texture, and each attempt no longer logs the
+  same lines every frame.
+- **Phantom Blade Zero UI** (Modern, from 00052, contributed by PureDark). Fixed
+  half-width UI with Native Stereo and the UI being warped along with the scene
+  by AFW. 00053 replaces this with Joey Hodge's fuller version of the same fix
+  (see Upstream below).
+- **Stupid Never Dies no longer crashes on injection with Legacy** (contributed
+  by bonowook-ops). UU3D mistook a name-creation call for the game's texture
+  creation function. Modern gets the same fix from upstream.
+- **Periodic hitch while looking for the game's UI render target** (Modern,
+  contributed by bonowook-ops). In games where UU3D can't find it, the search
+  ran again every 2 seconds and stuttered each time. It now waits longer
+  between attempts, up to once a minute. Once it has succeeded, it never
+  backs off.
+- **Gears of War: E-Day clipped the player and nearby walls under Flat3D**
+  (Modern, contributed by bonowook-ops). The near plane UU3D falls back to was
+  far larger than the one the game renders with, so the third-person view
+  looked first-person. This game now uses Unreal's default of 10 unless
+  *Custom Z Near* is set.
+
+### Upstream (Modern only)
+The Modern backend merged Joey Hodge's `ue57performance` branch again (49
+upstream commits, 2026-10-16 to 2026-11-04). As before, these target the VR
+path. The renderer, UI-routing and startup parts that UU3D shares may help these
+titles under Flat3D too, but none have been verified in UU3D:
+- *Gears of War: E-Day* (UE 5.6.1, Steam and Game Pass) - new: scene and object
+  discovery, dedicated UI and Native Fix. HMD aiming is VR only.
+- *Star Wars: Zero Company* - game build 199049, with its Native Fix hologram
+  passes guarded.
+- *Stupid Never Dies* - the injection crash, the UI routed to its own target,
+  and the UI kept aligned after the window is resized.
+- *Phantom Blade Zero* - UI startup, Native Fix capture using the game's own
+  stereo data, and a UI hook that keeps working after the game's patches.
+- *Avowed* - stereo startup, a validated Native Fix capture target and scene
+  counter, and the forced ten-second pause on transitions removed.
+- *Stellar Blade* - both views kept stable during startup.
+- *Black Myth: Wukong* - Native Fix found the wrong renderer function and never
+  got an eye pair.
+- *Fatekeeper* - validated viewport Draw override.
+- *What Remains of Edith Finch* - Native Fix capture, viewport and eye color.
+  HMD and controller aiming and the readable journal are VR only.
+- *The Sinking City 2* - Draw and Native Fix eye handling.
+- *Glory to the Heroes* (UE 5.5.4) - dedicated UI route and name creation.
+- *Galactic Racer* - opt-in cinematic letterbox stereo repair, opt-in Panini
+  toggles, and movie seeking for game build Auto-386500.
+- `FFRS-Win64-Shipping.exe` and `Hotel188-Win64-Shipping.exe` - Native Fix
+  discovery, and scene textures adopted only after a completed draw.
+- *Dune: Awakening* - Mono render-frame handoff restored (VR Mono only).
+- *S.T.A.L.K.E.R. 2* - safer console discovery.
+- Engine-wide: UE 5.8.4 support, UE 5.8 Native Stereo Fix crashes fixed,
+  sturdier pre-5.7 Slate UI discovery, and CVar sliders the engine rejects on
+  UE 5.7/5.8 can retry once. A D3D11 fix (contributed upstream by GmoLargey)
+  moves two shader hooks onto the functions they were meant for. On the wrong
+  ones, some D3D11 games could crash. Legacy never had these hooks.
+
 ## Nightly 00050
 
 Also covers **00048** and **00049**, which shipped without a changelog entry.
