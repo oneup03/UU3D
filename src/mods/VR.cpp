@@ -56,6 +56,8 @@
 
 #include "VR.hpp"
 #include <safetyhook.hpp>
+#include "vr/GalacticRacerPanini.hpp"
+#include "vr/GalacticRacerLetterboxing.hpp"
 #include "vr/Stalker2NativePolicy.hpp"
 #include "UObjectHook.hpp"
 #include "GameSpecific.hpp"
@@ -413,6 +415,8 @@ std::shared_ptr<VR>& VR::get() {
 }
 
 VR::~VR() {
+    uevr::swgr_panini::shutdown();
+    uevr::swgr_letterbox::shutdown();
     stop_native_openxr_async_wait_worker();
     restore_1666amsterdam_native_postprocess_cvars();
     restore_daysgone_gbuffer_cvar();
@@ -5481,6 +5485,12 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     // until the game has loaded nvngx.dll (it loads lazily on first DLSS use).
     init_framewarp_module();
 
+    // Exact Native selection excludes optional Mono/DIBR modes on every branch.
+    const auto letterbox_runtime = get_runtime();
+    uevr::swgr_letterbox::update(m_compatibility_swgr_letterboxing->value(),
+        letterbox_runtime && letterbox_runtime->loaded && is_hmd_active() && !m_disable_vr &&
+        is_using_native_stereo() && !is_using_2d_screen() && !is_splitscreen_compatibility_enabled());
+
     const auto now = std::chrono::steady_clock::now();
     const auto previous_engine_tick = m_last_engine_tick.load(std::memory_order_relaxed);
     const bool hitch_diagnostics_enabled = m_enable_hitch_diagnostics->value();
@@ -5613,6 +5623,8 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     update_subnautica2_native_water_compatibility(engine);
     update_1666amsterdam_native_postprocess_compatibility(engine);
     update_daysgone_gbuffer_compatibility(engine);
+    uevr::swgr_panini::update(m_compatibility_swgr_disable_panini->value(),
+        m_compatibility_swgr_panini_component->value(), is_hmd_active() && !m_disable_vr);
     update_everspace2_cinematic_bars(engine);
 
     update_statistics_overlay(engine);
@@ -10842,7 +10854,24 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_compatibility_head_turn_camera_stabilizer->draw("Head-Turn Camera Stabilizer");
             m_compatibility_ui_layer_pose_telemetry->draw("UI Layer Pose Telemetry");
             m_compatibility_ui_layer_pose_stabilizer->draw("UI Layer Pose Stabilizer");
+            m_compatibility_pre57_slate_ui_observation->draw("Observe UE5.5/5.6 Slate UI (Experimental)");
+            if (m_compatibility_pre57_slate_ui_observation->value() && m_fake_stereo_hook) {
+                ImGui::TextWrapped("%s", m_fake_stereo_hook->get_pre57_slate_ui_observation_status());
+                ImGui::TextWrapped("Read-only discovery: no CVar, alpha, UI destination, allocation or rendering-mode changes. "
+                    "Existing game adapters keep priority. A distinct texture is not proof of main-window or pooled-resource ownership; "
+                    "unknown routes remain unchanged. UE5.4 retains its separate immediate-command-list path. "
+                    "Results are included in Hook Provenance.");
+            }
             if (sdk::galactic_racer::current_dx12_game()) {
+                m_compatibility_swgr_letterboxing->draw("Galactic Racer Cinematic Letterboxing Fix (Experimental)");
+                if (!m_compatibility_swgr_letterboxing->value()) { uevr::swgr_letterbox::update(false, false); }
+                ImGui::TextWrapped("%s", uevr::swgr_letterbox::status_text(uevr::swgr_letterbox::status()));
+                ImGui::TextWrapped("Opt-in DX12 Native / Native Fix only. Removes only M_PP_CameraLetterboxing, which can black out the right eye during collision cameras. Other post-process materials, UI, alpha, FOV and temporal states are unchanged. Fresh chains handle game re-enables and replacement material instances; no CVar freeze/re-arm. Unsupported code/storage keeps the original path.");
+                m_compatibility_swgr_disable_panini->draw("Galactic Racer Disable Panini - CVar (Experimental)");
+                ImGui::TextWrapped("%s", uevr::swgr_panini::status_text(uevr::swgr_panini::cvar_status()));
+                m_compatibility_swgr_panini_component->draw("Galactic Racer Panini Component Fallback (Experimental)");
+                ImGui::TextWrapped("%s", uevr::swgr_panini::status_text(uevr::swgr_panini::component_status()));
+                ImGui::TextWrapped("Enable only one test. Both default off. CVar uses Gfn.Panini.Enable without raising priority, re-arms game-code resets with limited retries, and restores its owned value when disabled. Console/other external changes remain protected. Component fallback bypasses backend CVar lookup using the validated game's temporary-camera branch for each Tick, immediately restoring the flag. Unsupported builds remain unchanged. No FOV, world scale, alpha, UI or stereo mode changes. Compare at high speed; the cause is not yet runtime-confirmed.");
                 m_compatibility_swgr_bink_seek_budget->draw("Galactic Racer Movie Seek Budget (Experimental)");
                 ImGui::TextWrapped("Opt-in SWGR UE5.7.4 DX12 only. Uses a 6 ms incremental budget for playing, forward-seeking viewport movies and keeps their completed image scheduled while seeking. A full decode can exceed the budget; movie/audio timing needs testing. Enable before playing a movie. Rewinds, paused seeks, texture movies and other games keep the original path.");
             }

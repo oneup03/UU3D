@@ -9,6 +9,7 @@
 #include <sdk/FSceneViewFamily.hpp>
 #include <sdk/FSceneViewLayoutPolicy.hpp>
 #include <sdk/MafiaDiscovery.hpp>
+#include "../dependencies/submodules/UESDK/tests/GloryFNameDiscoveryTests.hpp"
 
 #include "mods/GameSpecific.hpp"
 #include "utility/UObjectScanBudget.hpp"
@@ -25,6 +26,11 @@
 #include "mods/vr/KtjLFogResources.hpp"
 #include "mods/vr/KtjLHookContracts.hpp"
 #include "mods/vr/SWZeroCompanyBinary.hpp"
+#include "mods/vr/GearsEDayAllocation.hpp"
+#include "PhantomBladeZeroUITests.hpp"
+#include "CVarExistingPriorityTests.hpp"
+#include "B1RendererTests.hpp"
+#include "StellarBladeSlateTests.hpp"
 
 namespace {
 
@@ -41,6 +47,39 @@ void expect(bool condition, std::string_view message) {
 
 constexpr size_t offset_delta(size_t member, size_t base) {
     return member - base;
+}
+
+void test_goweday_engine_allocation() {
+    struct Manager {
+        uintptr_t* texture_hook_ref{};
+        uintptr_t* shader_resource_hook_ref{};
+        bool allocate_texture_called{};
+        bool set_up_texture_hook{};
+        std::atomic_bool legacy_texture_replay_failed_closed{};
+        uintptr_t scene{0x10000};
+        uintptr_t dedicated_ui{0x20000};
+        uint64_t generation{7};
+    } manager;
+    uintptr_t target{0x30000}, shader{0x40000};
+    // Reallocation, mode changes and a previously armed callback all leave
+    // creation/refcounting with the engine; no game output storage is retained.
+    for (int pass = 0; pass < 3; ++pass) {
+        manager.texture_hook_ref = &target;
+        manager.shader_resource_hook_ref = &shader;
+        manager.allocate_texture_called = true;
+        manager.set_up_texture_hook = false;
+        manager.legacy_texture_replay_failed_closed.store(false);
+        expect(!uevr::gears_eday::defer_to_engine_allocation(manager.texture_hook_ref, manager.shader_resource_hook_ref,
+            manager.allocate_texture_called, manager.set_up_texture_hook, manager.legacy_texture_replay_failed_closed),
+            "Gears allocation returns false so the engine performs its original allocation");
+        expect(manager.texture_hook_ref == nullptr && manager.shader_resource_hook_ref == nullptr &&
+            !manager.allocate_texture_called && manager.set_up_texture_hook &&
+            manager.legacy_texture_replay_failed_closed.load(std::memory_order_acquire),
+            "Gears disables pre/post replay and never retains stack-local output references");
+        expect(target == 0x30000 && shader == 0x40000 && manager.scene == 0x10000 &&
+            manager.dedicated_ui == 0x20000 && manager.generation == 7,
+            "Gears allocation bypass preserves engine outputs, published targets and generation");
+    }
 }
 
 void test_outerworlds2_tracking_policy() {
@@ -163,6 +202,8 @@ void test_scene_view_layouts() {
         "UE5.6 patch versions must select the UE5.6/5.7 layout");
     expect(classify_engine_version_string(L"5.8.2") == FSceneViewInitLayout::UE58,
         "UE5.8 patch versions must select the validated UE5.8 layout");
+    expect(classify_engine_version_string(L"5.8.4") == FSceneViewInitLayout::UE58,
+        "source-reviewed UE5.8.4 retains the UE5.8 view-init layout");
     expect(classify_engine_version_string(L"5.9") == FSceneViewInitLayout::UnsupportedNewer,
         "UE5.9 string detection must fail closed");
     expect(classify_engine_version_string(L"6.0") == FSceneViewInitLayout::UnsupportedNewer,
@@ -557,6 +598,38 @@ void test_minecraft_dungeons_dedicated_ui_gate() {
             L"Voyage-Win64-Shipping.exe", L"AVENAGame-Win64-Shipping.exe"}) {
         expect(!should_use_minecraft_dungeons_ue561_dedicated_ui_target(path, L"5.6.1", 0x00050006, 0x00010000, true),
             "other games and basename lookalikes keep their existing UI routing");
+    }
+}
+
+void test_glory_to_the_heroes_dedicated_ui_gate() {
+    using uevr::games::should_use_glory_to_the_heroes_ue554_dedicated_ui_target;
+    for (const auto path : {L"GloryToTheHeroes-Win64-Shipping.exe",
+            L"D:\\Steam\\steamapps\\common\\Glory to the Heroes\\GloryToTheHeroes\\Binaries\\Win64\\GloryToTheHeroes-Win64-Shipping.exe",
+            L"D:/Games/GloryToTheHeroes/GloryToTheHeroes-Win64-Shipping.exe",
+            L"C:\\Games\\GLORYTOTHEHEROES-WIN64-SHIPPING.EXE"}) {
+        expect(should_use_glory_to_the_heroes_ue554_dedicated_ui_target(path, 0x00050005, 0x00040000, true),
+            "exact Glory UE5.5.4.0 DX12 executable enters the validated dedicated UI route");
+        expect(!should_use_glory_to_the_heroes_ue554_dedicated_ui_target(path, 0x00050005, 0x00040000, false),
+            "Glory DX11 retains its existing UI routing");
+        for (const auto version_ms : {0u, 0x0004001bu, 0x00050004u, 0x00050006u, 0x00050008u, 0x00060000u}) {
+            expect(!should_use_glory_to_the_heroes_ue554_dedicated_ui_target(path, version_ms, 0x00040000, true),
+                "missing or non-UE5.5 version evidence does not enable Glory dedicated UI");
+        }
+        for (const auto version_ls : {0u, 0x00030000u, 0x00040001u, 0x0004ffffu, 0x00050000u}) {
+            expect(!should_use_glory_to_the_heroes_ue554_dedicated_ui_target(path, 0x00050005, version_ls, true),
+                "unvalidated Glory patches and build revisions retain original routing");
+        }
+    }
+    for (const auto path : {L"", L"GloryToTheHeroes.exe", L"GloryToTheHeroes-Win64-Shipping",
+            L"NotGloryToTheHeroes-Win64-Shipping.exe", L"GloryToTheHeroes-Win64-Shipping.exe.bak",
+            L"D:/GloryToTheHeroes-Win64-Shipping.exe/Other.exe",
+            L"D:\\GloryToTheHeroes-Win64-Shipping.exe\\Other.exe",
+            L"D:/GloryToTheHeroes-Win64-Shipping.exe/", L"TheSinkingCity2.exe",
+            L"Borderlands4.exe", L"Stalker2-Win64-Shipping.exe", L"SWGR-Win64-Shipping.exe",
+            L"Dungeons-Win64-Shipping.exe", L"SWZeroCompany.exe", L"DaysGone.exe",
+            L"prospi-Win64-Shipping.exe", L"KINGDOM HEARTS III.exe"}) {
+        expect(!should_use_glory_to_the_heroes_ue554_dedicated_ui_target(path, 0x00050005, 0x00040000, true),
+            "other games, directory names and basename lookalikes keep their existing UI routing");
     }
 }
 
@@ -1090,10 +1163,10 @@ void test_ue58_pooled_slate_fallback() {
         .pooled_wrapper_transactions = 1,
         .shared_strict_pooled_transactions = 1,
     };
-    for (uint32_t patch = 0; patch <= 4; ++patch) {
+    for (uint32_t patch = 0; patch <= 5; ++patch) {
         input.exact_ue58 = is_validated_ue58_slate_source_version(0x00050008, patch << 16);
-        expect(should_use_ue58_pooled_slate_fallback(input) == (patch <= 3),
-            "pooled fallback must be restricted to validated UE5.8.0-5.8.3 source versions");
+        expect(should_use_ue58_pooled_slate_fallback(input) == (patch <= 4),
+            "pooled fallback must be restricted to validated UE5.8.0-5.8.4 source versions");
     }
     input.exact_ue58 = false;
     expect(!should_use_ue58_pooled_slate_fallback(input),
@@ -1287,9 +1360,11 @@ void test_ue58_slate_ui_capability() {
         "UE5.8.2 must be eligible for validated Slate capability routing");
     expect(is_validated_ue58_slate_source_version(0x00050008, 0x00030000),
         "source-reviewed UE5.8.3 must be eligible for validated Slate capability routing");
+    expect(is_validated_ue58_slate_source_version(0x00050008, 0x00040000),
+        "source-reviewed UE5.8.4 must retain validated Slate capability routing");
     for (uint32_t revision : {0u, 1u, 0xffffu}) {
         for (uint32_t patch : {0u, 1u, 2u, 3u, 4u, 5u, 0xffffu}) {
-            expect(is_validated_ue58_slate_source_version(0x00050008, (patch << 16) | revision) == (patch <= 3),
+            expect(is_validated_ue58_slate_source_version(0x00050008, (patch << 16) | revision) == (patch <= 4),
                 "the build revision must not exclude reviewed patches or admit unreviewed UE5.8 patches");
         }
     }
@@ -1298,7 +1373,7 @@ void test_ue58_slate_ui_capability() {
     expect(!is_validated_ue58_slate_source_version(0x00050009, 0x00000000) &&
         !is_validated_ue58_slate_source_version(0x00040008, 0x00030000) &&
         !is_validated_ue58_slate_source_version(0x00060008, 0x00030000),
-        "different engine minors and majors must not inherit the reviewed UE5.8.3 contract");
+        "different engine minors and majors must not inherit the reviewed UE5.8.4 contract");
 
     UE58SlateCallABIObservation direct_call{
         .rcx_builder = true,
@@ -1785,9 +1860,10 @@ void test_stellar_blade_callable_renderer_entry() {
 
 void test_sw_zero_company_binary_revisions() {
     using namespace uevr::sw_zero_company;
-    expect(binary_layouts.size() == 3 && binary_layouts[0].revision == 196320 &&
-           binary_layouts[1].revision == 196985 && binary_layouts[2].revision == 197649,
-        "SWZC retains both working revisions alongside the latest validated update");
+    expect(binary_layouts.size() == 4 && binary_layouts[0].revision == 196320 &&
+           binary_layouts[1].revision == 196985 && binary_layouts[2].revision == 197649 &&
+           binary_layouts[3].revision == 199049,
+        "SWZC retains all three working revisions alongside update 199049");
     expect(select_unique_layout([](const auto&) { return false; }) == nullptr,
         "SWZC unknown binary fails closed");
     expect(select_unique_layout([](const auto&) { return true; }) == nullptr,
@@ -1945,6 +2021,94 @@ void test_sw_zero_company_binary_revisions() {
            latest_inlined_stereo.primary_rva == 0xD8A4408 &&
            latest_inlined_stereo.secondary_rva == 0xD8A44B0,
         "SWZC latest constructor uses its EXE/PDB-validated tables, not a previous build's addresses");
+
+    const auto& current = binary_layouts[3];
+    expect(current.inlined_stereo == &revision_199049_inlined_stereo &&
+           current.native_resource == &revision_199049_native_resource &&
+           revision_199049_inlined_stereo.initialize_hmd_rva == 0x797D070 &&
+           revision_199049_inlined_stereo.assignment_rva == 0x797DAE2 &&
+           revision_199049_inlined_stereo.primary_rva == 0xD8D33E0 &&
+           revision_199049_inlined_stereo.secondary_rva == 0xD8D3360,
+        "SWZC 199049 binds both stereo interfaces and native textures to its own verified image");
+    expect(matches_native_resource_accessor(current, image_base,
+               image_base + revision_199049_native_resource.texture_vtable_rva,
+               image_base + revision_199049_native_resource.getter_rva, latest_native_resource_code) &&
+           matches_native_resource_accessor(current, image_base,
+               image_base + revision_199049_native_resource.backbuffer_vtable_rva,
+               image_base + revision_199049_native_resource.getter_rva, latest_native_resource_code),
+        "SWZC 199049 admits only the verified native getter in its two real FRHITexture tables");
+    expect(!matches_native_resource_accessor(current, image_base,
+               image_base + revision_199049_native_resource.texture_vtable_rva,
+               image_base + 0x5F9ECF0, latest_native_resource_code) &&
+           !matches_native_resource_accessor(current, image_base,
+               image_base + revision_199049_native_resource.backbuffer_vtable_rva,
+               image_base + 0x5FA3EE0, latest_native_resource_code) &&
+           !matches_native_resource_accessor(current, image_base,
+               image_base + latest_native_resource.texture_vtable_rva,
+               image_base + revision_199049_native_resource.getter_rva, latest_native_resource_code) &&
+           !matches_native_resource_accessor(latest, image_base,
+               image_base + revision_199049_native_resource.texture_vtable_rva,
+               image_base + latest_native_resource.getter_rva, latest_native_resource_code),
+        "SWZC 199049 rejects bindless hidden-sret getters and cross-revision texture tables");
+    for (const auto result : {uintptr_t{0}, uintptr_t{0x2000}}) {
+        size_t validated_calls{}, legacy_calls{};
+        expect(resolve_native_resource(&current,
+                   [&]() { ++validated_calls; return result; },
+                   [&]() { ++legacy_calls; return uintptr_t{0x3000}; }) == result &&
+                   validated_calls == 1 && legacy_calls == 0,
+            "SWZC 199049 Native Fix never falls back to the unsafe legacy virtual-slot scan");
+    }
+    for (size_t offset = 0; offset < latest_native_resource_code.size(); ++offset) {
+        auto changed = latest_native_resource_code;
+        changed[offset] ^= 1;
+        expect(!matches_native_resource_accessor(current, image_base,
+                   image_base + revision_199049_native_resource.texture_vtable_rva,
+                   image_base + revision_199049_native_resource.getter_rva, changed),
+            "SWZC 199049 rejects every mutated native getter byte");
+    }
+    expect(!binary_layouts[0].native_fix_hologram_guard && !binary_layouts[1].native_fix_hologram_guard &&
+           !binary_layouts[2].native_fix_hologram_guard && current.native_fix_hologram_guard,
+        "SWZC Native Fix hologram coverage changes only for the newly validated revision");
+    std::array<uint8_t, revision_199049_raster_code_size> raster_code{};
+    std::copy(revision_199049_visible_clusters_load.begin(), revision_199049_visible_clusters_load.end(),
+        raster_code.begin() + revision_199049_visible_clusters_load_offset);
+    std::copy(revision_199049_shading_mask_load.begin(), revision_199049_shading_mask_load.end(),
+        raster_code.begin() + revision_199049_shading_mask_load_offset);
+    expect(matches_revision_199049_hologram_raster(raster_code),
+        "SWZC hologram coverage requires both proven raster-member load instructions");
+    for (size_t size = 0; size < raster_code.size(); ++size) {
+        expect(!matches_revision_199049_hologram_raster(std::span{raster_code}.first(size)),
+            "SWZC incomplete Nanite body cannot authorize Native Fix hologram coverage");
+    }
+    for (const auto offset : {revision_199049_visible_clusters_load_offset, revision_199049_shading_mask_load_offset}) {
+        for (size_t byte = 0; byte < 4; ++byte) {
+            auto changed = raster_code;
+            changed[offset + byte] ^= 1;
+            expect(!matches_revision_199049_hologram_raster(changed),
+                "SWZC changed raster offset, register or opcode cannot enable the guard");
+        }
+    }
+    for (const bool dx12 : {false, true}) {
+        for (const bool active : {false, true}) {
+            for (const bool native : {false, true}) {
+                for (const bool native_fix : {false, true}) {
+                    for (const auto& layout : binary_layouts) {
+                        const auto caller = image_base + layout.hologram_return_rva;
+                        const bool expected = dx12 && active && native &&
+                            (!native_fix || layout.native_fix_hologram_guard);
+                        expect(should_guard_hologram_dispatch(dx12, active, native, native_fix,
+                                   layout.native_fix_hologram_guard, caller, caller) == expected,
+                            "SWZC hologram scope preserves other renderers, inactive HMDs and legacy modes");
+                        expect(!should_guard_hologram_dispatch(dx12, active, native, native_fix,
+                                   layout.native_fix_hologram_guard, caller, caller + 1) &&
+                               !should_guard_hologram_dispatch(dx12, active, native, native_fix,
+                                   layout.native_fix_hologram_guard, 0, 0),
+                            "SWZC hologram guard cannot suppress unrelated or unidentified Nanite callers");
+                    }
+                }
+            }
+        }
+    }
 }
 
 } // namespace
@@ -2394,13 +2558,55 @@ void test_ktjl_hook_contracts() {
 #include "HalloweenRenderTargetsTests.hpp"
 #include "SatisfactoryModularTests.hpp"
 #include "GalacticRacerRenderTargetsTests.hpp"
+#include "GalacticRacerRHICommandTests.hpp"
+#include "GalacticRacerPaniniTests.hpp"
 #include "GalacticRacerOwnedTextureTests.hpp"
 #include "GalacticRacerNativeFixTests.hpp"
 #include "GalacticRacerBinkTests.hpp"
 #include "GalacticRacerBinkSeekTests.hpp"
+#include "GearsEDayNativeFixTests.hpp"
+#include "FinalFantasyResonanceTests.hpp"
+#include "ShippingSceneViewTests.hpp"
+#include "FrameworkInitializationTests.hpp"
+#include "FinchNativeFixTests.hpp"
+#include "FinchAimTests.hpp"
+#include "Pre57SlateDiscoveryTests.hpp"
+#include "Pre57UIResourceTests.hpp"
+#include "UE58NativeFixTests.hpp"
 
 int main(int argc, char** argv) {
+    ue58_native_tests::run(expect);
+    if (argc == 3 && std::string_view{argv[1]} == "--ue58-native-image") { ue58_native_tests::shipping_image(argv[2], expect); }
+    glory_fname_tests::run(expect);
+    pbz_ui_tests::run(expect);
+    cvar_existing_priority_tests::run(expect);
+    b1_renderer_tests::run(expect);
+    if (argc == 3 && std::string_view{argv[1]} == "--glory-fname-image") { glory_fname_tests::shipping_image(argv[2], expect); }
+    test_pre57_ui_resources();
+    test_pre57_ui_safety();
+    if (argc == 3 && std::string_view{argv[1]} == "--pre57-ui-getter-fixture") { test_pre57_ui_getter_fixture(argv[2]); }
+    test_pre57_slate_discovery();
+    if (argc == 3 && std::string_view{argv[1]} == "--pre57-slate-fixture") { test_pre57_slate_fixture(argv[2]); }
+    test_finch_native_fix_contracts();
+    test_finch_aim_contracts();
+    test_finch_aim_pose();
+    if (argc == 3 && std::string_view{argv[1]} == "--finch-image") {
+        test_finch_native_fix_image(argv[2]);
+        test_finch_aim_image(argv[2]);
+    }
+    test_ffrs_texture_selection();
+    test_shipping_scene_view_layouts();
+    test_ffrs_engine_version();
+    if (argc == 3 && std::string_view{argv[1]} == "--ffrs-image") { test_ffrs_image(argv[2]); }
+    if (argc == 3 && std::string_view{argv[1]} == "--hotel188-image") { test_ffrs_image(argv[2], true); }
+    test_framework_initialization();
+    test_goweday_engine_allocation();
+    test_goweday_native_family();
+    test_goweday_native_rects();
     test_swgr_render_targets();
+    test_swgr_rhi_command_root();
+    test_swgr_panini();
+    if (argc == 3 && std::string_view{argv[1]} == "--swgr-panini-image") { test_swgr_panini_image(argv[2]); }
     test_swgr_owned_texture();
     test_swgr_native_fix();
     test_swgr_bink();
@@ -2425,6 +2631,7 @@ int main(int argc, char** argv) {
     test_rendering_mode_matrix();
     test_version_gates();
     test_minecraft_dungeons_dedicated_ui_gate();
+    test_glory_to_the_heroes_dedicated_ui_gate();
     test_borderlands4_dedicated_ui_gate();
     test_borderlands4_slate_inputs();
     test_stalker2_lazy_ghost_bootstrap();
@@ -2439,6 +2646,7 @@ int main(int argc, char** argv) {
     test_mafia_discovery();
     test_family_snapshot_accessors();
     test_stellar_blade_callable_renderer_entry();
+    test_stellar_blade_slate_contract(expect);
     test_hifi_rush_callable_renderer_entry();
     test_sifu_callable_renderer_entry();
     test_sifu_native_mesh_commands();

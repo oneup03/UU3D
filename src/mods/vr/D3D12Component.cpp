@@ -21,6 +21,7 @@
 #include "../VR.hpp"
 
 #include <sdk/Utility.hpp>
+#include <sdk/PhantomBladeZeroObjectArray.hpp>
 
 #include <../../directxtk12-src/Inc/ResourceUploadBatch.h>
 #include <../../directxtk12-src/Inc/RenderTargetState.h>
@@ -32,6 +33,7 @@
 
 #include "D3D12Component.hpp"
 #include "GalacticRacerRenderTargets.hpp"
+#include "PhantomBladeZeroNative.hpp"
 
 //#define AFR_DEPTH_TEMP_DISABLED
 
@@ -353,6 +355,16 @@ bool is_everspace2_current_game() {
     }();
 
     return result;
+}
+
+bool is_pbz_ue574_dx12_current_game() {
+    if (g_framework == nullptr || !g_framework->is_dx12()) { return false; }
+    static const bool exact_game = [] {
+        const auto path = utility::get_module_pathw(utility::get_executable());
+        const auto version = sdk::get_file_version_info();
+        return path && sdk::pbz::eligible(*path, version.dwFileVersionMS, version.dwFileVersionLS);
+    }();
+    return exact_game;
 }
 
 Microsoft::WRL::ComPtr<ID3D12Resource> acquire_scene_target_resource(
@@ -2280,6 +2292,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         : uevr::nascar::is_target()
         ? (nascar_ui_snapshot ? reinterpret_cast<FRHITexture2D*>(nascar_ui_snapshot->source_texture) : nullptr)
         : ffsr->get_render_target_manager()->get_ui_target();
+    // Keep one validated native resource for this submission. Do not rediscover
+    // a getter from a raw UI wrapper midway through a resize or target change.
+    ComPtr<ID3D12Resource> pre57_ui_native;
+    const bool pre57_ui_handled = ffsr->get_render_target_manager()->try_get_pre57_slate_ui_native(ui_target, pre57_ui_native);
     const auto native_ui_resource = [&]() -> ID3D12Resource* {
         if (sdk::galactic_racer::current_game() && g_framework->is_dx12()) {
             return swgr_ui_snapshot && swgr_ui_snapshot->device_identity == reinterpret_cast<uintptr_t>(device)
@@ -2290,6 +2306,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         if (ffsr->get_render_target_manager()->try_get_sw_zero_company_pinned_ui_resource(ui_target, native)) {
             return native;
         }
+        if (pre57_ui_handled) { return pre57_ui_native.Get(); }
         return ui_target ? static_cast<ID3D12Resource*>(ui_target->get_native_resource()) : nullptr;
     };
 
@@ -2351,6 +2368,50 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 frame_diag::Backend::d3d12, api, stage, result, eye, call);
         }
     };
+
+    if (native_stereo_packet != nullptr &&
+        vr->is_using_native_stereo() && vr->is_native_stereo_fix_enabled() &&
+        runtime->is_openxr() && !vr->is_extreme_compatibility_mode_enabled() &&
+        is_pbz_ue574_dx12_current_game())
+    {
+        const bool descriptor_valid =
+            scene_source_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            scene_source_desc.DepthOrArraySize == 1 && scene_source_desc.MipLevels == 1 &&
+            scene_source_desc.SampleDesc.Count == 1 && scene_source_desc.SampleDesc.Quality == 0 &&
+            (scene_source_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+            (scene_source_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0 &&
+            (scene_source_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+             scene_source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+        const auto action = uevr::pbz_native::copy_extent_action({
+            true, backbuffer.Get() != real_backbuffer.Get(), descriptor_valid,
+            scene_source_desc.Width, scene_source_desc.Height,
+            m_backbuffer_size[0], m_backbuffer_size[1],
+            static_cast<uint32_t>(vr->get_hmd_width()), static_cast<uint32_t>(vr->get_hmd_height())});
+        if (action != uevr::pbz_native::CopyExtentAction::unchanged) {
+            ComPtr<ID3D12Device4> source_device{};
+            const bool can_rebuild = action == uevr::pbz_native::CopyExtentAction::rebuild &&
+                SUCCEEDED(backbuffer->GetDevice(IID_PPV_ARGS(&source_device))) &&
+                source_device.Get() == device;
+            ffsr->reject_native_stereo_frame_packet(native_stereo_packet->serial, can_rebuild
+                ? "PBZ scene extent changed; rebuilding Native Fix copy resources"
+                : "PBZ Native Fix requires the current packed HMD scene target");
+            if (can_rebuild) {
+                // Startup may cache Slate's desktop extent before the stereo RT
+                // arrives. Use normal setup/retirement, not a partial size edit.
+                m_force_reset = true;
+                SPDLOG_INFO_EVERY_N_SEC(2,
+                    "[PBZ][NativeStereoFix][D3D12] Refreshing cached copy extent {}x{} -> {}x{} before eye submission",
+                    m_backbuffer_size[0], m_backbuffer_size[1], scene_source_desc.Width, scene_source_desc.Height);
+            } else {
+                SPDLOG_INFO_EVERY_N_SEC(2,
+                    "[PBZ][NativeStereoFix][D3D12] Waiting for a packed HMD scene target; source={}x{} format={} expected={}x{}",
+                    scene_source_desc.Width, scene_source_desc.Height, uint32_t(scene_source_desc.Format),
+                    uint64_t{static_cast<uint32_t>(vr->get_hmd_width())} * 2, vr->get_hmd_height());
+            }
+            close_openxr_setup_failure_frame();
+            return vr::VRCompositorError_None;
+        }
+    }
 
     const auto real_backbuffer_copy_needs_setup = [&]() {
         if (backbuffer.Get() != real_backbuffer.Get() ||
@@ -3586,7 +3647,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
-    auto* active_ui_tex = ue58_ui_uses_shader_conversion ? ue58_ui_submit_context : &m_game_ui_tex;
+    // nullptr means "use m_game_ui_tex" to the spectator helper. Use an empty
+    // override on rejection so neither it nor alpha/clear passes reuse a stale
+    // source that may now alias the scene. Keep old GPU references, do not reset.
+    static d3d12::TextureContext rejected_pre57_ui;
+    const bool pre57_ui_rejected = pre57_ui_handled && native_ui_resource() == nullptr;
+    auto* active_ui_tex = pre57_ui_rejected ? &rejected_pre57_ui
+        : ue58_ui_uses_shader_conversion ? ue58_ui_submit_context : &m_game_ui_tex;
 
     const auto halo_electra_renderer_2d_screen =
         vr->is_halo_electra_cinematic_active() &&
@@ -4000,10 +4067,27 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
         draw_2d_view(m_openvr.ui_tex.commands, nullptr);
 
+        bool stupid_never_dies_ui_copy_blocked = false;
+        if (!use_2d_screen && ffsr->get_render_target_manager()->get_stupid_never_dies_ui_extent()) {
+            auto* const source = native_ui_resource();
+            const auto destination_desc = m_openvr.ui_tex.texture->GetDesc();
+            const auto source_desc = source ? source->GetDesc() : D3D12_RESOURCE_DESC{};
+            stupid_never_dies_ui_copy_blocked = !source ||
+                !uevr::stupid_never_dies_ui::copy_target_matches(source_desc, destination_desc);
+            if (source && uevr::stupid_never_dies_ui::ui_target(source_desc,
+                static_cast<uint32_t>(source_desc.Width), source_desc.Height) &&
+                uevr::stupid_never_dies_ui::request_resize_once(m_stupid_never_dies_openvr_ui_resize_pending,
+                    destination_desc, {static_cast<uint32_t>(source_desc.Width), source_desc.Height})) {
+                ffsr->set_should_recreate_textures(true);
+                SPDLOG_INFO("[StupidNeverDies][OpenVR] Queued one UI destination rebuild [{}x{}]->[{}x{}]; mismatched copy blocked",
+                    destination_desc.Width, destination_desc.Height, source_desc.Width, source_desc.Height);
+            }
+        }
+
         if (is_right_eye_frame) {
             if (use_2d_screen) {
                 m_openvr.ui_tex.commands.copy(m_2d_screen_tex[0].texture.Get(), m_openvr.ui_tex.texture.Get(), ENGINE_SRC_COLOR);
-            } else if (ui_target != nullptr) {
+            } else if (ui_target != nullptr && !pre57_ui_rejected && !stupid_never_dies_ui_copy_blocked) {
                 m_openvr.ui_tex.commands.copy(native_ui_resource(), m_openvr.ui_tex.texture.Get(), ENGINE_SRC_COLOR);
             }
         } else if (use_2d_screen) {

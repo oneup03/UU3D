@@ -710,6 +710,7 @@ if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
 
 	list(APPEND diagnostic-safety-tests_SOURCES
 		"tests/DiagnosticSafetyTests.cpp"
+		"tests/BufferedRTTextureCallTests.cpp"
 		"tests/UObjectBrowserCostTests.cpp"
 		"tests/CadenceReplayTests.cpp"
 		"tests/LoggingDisabledTests.cpp"
@@ -822,6 +823,7 @@ if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
 
 	list(APPEND hifi-hook-memory-tests_SOURCES
 		"tests/HiFiRushHookMemoryTests.cpp"
+		"tests/GearsEDayHookTests.cpp"
 		"tests/KtjLCloudHookTests.cpp"
 		"tests/KtjLShadowGatherTests.cpp"
 		"tests/KtjLCloudOutputTests.cpp"
@@ -865,6 +867,53 @@ if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
 
 	add_test(NAME hifi-hook-memory-tests COMMAND hifi-hook-memory-tests)
 	set_tests_properties(hifi-hook-memory-tests PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target gears-eday-aim-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET gears-eday-aim-tests)
+	set(gears-eday-aim-tests_SOURCES "")
+
+	list(APPEND gears-eday-aim-tests_SOURCES
+		"tests/GearsEDayAimTests.cpp"
+	)
+
+	list(APPEND gears-eday-aim-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${gears-eday-aim-tests_SOURCES})
+	add_executable(gears-eday-aim-tests)
+
+	if(gears-eday-aim-tests_SOURCES)
+		target_sources(gears-eday-aim-tests PRIVATE ${gears-eday-aim-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT gears-eday-aim-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${gears-eday-aim-tests_SOURCES})
+
+	target_compile_features(gears-eday-aim-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(gears-eday-aim-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+	)
+
+	target_link_libraries(gears-eday-aim-tests PRIVATE
+		bddisasm
+	)
+
+	add_test(NAME gears-eday-aim-tests COMMAND gears-eday-aim-tests)
+	set_tests_properties(gears-eday-aim-tests PROPERTIES TIMEOUT 60)
 
 	unset(CMKR_TARGET)
 	unset(CMKR_SOURCES)
@@ -1058,6 +1107,52 @@ if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
 
 	add_test(NAME stalker2-native-d3d12-tests COMMAND stalker2-native-d3d12-tests)
 	set_tests_properties(stalker2-native-d3d12-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target galactic-racer-letterboxing-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET galactic-racer-letterboxing-tests)
+	set(galactic-racer-letterboxing-tests_SOURCES "")
+
+	list(APPEND galactic-racer-letterboxing-tests_SOURCES
+		"tests/GalacticRacerLetterboxingTests.cpp"
+	)
+
+	list(APPEND galactic-racer-letterboxing-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${galactic-racer-letterboxing-tests_SOURCES})
+	add_executable(galactic-racer-letterboxing-tests)
+
+	if(galactic-racer-letterboxing-tests_SOURCES)
+		target_sources(galactic-racer-letterboxing-tests PRIVATE ${galactic-racer-letterboxing-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT galactic-racer-letterboxing-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${galactic-racer-letterboxing-tests_SOURCES})
+
+	target_compile_features(galactic-racer-letterboxing-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(galactic-racer-letterboxing-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(galactic-racer-letterboxing-tests PRIVATE
+		safetyhook
+	)
+
+	add_test(NAME galactic-racer-letterboxing-tests COMMAND galactic-racer-letterboxing-tests)
+	set_tests_properties(galactic-racer-letterboxing-tests PROPERTIES TIMEOUT 30)
 
 	unset(CMKR_TARGET)
 	unset(CMKR_SOURCES)
@@ -1475,9 +1570,13 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/D3D12Component.cpp"
 	"src/mods/vr/FFakeStereoRenderingHook.cpp"
 	"src/mods/vr/GameDepthCapture.cpp"
+	"src/mods/vr/GalacticRacerLetterboxing.cpp"
+	"src/mods/vr/GalacticRacerPanini.cpp"
 	"src/mods/vr/IXRTrackingSystemHook.cpp"
 	"src/mods/vr/KtjLOpenXRFactory.cpp"
 	"src/mods/vr/OverlayComponent.cpp"
+	"src/mods/vr/PhantomBladeZeroNative.hpp"
+	"src/mods/vr/PhantomBladeZeroUI.hpp"
 	"src/mods/vr/RenderTargetPoolHook.cpp"
 	"src/mods/vr/SatisfactoryRuntime.cpp"
 	"src/mods/vr/UE57SlateSymbols.cpp"
@@ -1546,6 +1645,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/Borderlands4Slate.hpp"
 	"src/mods/vr/BreathedgeInventoryPolicy.hpp"
 	"src/mods/vr/CVarDiagnostics.hpp"
+	"src/mods/vr/CVarExistingPriority.hpp"
 	"src/mods/vr/CVarManager.hpp"
 	"src/mods/vr/CompatibilityPolicy.hpp"
 	"src/mods/vr/ControllerTouchBindings.hpp"
@@ -1562,12 +1662,22 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/GalacticRacerBinkCode.hpp"
 	"src/mods/vr/GalacticRacerBinkSeek.hpp"
 	"src/mods/vr/GalacticRacerBinkSeekCode.hpp"
+	"src/mods/vr/GalacticRacerLetterboxing.hpp"
+	"src/mods/vr/GalacticRacerLetterboxingCode.hpp"
+	"src/mods/vr/GalacticRacerLetterboxingPolicy.hpp"
 	"src/mods/vr/GalacticRacerNativeFix.hpp"
 	"src/mods/vr/GalacticRacerNativeFixCode.hpp"
 	"src/mods/vr/GalacticRacerOwnedTexture.hpp"
+	"src/mods/vr/GalacticRacerPanini.hpp"
+	"src/mods/vr/GalacticRacerPaniniPolicy.hpp"
+	"src/mods/vr/GalacticRacerRHICommand.hpp"
 	"src/mods/vr/GalacticRacerRenderTargets.hpp"
 	"src/mods/vr/GameDepthCapture.hpp"
 	"src/mods/vr/GamepadRecovery.hpp"
+	"src/mods/vr/GearsEDayAim.hpp"
+	"src/mods/vr/GearsEDayAllocation.hpp"
+	"src/mods/vr/GearsEDayNativeContracts.hpp"
+	"src/mods/vr/GearsEDayNativeFix.hpp"
 	"src/mods/vr/HalloweenNativeFix.hpp"
 	"src/mods/vr/HalloweenRenderTargets.hpp"
 	"src/mods/vr/HellraiserCaptureLayout.hpp"
@@ -1603,6 +1713,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/SteamFrameInput.hpp"
 	"src/mods/vr/StellarBladeRendererEntry.hpp"
 	"src/mods/vr/StockFrameBindingMigration.hpp"
+	"src/mods/vr/StupidNeverDiesUI.hpp"
 	"src/mods/vr/UE57SlateSymbols.hpp"
 	"src/mods/vr/UE58OwnedUITexture.hpp"
 	"src/mods/vr/UE58UIInitialization.hpp"
@@ -1637,9 +1748,12 @@ list(APPEND uevr_SOURCES
 	"src/uevr-imgui/font_robotomedium.hpp"
 	"src/uevr-imgui/uevr_imconfig.hpp"
 	"src/utility/BoundedTextureDiagnostics.hpp"
+	"src/utility/BufferedRTTextureCall.hpp"
 	"src/utility/BuildIdentity.hpp"
+	"src/utility/FrameworkInitialization.hpp"
 	"src/utility/GpuRetirement.hpp"
 	"src/utility/HiFiRushHookMemory.hpp"
+	"src/utility/HookDiagnostics.hpp"
 	"src/utility/ImGui.hpp"
 	"src/utility/InputHookInstallation.hpp"
 	"src/utility/Logging.hpp"
@@ -1784,4 +1898,3 @@ endif()
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
-

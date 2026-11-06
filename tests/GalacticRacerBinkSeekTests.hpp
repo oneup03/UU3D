@@ -29,6 +29,32 @@ void test_swgr_bink_seek() {
     };
     mutations(f.seek, b::seek_mask); mutations(f.tick, b::tick_mask); mutations(f.process, b::process_mask);
     mutations(info, b::info_mask); mutations(go, b::goto_mask);
+    for (const auto* variant : {&b::process_code_382801, &b::process_code_386500}) {
+        m = good; m.put(f.process, *variant);
+        expect(contract(), "observed SWGR SDK arrays retain the complete decode/continuation contract");
+        const auto updated = m;
+        for (size_t offset = 0; offset < b::process_mask.size(); ++offset) {
+            if (!b::process_mask[offset]) { continue; }
+            m = updated; m.bytes[f.process - base + offset] ^= 1;
+            expect(!contract(), "updated decoder validates every non-relocation instruction/operand byte");
+        }
+    }
+    constexpr std::array<size_t, 5> operands{0x9e, 0xb5, 0xd6, 0x311, 0x7b3};
+    for (const auto* from : {&b::process_code, &b::process_code_382801, &b::process_code_386500}) {
+        for (const auto* to : {&b::process_code, &b::process_code_382801, &b::process_code_386500}) {
+            if (from == to) { continue; }
+            for (unsigned subset = 1; subset < (1u << operands.size()) - 1; ++subset) {
+                m = good; m.put(f.process, *from);
+                for (size_t i = 0; i < operands.size(); ++i) {
+                    if (!(subset & (1u << i))) { continue; }
+                    std::array<uint8_t, 4> operand{};
+                    std::copy_n(to->data() + operands[i], operand.size(), operand.data());
+                    m.put(f.process + operands[i], operand);
+                }
+                expect(!contract(), "mixed SDK operands from any observed builds are rejected");
+            }
+        }
+    }
     m = good; rel32(f.tick + 0x26b, go);
     expect(!contract(), "Tick cannot borrow an unrelated Info consumer");
     m = good; rel32(go + 0x17, initialize + 8);
