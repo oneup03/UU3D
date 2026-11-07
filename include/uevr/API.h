@@ -36,7 +36,7 @@ SOFTWARE.
 #define UEVR_OUT
 
 #define UEVR_PLUGIN_VERSION_MAJOR 2
-#define UEVR_PLUGIN_VERSION_MINOR 41
+#define UEVR_PLUGIN_VERSION_MINOR 42
 #define UEVR_PLUGIN_VERSION_PATCH 0
 
 #define UEVR_RENDERER_D3D11 0
@@ -160,6 +160,42 @@ typedef void (*UEVR_OnPostRenderVRFrameworkDX11Cb)(void*, void*, void*); /* imme
 /* On DX12 the resource state is D3D12_RESOURCE_STATE_RENDER_TARGET */
 typedef void (*UEVR_OnPostRenderVRFrameworkDX12Cb)(void*, void*, void*); /* command_list, ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE* rtv */
 
+/* Stereo pair output (3D Display output mode "StereoShutter"): once per present, before the game
+ * presents, the composited stereo pair (eye swap, convergence and HUD applied) as ONE side-by-side
+ * texture, each half the size of the game's backbuffer, in the backbuffer's format and color space.
+ * The texture belongs to UU3D and is redrawn every present: read it only inside the callback, on
+ * the GPU, with the context / queue given, and never write it. UU3D may recreate it between calls
+ * (output size, format or color space, the game's render size, a device reset): use the pointer
+ * passed in each call. info is valid during the call only.
+ *   DX11: immediate_context (ID3D11DeviceContext*), texture (ID3D11Texture2D*), info. The game's
+ *         state is already restored on the context: restore any state you change.
+ *   DX12: command_queue (ID3D12CommandQueue*), resource (ID3D12Resource*), info. UU3D's work on the
+ *         resource is already submitted to that queue; submit yours to the same queue before
+ *         returning, leave the resource in info->resource_state, and keep your own reference
+ *         (AddRef) until your work on it has completed on the GPU.
+ * The pair is only drawn while a plugin has registered the callback for the game's renderer.
+ * Plugin API: the two callbacks exist from 2.42 on, and in the Legacy backend from 2.39.1, but not
+ * in 2.40 or 2.41. Check the version passed to uevr_plugin_initialize before reading them: minor 42
+ * or later, or minor 39 with patch 1 or later. */
+typedef struct {
+    unsigned int size;             /* sizeof(UEVR_StereoPairInfo) */
+    unsigned int width;            /* of the side-by-side texture (both eyes) */
+    unsigned int height;
+    unsigned int eye_width;        /* width of one eye (width / 2) */
+    unsigned int dxgi_format;      /* DXGI_FORMAT of the texture */
+    unsigned int dxgi_color_space; /* DXGI_COLOR_SPACE_TYPE: 0 sRGB, 1 scRGB (linear, FP16), 12 HDR10 (PQ):
+                                      from the game's SetColorSpace1 or, when that is not seen (DX11, HDR
+                                      switched on before injection), from the engine's own HDR output */
+    unsigned int layout;           /* 1 = left eye in the left half (currently always 1), 2 = right eye in the left half */
+    unsigned int resource_state;   /* DX12: the D3D12_RESOURCE_STATES the resource is in; DX11: 0 */
+    unsigned long long frame;      /* counts the pairs handed over, from 1 */
+    unsigned int eyes_fresh;       /* bit 0: the left half shows a new eye image this present, bit 1: the
+                                      right half; 0: neither (Synced Sequential is holding the previous pair) */
+    unsigned int reserved[5];
+} UEVR_StereoPairInfo;
+typedef void (*UEVR_OnStereoPairDX11Cb)(void*, void*, const UEVR_StereoPairInfo*); /* immediate_context, ID3D11Texture2D* texture, info */
+typedef void (*UEVR_OnStereoPairDX12Cb)(void*, void*, const UEVR_StereoPairInfo*); /* command_queue, ID3D12Resource* resource, info */
+
 /* Windows callbacks*/
 typedef bool (*UEVR_OnMessageCb)(void*, unsigned int, unsigned long long, long long);
 typedef void (*UEVR_OnXInputGetStateCb)(unsigned int*, unsigned int, void*); /* retval, dwUserIndex, pState, read MSDN for details */
@@ -181,6 +217,8 @@ typedef bool (*UEVR_OnDeviceResetFn)(UEVR_OnDeviceResetCb);
 /* VR Renderer */
 typedef bool (*UEVR_OnPostRenderVRFrameworkDX11Fn)(UEVR_OnPostRenderVRFrameworkDX11Cb);
 typedef bool (*UEVR_OnPostRenderVRFrameworkDX12Fn)(UEVR_OnPostRenderVRFrameworkDX12Cb);
+typedef bool (*UEVR_OnStereoPairDX11Fn)(UEVR_OnStereoPairDX11Cb);
+typedef bool (*UEVR_OnStereoPairDX12Fn)(UEVR_OnStereoPairDX12Cb);
 
 /* Windows */
 typedef bool (*UEVR_OnMessageFn)(UEVR_OnMessageCb);
@@ -211,6 +249,10 @@ typedef struct {
     UEVR_OnPostRenderVRFrameworkDX11Fn on_post_render_vr_framework_dx11;
     UEVR_OnPostRenderVRFrameworkDX12Fn on_post_render_vr_framework_dx12;
     UEVR_OnCustomEventFn on_custom_event;
+    /* Stereo pair output, appended: from 2.42 (2.39.1 in the Legacy backend), not in 2.40 or 2.41.
+       Older backends have no tail: check the version first (see UEVR_StereoPairInfo). */
+    UEVR_OnStereoPairDX11Fn on_stereo_pair_dx11;
+    UEVR_OnStereoPairDX12Fn on_stereo_pair_dx12;
 } UEVR_PluginCallbacks;
 
 typedef struct {
