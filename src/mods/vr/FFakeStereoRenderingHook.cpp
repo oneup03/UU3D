@@ -8289,8 +8289,11 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
     // In 4.18 this doesn't exist. Not much we can do about that.
     if (backbuffer_format_cvar) {
         SPDLOG_INFO("Backbuffer Format CVar: {:x}", (uintptr_t)*backbuffer_format_cvar);
-        *(int32_t*)(*(uintptr_t*)*backbuffer_format_cvar + 0) = 0;   // 8bit RGBA, which is what VR headsets support
-        *(int32_t*)(*(uintptr_t*)*backbuffer_format_cvar + 0x4) = 0; // 8bit RGBA, which is what VR headsets support
+        // 8bit RGBA, which is what VR headsets support. The Flat3D StereoShutter output keeps the
+        // bit depth the engine draws with instead (VR::choose_flat3d_eye_pixel_format).
+        const auto pixel_format = VR::get()->choose_flat3d_eye_pixel_format();
+        *(int32_t*)(*(uintptr_t*)*backbuffer_format_cvar + 0) = pixel_format;
+        *(int32_t*)(*(uintptr_t*)*backbuffer_format_cvar + 0x4) = pixel_format;
     } else {
         SPDLOG_ERROR("Failed to find backbuffer format cvar, continuing anyways...");
     }
@@ -14237,6 +14240,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
             int32_t old_width{};
             int32_t old_height{};
+            uint8_t old_format{};
 
             for (auto i = 0; i < 0x100; ++i) {
                 auto& x = *(int32_t*)(ctx.r9 + i);
@@ -14255,9 +14259,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                     y = size.y;
 
                     uint8_t* format = (uint8_t*)(ctx.r9 + width_offset.value() + 15);
+                    old_format = *format;
 
-                    // some games have 10 bit format
-                    if (*format == 18) {
+                    // some games have 10 bit format, and under the Flat3D StereoShutter output with
+                    // scRGB the stereo render target is FloatRGBA: the UI texture made here is 8-bit
+                    if (*format == 18 || (*format == 10 && VR::get()->flat3d_eye_pixel_format() != 0)) {
                         *format = 2; // PF_B8G8R8A8
                     }
 
@@ -14279,6 +14285,13 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                 x = old_width;
                 y = old_height;
+
+                // The Flat3D StereoShutter output keeps the bit depth it chose for the
+                // stereo render target (VR::choose_flat3d_eye_pixel_format): only the
+                // UI texture made above is 8-bit.
+                if (VR::get()->flat3d_eye_pixel_format() != 0) {
+                    *(uint8_t*)(ctx.r9 + *width_offset + 15) = old_format;
+                }
             }
 
             if (rtm->texture_hook_ref == nullptr || rtm->texture_hook_ref->texture == nullptr) {
@@ -14405,6 +14418,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                 int32_t old_width{};
                 int32_t old_height{};
+                uint8_t old_format{};
 
                 for (auto i = 0; i < 0x100; ++i) {
                     auto& x = *(int32_t*)(ctx.rdx + i);
@@ -14421,6 +14435,16 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                         x = size.x;
                         y = size.y;
+
+                        // The Flat3D StereoShutter output keeps the engine's bit depth for the
+                        // stereo render target (VR::choose_flat3d_eye_pixel_format): the UI
+                        // texture made here stays 8-bit.
+                        uint8_t* format = (uint8_t*)(ctx.rdx + i + 15);
+                        old_format = *format;
+
+                        if (VR::get()->flat3d_eye_pixel_format() != 0 && (*format == 18 || *format == 10)) {
+                            *format = 2; // PF_B8G8R8A8
+                        }
                         break;
                     }
                 }
@@ -14433,6 +14457,7 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
 
                     x = old_width;
                     y = old_height;
+                    *(uint8_t*)(ctx.rdx + *width_offset + 15) = old_format;
                 }
 
                 if (rtm->texture_hook_ref == nullptr || rtm->texture_hook_ref->texture == nullptr) {
@@ -14440,8 +14465,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                     rtm->texture_hook_ref = (FTexture2DRHIRef*)ctx.rcx;
                 }
             } else {
-                // Format
-                ctx.r9 = 2; // PF_B8G8R8A8
+                // Format: 8-bit, unless the Flat3D StereoShutter output keeps the engine's bit
+                // depth for the stereo render target (VR::choose_flat3d_eye_pixel_format).
+                if (VR::get()->flat3d_eye_pixel_format() == 0) {
+                    ctx.r9 = 2; // PF_B8G8R8A8
+                }
 
                 void (*func)(
                     FTexture2DRHIRef* out,
@@ -14464,7 +14492,11 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
                     stack_args[7], stack_args[8], stack_args[9]);
             }
         } else {
-            ctx.r8 = 2; // PF_B8G8R8A8
+            // Format: 8-bit, unless the Flat3D StereoShutter output keeps the engine's bit depth
+            // for the stereo render target (VR::choose_flat3d_eye_pixel_format).
+            if (VR::get()->flat3d_eye_pixel_format() == 0) {
+                ctx.r8 = 2; // PF_B8G8R8A8
+            }
 
             std::optional<int> previous_stack_found_index{};
             std::optional<int> previous_stack_repeating_index{};
@@ -14810,7 +14842,10 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     }
 
     const float clear_color[4] {0.0f, 0.0f, 0.0f, 1.0f};
-    auto tgt_raw = kismet_rendering->create_render_target_2d(world, VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), 2, clear_color, false);
+    // RTF_RGBA8, or the format matching the stereo render target's bit depth under the Flat3D
+    // StereoShutter output (the compositor copies this eye into the same texture format).
+    const auto target_format = VR::get()->flat3d_capture_target_format();
+    auto tgt_raw = kismet_rendering->create_render_target_2d(world, VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), target_format, clear_color, false);
 
     if (tgt_raw == nullptr) {
         SPDLOG_ERROR("[VRRenderTargetManager] Failed to create texture!");
