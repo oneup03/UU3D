@@ -13605,7 +13605,40 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
     if (slate_viewport != nullptr) {
         slate_resource = slate_viewport->GetViewportRenderTargetTexture();
     } else {
-        const auto viewport_rt_provider = viewport_info->get_rt_provider(g_hook->get_render_target_manager()->get_render_target());
+        // This UESDK's FViewportInfo::get_rt_provider re-runs its full 0x500-byte
+        // bruteforce (emulation + hundreds of log lines, ~0.7s) on EVERY call
+        // until it resolves, with no retry window of its own. On titles where it
+        // never resolves (e.g. Stupid Never Dies) that is near-continuous
+        // render-thread stutter. Space the attempts out here: every 2s for the
+        // first few, then 4s doubling to a 60s cap, rather than giving up - a
+        // window may legitimately have no provider during startup, so a later
+        // scan must still be able to succeed. One non-null result means the
+        // offset is resolved and every later call is a plain field read, so
+        // stop counting.
+        static bool rt_provider_resolved = false;
+        static int rt_provider_failures = 0;
+        static std::chrono::steady_clock::time_point rt_provider_next_attempt{};
+        constexpr int rt_provider_free_failures = 5;
+
+        sdk::IViewportRenderTargetProvider* viewport_rt_provider = nullptr;
+
+        if (const auto now = std::chrono::steady_clock::now(); rt_provider_resolved || now >= rt_provider_next_attempt) {
+            viewport_rt_provider = viewport_info->get_rt_provider(g_hook->get_render_target_manager()->get_render_target());
+
+            if (viewport_rt_provider != nullptr) {
+                rt_provider_resolved = true;
+            } else if (!rt_provider_resolved) {
+                ++rt_provider_failures;
+                const auto shift = std::clamp(rt_provider_failures - rt_provider_free_failures + 1, 0, 5);
+                const auto delay = std::min(std::chrono::seconds(2LL << shift), std::chrono::seconds(60));
+                rt_provider_next_attempt = now + delay;
+
+                if (rt_provider_failures >= rt_provider_free_failures) {
+                    SPDLOG_WARN("FViewportInfo::GetRenderTargetProvider failed {} times; next probe in {}s",
+                        rt_provider_failures, delay.count());
+                }
+            }
+        }
 
         if (viewport_rt_provider == nullptr) {
             SPDLOG_INFO_EVERY_N_SEC(1, "No viewport RT provider, skipping!");
