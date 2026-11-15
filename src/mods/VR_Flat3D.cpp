@@ -544,8 +544,8 @@ void flat3d_window_hold_release() {
     }
 }
 
-// Current + native (max) resolution of the monitor hosting hwnd. Native is
-// cached per display device (EnumDisplaySettings walk).
+// Current + native resolution of the monitor hosting hwnd. Native is the
+// display's CURRENT mode in physical pixels (see query_display_info).
 struct Flat3DDisplayInfo {
     int native_w{0};
     int native_h{0};
@@ -578,34 +578,47 @@ std::optional<Flat3DDisplayInfo> query_display_info(HWND hwnd) {
     info.origin_x = mi.rcMonitor.left;
     info.origin_y = mi.rcMonitor.top;
 
-    static std::string cached_device{};
-    static int cached_native_w = 0;
-    static int cached_native_h = 0;
-
-    if (cached_device != mi.szDevice) {
-        cached_device = mi.szDevice;
-        cached_native_w = 0;
-        cached_native_h = 0;
-
-        DEVMODEA dm{};
-        dm.dmSize = sizeof(dm);
-        for (DWORD i = 0; EnumDisplaySettingsA(mi.szDevice, i, &dm); ++i) {
-            if ((int)(dm.dmPelsWidth * dm.dmPelsHeight) > cached_native_w * cached_native_h) {
-                cached_native_w = (int)dm.dmPelsWidth;
-                cached_native_h = (int)dm.dmPelsHeight;
-            }
-        }
-    }
-
-    info.native_w = cached_native_w;
-    info.native_h = cached_native_h;
-
+    // Native = the mode the display is being driven at right now, which
+    // ENUM_CURRENT_SETTINGS reports in physical pixels whatever the process's
+    // DPI awareness. Not the largest mode it lists: a 4K TV commonly offers DCI
+    // 4096x2160 next to the 3840x2160 desktop it actually runs, and holding the
+    // swapchain at a mode the desktop isn't in scales every present (so it is
+    // no longer pixel-exact) and keeps asking the engine for a resize it can't
+    // honor (Stupid Never Dies, Zero Company on a 4096-capable TV at 3840).
     {
         DEVMODEA dm{};
         dm.dmSize = sizeof(dm);
         if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+            info.native_w = (int)dm.dmPelsWidth;
+            info.native_h = (int)dm.dmPelsHeight;
             info.refresh_hz = (int)dm.dmDisplayFrequency;
         }
+    }
+
+    // Fallback if the current mode can't be read: the largest listed mode,
+    // cached per display device (EnumDisplaySettings walk).
+    if (info.native_w == 0 || info.native_h == 0) {
+        static std::string cached_device{};
+        static int cached_native_w = 0;
+        static int cached_native_h = 0;
+
+        if (cached_device != mi.szDevice) {
+            cached_device = mi.szDevice;
+            cached_native_w = 0;
+            cached_native_h = 0;
+
+            DEVMODEA dm{};
+            dm.dmSize = sizeof(dm);
+            for (DWORD i = 0; EnumDisplaySettingsA(mi.szDevice, i, &dm); ++i) {
+                if ((int)(dm.dmPelsWidth * dm.dmPelsHeight) > cached_native_w * cached_native_h) {
+                    cached_native_w = (int)dm.dmPelsWidth;
+                    cached_native_h = (int)dm.dmPelsHeight;
+                }
+            }
+        }
+
+        info.native_w = cached_native_w;
+        info.native_h = cached_native_h;
     }
 
     if (info.native_w == 0) {
