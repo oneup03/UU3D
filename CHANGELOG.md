@@ -10,6 +10,26 @@ root, Modern under `modern\`), so entries apply to both unless a heading says
 otherwise. Earlier nightlies were a single build, alternating between the two
 bases depending on which branch produced them.
 
+## Nightly 00054
+
+### Fixed
+- **Native output on TVs that list a larger mode than the desktop runs.**
+  Native output used to take the largest mode a display lists as its native
+  size. Many 4K TVs list a 4096x2160 (DCI) mode next to the 3840x2160 desktop
+  they actually run, so UU3D held the game at 4096 on a 3840 desktop. Every
+  frame was scaled, so interlaced and other pixel-exact modes no longer lined
+  up, and UU3D kept asking the game to resize to a size it couldn't reach.
+  Native now comes from the mode the desktop is running. Displays that
+  already run their largest mode are unaffected. To output at 4096x2160, set
+  the Windows desktop to it. *Frame Packed* also now matches the display mode
+  it switches to. Reported by bonowook-ops with Stupid Never Dies and Star
+  Wars: Zero Company, where the Modern crash on injection started right after
+  one of these resize requests.
+- **Stupid Never Dies stuttered heavily on Legacy.** On Legacy, the search
+  for the game's UI render target took about 0.7 seconds and ran again on
+  every frame until it succeeded, which it never does in this game. It now
+  backs off the same way Modern does since 00053.
+
 ## Nightly 00053
 
 Also covers **00051** and **00052**, which shipped without a changelog entry.
