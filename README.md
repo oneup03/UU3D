@@ -159,6 +159,26 @@ Pick how the stereo pair is packed into the screen image:
   VR and Frame Sequential viewers (Katanga.exe / VRScreenCap / NV3D-Glass /
   WibbleWobbleInjector); launch any app in any order. Forces
   the game into a normal window and shows a flat left-eye preview locally.
+- **StereoShutter** — hands the composited pair to a UU3D plugin every
+  frame, before the game presents: one side-by-side texture, each half the
+  size of the game's output, in the game's output format and color space,
+  with eye swap, convergence and HUD already applied. *Force SDR Output*
+  applies as in the other modes; with it off, the game's HDR passes through:
+  HDR10 and scRGB are recognized from the game's swap chain or from what the
+  engine reports (`r.HDR.EnableHDROutput`, `r.HDR.Display.OutputDevice`),
+  also on DX11 and when the game switched HDR on before injection, and the
+  stereo render target keeps the engine's bit depth instead of 8 bits: 10
+  bits for HDR10, FP16 for scRGB. The bit depth is chosen when UU3D is
+  injected, so inject with this output already selected and with the game's
+  HDR setting and *Force SDR Output* already as wanted; changing them
+  afterwards (above all to or from scRGB) needs a restart. Made for the
+  StereoShutter plugin (NVIDIA 3D Vision glasses), but any plugin can take
+  the pair: register `on_stereo_pair_dx11` or `on_stereo_pair_dx12` in
+  `UEVR_PluginCallbacks` (`include/uevr/API.h`; plugin API 2.42 on the
+  Modern backend, 2.39.1 on the Legacy backend) and copy the texture out
+  inside the callback. The game itself shows the left eye only, so without
+  such a plugin you get a flat picture; UU3D then says so, once per session
+  in a message box and under Output Mode in the 3D Display page.
 - **Anaglyph** (Red/Cyan, Green/Magenta, Blue/Amber, plus Dubois / Deghosted /
   Compromise variants) — for colored 3D glasses on any ordinary screen.
 
@@ -188,7 +208,7 @@ beat against.
 
 **Force SDR Output** — HDR output washes out the 3D modes and disables color
 correction. Leave this on unless you specifically want to experiment with HDR
-passthrough.
+passthrough, or want the game's HDR in the StereoShutter output.
 
 **Hold Window Size** — keeps the game window pinned borderless at the display's
 native rect: the game's own resize and move calls are rewritten to it instead of

@@ -39,6 +39,13 @@ public:
 
     void on_post_render_vr_framework_dx11(ID3D11DeviceContext* context, ID3D11Texture2D*, ID3D11RenderTargetView* rtv) override;
     void on_post_render_vr_framework_dx12(ID3D12GraphicsCommandList* command_list, ID3D12Resource* rt, D3D12_CPU_DESCRIPTOR_HANDLE* rtv) override;
+
+    // The 3D Display stereo pair (output mode "StereoShutter"), once per present from the
+    // Flat3D components after compositing; see UEVR_StereoPairInfo in uevr/API.h.
+    void on_stereo_pair_dx11(ID3D11DeviceContext* context, ID3D11Texture2D* texture, const UEVR_StereoPairInfo* info);
+    void on_stereo_pair_dx12(ID3D12CommandQueue* queue, ID3D12Resource* resource, const UEVR_StereoPairInfo* info);
+    bool has_stereo_pair_callbacks_dx11();
+    bool has_stereo_pair_callbacks_dx12();
     
     void on_pre_engine_tick(sdk::UGameEngine* engine, float delta) override;
     void on_post_engine_tick(sdk::UGameEngine* engine, float delta) override;
@@ -83,6 +90,8 @@ public:
     bool add_on_post_render_vr_framework_dx11(UEVR_OnPostRenderVRFrameworkDX11Cb cb);
     bool add_on_post_render_vr_framework_dx12(UEVR_OnPostRenderVRFrameworkDX12Cb cb);
     bool add_on_custom_event(UEVR_OnCustomEventCb cb);
+    bool add_on_stereo_pair_dx11(UEVR_OnStereoPairDX11Cb cb);
+    bool add_on_stereo_pair_dx12(UEVR_OnStereoPairDX12Cb cb);
 
     bool add_on_pre_engine_tick(UEVR_Engine_TickCb cb);
     bool add_on_post_engine_tick(UEVR_Engine_TickCb cb);
@@ -155,6 +164,8 @@ private:
     std::vector<UEVR_OnDeviceResetCb> m_on_device_reset_cbs{};
     std::vector<UEVR_OnPostRenderVRFrameworkDX11Cb> m_on_post_render_vr_framework_dx11_cbs{};
     std::vector<UEVR_OnPostRenderVRFrameworkDX12Cb> m_on_post_render_vr_framework_dx12_cbs{};
+    std::vector<UEVR_OnStereoPairDX11Cb> m_on_stereo_pair_dx11_cbs{};
+    std::vector<UEVR_OnStereoPairDX12Cb> m_on_stereo_pair_dx12_cbs{};
     std::vector<UEVR_OnMessageCb> m_on_message_cbs{};
     std::vector<UEVR_OnXInputGetStateCb> m_on_xinput_get_state_cbs{};
     std::vector<UEVR_OnXInputSetStateCb> m_on_xinput_set_state_cbs{};
@@ -180,6 +191,8 @@ private:
         // VR Renderer
         (std::vector<generic_std_function>*)&m_on_post_render_vr_framework_dx11_cbs,
         (std::vector<generic_std_function>*)&m_on_post_render_vr_framework_dx12_cbs,
+        (std::vector<generic_std_function>*)&m_on_stereo_pair_dx11_cbs,
+        (std::vector<generic_std_function>*)&m_on_stereo_pair_dx12_cbs,
 
         // Windows CBs
         (std::vector<generic_std_function>*)&m_on_message_cbs,

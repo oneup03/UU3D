@@ -12,12 +12,38 @@
 #include <utility/String.hpp>
 
 #include "Framework.hpp"
+#include "../../PluginLoader.hpp"
 #include "../../VR.hpp"
 #include "../GameDepthCapture.hpp"
 
 #include "../D3D11Component.hpp"
 
 namespace vrmod {
+namespace {
+// The typeless group of a color format: a texture copy needs the same group on
+// both sides.
+DXGI_FORMAT copy_family(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default:
+        return format;
+    }
+}
+} // namespace
+
 vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     auto& hook = g_framework->get_d3d11_hook();
 
@@ -89,9 +115,24 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     }
 
     // D3D11 has no SetColorSpace1 tracking — 10-bit swapchains are treated
-    // as SDR (FP16 still maps to scRGB inside setup).
-    if (!m_flat3d_compositor.setup(device, src_eye_w, dw_desc.Height, dw_desc.Format,
-                                   bb_desc.Format, false, g_framework->get_window())) {
+    // as SDR (FP16 still maps to scRGB inside setup). Under the StereoShutter
+    // output the engine's own HDR output (VR::flat3d_engine_hdr) identifies PQ,
+    // and tells the compositor that the eyes already carry the engine's HDR
+    // encoding.
+    const bool pair_output = vr->flat3d_output_mode_value() == (int32_t)flat3d::Flat3DOutputMode::STEREOSHUTTER;
+    const auto engine_hdr = pair_output ? vr->flat3d_engine_hdr() : (int32_t)VR::FLAT3D_ENGINE_HDR_OFF;
+
+    if (engine_hdr == VR::FLAT3D_ENGINE_HDR_SCRGB && !vr->m_flat3d_force_sdr->value() &&
+        copy_family(dw_desc.Format) != DXGI_FORMAT_R16G16B16A16_TYPELESS) {
+        SPDLOG_WARNING_EVERY_N_SEC(10, "[Flat3D] StereoShutter output: the engine outputs scRGB but the stereo render "
+                                       "target is format {}, not FP16; its bit depth is chosen when UU3D is injected: "
+                                       "inject with the game's HDR on, this output selected and Force SDR Output off",
+                                   (uint32_t)dw_desc.Format);
+    }
+
+    if (!m_flat3d_compositor.setup(device, src_eye_w, dw_desc.Height, dw_desc.Format, bb_desc.Format,
+                                   engine_hdr == VR::FLAT3D_ENGINE_HDR_PQ, g_framework->get_window(),
+                                   engine_hdr != VR::FLAT3D_ENGINE_HDR_OFF)) {
         SPDLOG_ERROR_EVERY_N_SEC(1, "[Flat3D] Compositor setup failed");
         return vr::VRCompositorError_None;
     }
@@ -101,6 +142,9 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
     // Per-frame parameters (stereo shifts, crosshair, HDR paper white...).
     auto params = vr->build_flat3d_frame_params(src_eye_w, dw_desc.Height);
     params.extreme_backbuffer_src = extreme;
+    const bool stereo_pair_output = params.mode == (int32_t)flat3d::Flat3DOutputMode::STEREOSHUTTER;
+    params.stereo_pair_wanted = stereo_pair_output && PluginLoader::get()->has_stereo_pair_callbacks_dx11();
+    vr->flat3d_note_stereo_pair_consumer(stereo_pair_output, params.stereo_pair_wanted);
 
     // VSync Override: force the present interval (consumed one-shot by the
     // present hook, so re-assert every frame). 0 = respect the game.
@@ -140,6 +184,21 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
             if (sc_desc.Width != src_eye_w || sc_desc.Height != dw_desc.Height) {
                 SPDLOG_INFO_EVERY_N_SEC(1, "[Flat3D] Scene capture {}x{} != eye {}x{} — waiting for recreation",
                                         sc_desc.Width, sc_desc.Height, src_eye_w, dw_desc.Height);
+                right_eye_src.Reset();
+            }
+        }
+
+        // Eyes made at the engine's bit depth (StereoShutter output with HDR at
+        // injection): the capture is copied into an eye texture of the
+        // double-wide's format, which only works within one format family. Keyed
+        // on the injection-time choice, so a later mode change keeps the check.
+        if (right_eye_src != nullptr && vr->flat3d_eye_pixel_format() != 0) {
+            D3D11_TEXTURE2D_DESC sc_desc{};
+            right_eye_src->GetDesc(&sc_desc);
+            if (copy_family(sc_desc.Format) != copy_family(dw_desc.Format)) {
+                SPDLOG_WARNING_EVERY_N_SEC(5, "[Flat3D] Scene capture format {} cannot be copied into eyes of format {}; "
+                                              "the right eye shows the left one",
+                                           (uint32_t)sc_desc.Format, (uint32_t)dw_desc.Format);
                 right_eye_src.Reset();
             }
         }
@@ -344,6 +403,30 @@ vr::EVRCompositorError D3D11Component::on_frame_flat3d(VR* vr) {
             m_flat3d_katanga.present(context.Get(),
                                      m_flat3d_compositor.eye_texture(l),
                                      m_flat3d_compositor.eye_texture(1 - l));
+        }
+    }
+
+    // StereoShutter handoff: the pair composite() drew on the immediate context
+    // goes to the plugins that registered on_stereo_pair_dx11 (uevr/API.h).
+    // The local window shows a left-eye preview.
+    if (params.stereo_pair_wanted) {
+        if (auto* pair = m_flat3d_compositor.stereo_pair_texture(); pair != nullptr) {
+            static uint64_t s_stereo_pair_frame = 0;
+            UEVR_StereoPairInfo info{};
+            info.size = sizeof(info);
+            info.width = m_flat3d_compositor.stereo_pair_width();
+            info.height = m_flat3d_compositor.stereo_pair_height();
+            info.eye_width = info.width / 2;
+            info.dxgi_format = (unsigned int)m_flat3d_compositor.stereo_pair_format();
+            info.dxgi_color_space = flat3d::dxgi_color_space_of(m_flat3d_compositor.colorspace());
+            info.layout = 1; // the left eye in the left half: the eye swap is already applied
+            info.resource_state = 0;
+            info.frame = ++s_stereo_pair_frame;
+            // eye_refresh_mask() counts engine eyes; eyes_fresh counts halves,
+            // which the eye swap exchanges.
+            const uint32_t refreshed = m_flat3d_compositor.eye_refresh_mask();
+            info.eyes_fresh = params.eye_swap ? ((refreshed & 1u) << 1) | ((refreshed >> 1) & 1u) : refreshed;
+            PluginLoader::get()->on_stereo_pair_dx11(context.Get(), pair, &info);
         }
     }
 
