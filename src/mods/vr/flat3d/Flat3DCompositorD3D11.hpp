@@ -41,10 +41,14 @@ public:
     // (Re)creates eye textures + pipelines. Safe to call every frame; no-ops
     // when nothing changed. backbuffer_format drives HDR colorspace handling;
     // hwnd is used by the (optional) LeiaSR weaver.
-    // backbuffer_pq: the game explicitly set a PQ color space on the
-    // swapchain (10-bit formats are otherwise treated as SDR/G22).
+    // backbuffer_pq: the swapchain is in a PQ color space, reported by the engine
+    // under the StereoShutter output (D3D11 does not track SetColorSpace1);
+    // 10-bit formats are otherwise treated as SDR/G22.
+    // eyes_in_output_encoding: the eyes already carry the engine's HDR encoding
+    // (PQ or scRGB), so 8-bit eyes under an HDR swapchain are not re-encoded
+    // from sRGB.
     bool setup(ID3D11Device* device, uint32_t eye_w, uint32_t eye_h, DXGI_FORMAT eye_format,
-               DXGI_FORMAT backbuffer_format, bool backbuffer_pq, HWND hwnd);
+               DXGI_FORMAT backbuffer_format, bool backbuffer_pq, HWND hwnd, bool eyes_in_output_encoding = false);
 
     // Full frame: refresh eye cache from the double-wide, draw UI/crosshair
     // overlays into each eye, then repack into the backbuffer RTV (or weave
@@ -87,6 +91,19 @@ public:
     // Used by the Katanga handoff to build the shared SbS frame.
     ID3D11Texture2D* eye_texture(int i) const { return (i >= 0 && i < 2) ? m_eye_tex[i].Get() : nullptr; }
 
+    // The stereo pair for the plugin callback (output mode StereoShutter): both
+    // eyes side by side, each at the output's size, in the backbuffer's format
+    // and color space, drawn by composite() while params.stereo_pair_wanted.
+    // Valid after composite(), on the immediate context; nullptr when that
+    // composite() did not draw it.
+    ID3D11Texture2D* stereo_pair_texture() const { return m_stereo_pair_drawn ? m_stereo_pair_tex.Get() : nullptr; }
+    uint32_t stereo_pair_width() const { return m_stereo_pair_w * 2; }
+    uint32_t stereo_pair_height() const { return m_stereo_pair_h; }
+    DXGI_FORMAT stereo_pair_format() const { return m_stereo_pair_fmt; }
+    // Which eyes the last composite() refreshed (bit N = eye N): 0b11 for a
+    // full pair, one bit under plain AFR, 0 while Synced Sequential holds a pair.
+    uint32_t eye_refresh_mask() const { return m_eye_refresh_mask; }
+
     // Saves a 3D screenshot of the last composited frame: renders the two
     // composited eye textures into an SbS image via the repack shader (so the
     // configured SDR color correction is applied and HDR eye formats are
@@ -119,6 +136,12 @@ private:
     // only if the SbS texture could not be (re)created.
     bool build_sbs(ID3D11DeviceContext* context, const Flat3DFrameParams& params,
                    uint32_t out_w, uint32_t out_h);
+    // Draws the plugin pair (stereo_pair_texture) at the backbuffer's size with
+    // the repack shader in SBS mode and the backbuffer's constants: eye swap,
+    // convergence shift/scale, ghost reduction (SDR only) and HDR encoding
+    // exactly as the backbuffer gets them. Binds its own pipeline state.
+    void build_stereo_pair(ID3D11DeviceContext* context, const Flat3DFrameParams& params,
+                           uint32_t out_w, uint32_t out_h);
     // eye_refresh_mask: bit N set = eye N's scene content was refreshed this
     // present; overlays bake only into refreshed eyes (persistent caches —
     // re-baking translucent UI onto an unrefreshed eye ratchets its opacity).
@@ -151,6 +174,7 @@ private:
     DXGI_FORMAT m_eye_format{DXGI_FORMAT_UNKNOWN};
     DXGI_FORMAT m_backbuffer_format{DXGI_FORMAT_UNKNOWN};
     bool m_backbuffer_pq{false};
+    bool m_eyes_in_output_encoding{false};
     Flat3DColorSpace m_colorspace{Flat3DColorSpace::SDR};
     bool m_src_srgb{false};
     HWND m_hwnd{nullptr};
@@ -277,6 +301,17 @@ private:
     uint32_t m_screenshot_w{0};
     uint32_t m_screenshot_h{0};
     DXGI_FORMAT m_screenshot_fmt{DXGI_FORMAT_UNKNOWN};
+
+    // The plugin pair (output mode StereoShutter): backbuffer size and format;
+    // m_stereo_pair_drawn says the last composite() drew it.
+    ComPtr<ID3D11Texture2D> m_stereo_pair_tex{};
+    ComPtr<ID3D11RenderTargetView> m_stereo_pair_rtv{};
+    uint32_t m_stereo_pair_w{0}; // per-eye dimensions
+    uint32_t m_stereo_pair_h{0};
+    DXGI_FORMAT m_stereo_pair_fmt{DXGI_FORMAT_UNKNOWN};
+    bool m_stereo_pair_failed{false}; // creation failed for this size/format: not retried until it changes
+    bool m_stereo_pair_drawn{false};
+    uint32_t m_eye_refresh_mask{0b11}; // see eye_refresh_mask()
 
     // LeiaSR weaver (optional). Own SbS texture because the weaver takes one
     // side-by-side input.

@@ -34,7 +34,7 @@ enum class Flat3DOutputMode : int32_t {
     DUAL_DISPLAY,        // horizontal split spanning two monitors (left=L, right=R)
     DUAL_DISPLAY_FLIP,   // as DUAL_DISPLAY but the left image is vertically flipped
     KATANGA,             // shares a SbS texture with Katanga.exe/VRScreenCap; forces windowed; left-eye preview
-    // Anaglyph family grouped at the bottom of the list.
+    // Anaglyph family grouped together.
     ANAGLYPH_RC,
     ANAGLYPH_RC_DUBOIS,
     ANAGLYPH_RC_DEGHOSTED,
@@ -43,6 +43,8 @@ enum class Flat3DOutputMode : int32_t {
     ANAGLYPH_GM_DUBOIS,
     ANAGLYPH_GM_DEGHOSTED,
     ANAGLYPH_BLUE_AMBER,
+    // Appended after the anaglyphs so that saved profiles keep their numbers.
+    STEREOSHUTTER,       // hands the pair to plugins (UEVR_OnStereoPair*, uevr/API.h); the game shows the left eye
     COUNT,
 };
 
@@ -98,6 +100,16 @@ enum class Flat3DColorSpace : int32_t {
     HDR10_PQ,   // R10G10B10A2 + ST-2084 (PQ) encoding
     SCRGB,      // R16G16B16A16_FLOAT linear (1.0 = 80 nits)
 };
+
+// The DXGI_COLOR_SPACE_TYPE value of a Flat3DColorSpace, for the plugin stereo
+// pair callback (uevr/API.h, UEVR_StereoPairInfo::dxgi_color_space).
+inline uint32_t dxgi_color_space_of(Flat3DColorSpace cs) {
+    switch (cs) {
+    case Flat3DColorSpace::HDR10_PQ: return 12u; // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+    case Flat3DColorSpace::SCRGB:    return 1u;  // DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    default:                         return 0u;  // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    }
+}
 
 // Computed once per frame on the CPU (VR::build_flat3d_frame_params) and
 // consumed by both compositors.
@@ -276,6 +288,11 @@ struct Flat3DFrameParams {
     // Extreme compatibility mode: the eye source is the REAL BACKBUFFER
     // (one full-width eye per frame, AFR forced; no double-wide exists).
     bool extreme_backbuffer_src{false};
+
+    // Output mode STEREOSHUTTER with a plugin registered for the pair on this
+    // renderer (PluginLoader::has_stereo_pair_callbacks_dx11/_dx12): the
+    // compositor draws the pair only then. Set by the components.
+    bool stereo_pair_wanted{false};
 
     // Depth sampling wishes (drives the SceneDepthZ readback).
     bool want_depth{false};
@@ -664,6 +681,7 @@ static const int kAnaGM              = 16;
 static const int kAnaGMDubois        = 17;
 static const int kAnaGMDeghosted     = 18;
 static const int kAnaBlueAmber       = 19;
+static const int kStereoShutter      = 20;
 
 struct VSOut {
     float4 pos : SV_Position;
@@ -704,10 +722,10 @@ float4 Repack(float2 uv, float2 pixel) {
         return SampleEye(half_idx, u_half, uv.y);
     }
 
-    // Katanga: the stereo pair goes out via the shared texture; the local
-    // window is a normal desktop preview showing the LEFT eye only (mono,
-    // eye_swap-aware).
-    if (m == kKatanga) {
+    // Katanga / StereoShutter: the stereo pair goes out via the shared texture
+    // or the plugin callback; the game's own window shows the LEFT eye only
+    // (mono, eye_swap-aware).
+    if (m == kKatanga || m == kStereoShutter) {
         return SampleEye(0, uv.x, uv.y);
     }
 
@@ -891,7 +909,7 @@ float4 ps_main(VSOut input) : SV_Target {
     // Pass-through / resampling modes with an sRGB source and an HDR output
     // still need the space conversion (anaglyph modes already returned
     // output-space; the frame-pack gap returns black which encodes to black).
-    bool passthrough = (mode < kAnaRC); // every non-anaglyph mode (anaglyphs are grouped at the end)
+    bool passthrough = !(mode >= kAnaRC && mode <= kAnaBlueAmber); // every non-anaglyph mode (the anaglyphs are grouped)
     if (passthrough && src_srgb != 0 && colorspace != 0) {
         c.rgb = from_normalized(c.rgb);
     }

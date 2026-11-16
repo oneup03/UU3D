@@ -192,6 +192,22 @@ bool on_post_render_vr_framework_dx12(UEVR_OnPostRenderVRFrameworkDX12Cb cb) {
     return PluginLoader::get()->add_on_post_render_vr_framework_dx12(cb);
 }
 
+bool on_stereo_pair_dx11(UEVR_OnStereoPairDX11Cb cb) {
+    if (cb == nullptr) {
+        return false;
+    }
+
+    return PluginLoader::get()->add_on_stereo_pair_dx11(cb);
+}
+
+bool on_stereo_pair_dx12(UEVR_OnStereoPairDX12Cb cb) {
+    if (cb == nullptr) {
+        return false;
+    }
+
+    return PluginLoader::get()->add_on_stereo_pair_dx12(cb);
+}
+
 bool on_custom_event(UEVR_OnCustomEventCb cb) {
     if (cb == nullptr) {
         return false;
@@ -209,7 +225,9 @@ UEVR_PluginCallbacks g_plugin_callbacks {
     uevr::on_xinput_set_state,
     uevr::on_post_render_vr_framework_dx11,
     uevr::on_post_render_vr_framework_dx12,
-    uevr::on_custom_event
+    uevr::on_custom_event,
+    uevr::on_stereo_pair_dx11,
+    uevr::on_stereo_pair_dx12
 };
 
 UEVR_PluginFunctions g_plugin_functions {
@@ -2125,6 +2143,44 @@ void PluginLoader::on_post_render_vr_framework_dx12(ID3D12GraphicsCommandList* c
     }
 }
 
+void PluginLoader::on_stereo_pair_dx11(ID3D11DeviceContext* context, ID3D11Texture2D* texture, const UEVR_StereoPairInfo* info) {
+    std::shared_lock _{m_api_cb_mtx};
+
+    for (auto&& cb : m_on_stereo_pair_dx11_cbs) {
+        try {
+            cb((void*)context, (void*)texture, info);
+        } catch(...) {
+            spdlog::error("[APIProxy] Exception occurred in on_stereo_pair_dx11 callback; one of the plugins has an error.");
+            continue;
+        }
+    }
+}
+
+void PluginLoader::on_stereo_pair_dx12(ID3D12CommandQueue* queue, ID3D12Resource* resource, const UEVR_StereoPairInfo* info) {
+    std::shared_lock _{m_api_cb_mtx};
+
+    for (auto&& cb : m_on_stereo_pair_dx12_cbs) {
+        try {
+            cb((void*)queue, (void*)resource, info);
+        } catch(...) {
+            spdlog::error("[APIProxy] Exception occurred in on_stereo_pair_dx12 callback; one of the plugins has an error.");
+            continue;
+        }
+    }
+}
+
+bool PluginLoader::has_stereo_pair_callbacks_dx11() {
+    std::shared_lock _{m_api_cb_mtx};
+
+    return !m_on_stereo_pair_dx11_cbs.empty();
+}
+
+bool PluginLoader::has_stereo_pair_callbacks_dx12() {
+    std::shared_lock _{m_api_cb_mtx};
+
+    return !m_on_stereo_pair_dx12_cbs.empty();
+}
+
 bool PluginLoader::on_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     std::shared_lock _{m_api_cb_mtx};
 
@@ -2343,6 +2399,20 @@ bool PluginLoader::add_on_post_render_vr_framework_dx12(UEVR_OnPostRenderVRFrame
     std::unique_lock _{m_api_cb_mtx};
 
     m_on_post_render_vr_framework_dx12_cbs.push_back(cb);
+    return true;
+}
+
+bool PluginLoader::add_on_stereo_pair_dx11(UEVR_OnStereoPairDX11Cb cb) {
+    std::unique_lock _{m_api_cb_mtx};
+
+    m_on_stereo_pair_dx11_cbs.push_back(cb);
+    return true;
+}
+
+bool PluginLoader::add_on_stereo_pair_dx12(UEVR_OnStereoPairDX12Cb cb) {
+    std::unique_lock _{m_api_cb_mtx};
+
+    m_on_stereo_pair_dx12_cbs.push_back(cb);
     return true;
 }
 
